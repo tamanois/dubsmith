@@ -1,0 +1,355 @@
+"""Job configuration, environment settings and language normalisation."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .errors import ConfigError
+
+__all__ = [
+    "LANGUAGE_ALIASES",
+    "SUPPORTED_LANGUAGES",
+    "normalize_language",
+    "JobConfig",
+    "Settings",
+    "read_env_file",
+    "resolve_device",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Languages
+# --------------------------------------------------------------------------- #
+
+#: Language names accepted by the Qwen3-TTS checkpoints. "Auto" lets the model
+#: adapt to the text; it is only valid for the *target* language.
+SUPPORTED_LANGUAGES: frozenset[str] = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "German",
+        "Italian",
+        "Portuguese",
+        "Spanish",
+        "Japanese",
+        "Korean",
+        "French",
+        "Russian",
+    }
+)
+
+#: Convenience aliases so users can pass ``--target fr`` instead of ``French``.
+LANGUAGE_ALIASES: dict[str, str] = {
+    "auto": "Auto",
+    "zh": "Chinese", "cn": "Chinese", "chi": "Chinese", "chinese": "Chinese",
+    "en": "English", "eng": "English", "english": "English",
+    "de": "German", "deu": "German", "ger": "German", "german": "German",
+    "it": "Italian", "ita": "Italian", "italian": "Italian",
+    "pt": "Portuguese", "por": "Portuguese", "portuguese": "Portuguese",
+    "es": "Spanish", "spa": "Spanish", "spanish": "Spanish",
+    "ja": "Japanese", "jp": "Japanese", "jpn": "Japanese", "japanese": "Japanese",
+    "ko": "Korean", "kor": "Korean", "korean": "Korean",
+    "fr": "French", "fra": "French", "fre": "French", "french": "French",
+    "ru": "Russian", "rus": "Russian", "russian": "Russian",
+}
+
+#: Human-readable language names keyed by ISO-639-1 code, used to describe the
+#: language a Whisper model detected so the LLM prompt can name it.
+CODE_TO_NAME: dict[str, str] = {
+    "zh": "Chinese", "en": "English", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "es": "Spanish", "ja": "Japanese", "ko": "Korean",
+    "fr": "French", "ru": "Russian",
+}
+
+#: Inverse of :data:`CODE_TO_NAME`; Whisper expects a bare code, not a name.
+NAME_TO_CODE: dict[str, str] = {name: code for code, name in CODE_TO_NAME.items()}
+
+
+def normalize_language(value: str) -> str:
+    """Map a user-supplied language (``fr``, ``french``, ``French``) to canonical form.
+
+    Args:
+        value: Language code, alias, or full name.
+
+    Returns:
+        One of :data:`SUPPORTED_LANGUAGES`.
+
+    Raises:
+        ConfigError: If the language is unknown.
+    """
+    key = str(value).strip().lower()
+    if key in LANGUAGE_ALIASES:
+        return LANGUAGE_ALIASES[key]
+    # Allow exact canonical names that are not also aliases (e.g. "Auto").
+    for canonical in SUPPORTED_LANGUAGES:
+        if canonical.lower() == key:
+            return canonical
+    supported = ", ".join(sorted(SUPPORTED_LANGUAGES))
+    raise ConfigError(f"Unsupported language {value!r}. Supported: {supported}")
+
+
+def language_name_for_code(code: str | None) -> str | None:
+    """Best-effort mapping of a Whisper language code to a display name."""
+    if not code:
+        return None
+    return CODE_TO_NAME.get(code.strip().lower(), code)
+
+
+def language_code_for_name(name: str | None) -> str | None:
+    """Map a canonical language name to the code Whisper expects.
+
+    Returns ``None`` (auto-detect) when the name is unknown or unset, which is
+    safer than passing a full name Whisper would reject.
+    """
+    if not name:
+        return None
+    key = str(name).strip()
+    if key.lower() == "auto":
+        return None
+    if key.lower() in CODE_TO_NAME:
+        return key.lower()
+    return NAME_TO_CODE.get(key, None)
+
+
+# --------------------------------------------------------------------------- #
+# Environment
+# --------------------------------------------------------------------------- #
+
+ENV_PREFIX = ""
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Parse a minimal ``KEY=VALUE`` dotenv file.
+
+    Supports ``export`` prefixes, ``#`` comments, blank lines, and single/double
+    quoted values. Deliberately dependency-free: this project only needs the
+    tiny subset of dotenv semantics and adding a package for it would be
+    disproportionate.
+    """
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+class Settings(BaseModel):
+    """Runtime settings, sourced from environment variables and ``.env``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_base_url: str = "http://127.0.0.1:8080/v1"
+    llm_api_key: str = "not-needed"
+    llm_model: str = "local-model"
+    llm_timeout_s: float = 180.0
+    llm_chunk_size: int = Field(default=40, ge=1)
+
+    models_dir: Path = Path("models")
+    log_level: str = "INFO"
+    log_json: bool = False
+
+    @classmethod
+    def from_env(
+        cls,
+        env_file: Path | str = ".env",
+        environ: Mapping[str, str] | None = None,
+    ) -> "Settings":
+        """Build settings from ``.env`` then the process environment.
+
+        Real environment variables take precedence over the file, so a user can
+        override a checked-in default without editing anything.
+        """
+        source = dict(environ if environ is not None else os.environ)
+        file_values = read_env_file(Path(env_file))
+        merged: dict[str, str] = {**file_values, **source}
+
+        def pick(name: str, default: Any) -> Any:
+            raw = merged.get(f"{ENV_PREFIX}{name}")
+            if raw is None:
+                return default
+            if isinstance(default, bool):
+                return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+            return raw
+
+        payload = {
+            "llm_base_url": pick("LLM_BASE_URL", cls.model_fields["llm_base_url"].default),
+            "llm_api_key": pick("LLM_API_KEY", cls.model_fields["llm_api_key"].default),
+            "llm_model": pick("LLM_MODEL", cls.model_fields["llm_model"].default),
+            "llm_timeout_s": pick("LLM_TIMEOUT_S", cls.model_fields["llm_timeout_s"].default),
+            "llm_chunk_size": pick("LLM_CHUNK_SIZE", cls.model_fields["llm_chunk_size"].default),
+            "models_dir": pick("MODELS_DIR", cls.model_fields["models_dir"].default),
+            "log_level": pick("LOG_LEVEL", cls.model_fields["log_level"].default),
+            "log_json": pick("LOG_JSON", cls.model_fields["log_json"].default),
+        }
+        return cls.model_validate(payload)
+
+
+# --------------------------------------------------------------------------- #
+# Job
+# --------------------------------------------------------------------------- #
+
+
+class JobConfig(BaseModel):
+    """Everything needed to dub one video (or audio file)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Input: exactly one of these.
+    video: Path | None = None
+    audio: Path | None = None
+
+    # Canonical name, not a code: pydantic validators do not run on defaults, so a
+    # default of "fr" would bypass normalisation and leak a raw code downstream.
+    target_language: str = "French"
+    source_language: str | None = None  # None -> auto-detect
+
+    # Voice donor: if omitted, the longest clean speech segment is used.
+    ref_audio: Path | None = None
+    ref_text: str | None = None
+
+    output_dir: Path = Path("output")
+    device: str = "auto"
+    whisper_model: str = "large-v3"
+    llm_model: str | None = None  # overrides Settings.llm_model
+
+    # Duration fitting.
+    min_stretch: float = Field(default=0.85, gt=0.05, le=1.0)
+    max_stretch: float = Field(default=1.18, ge=1.0, le=3.0)
+
+    # ASR gating: segments the model itself distrusts are dropped.
+    no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+
+    keep_subtitles: bool = True
+    force: bool = False
+
+    @field_validator("target_language")
+    @classmethod
+    def _check_target(cls, value: str) -> str:
+        return normalize_language(value)
+
+    @field_validator("source_language")
+    @classmethod
+    def _check_source(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_language(value)
+        if normalized == "Auto":
+            raise ConfigError("source_language must be an explicit language, not 'auto'")
+        return normalized
+
+    @field_validator("video", "audio", "ref_audio", "output_dir")
+    @classmethod
+    def _expand(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "JobConfig":
+        if (self.video is None) == (self.audio is None):
+            raise ConfigError("Provide exactly one input: either --video or --audio")
+
+        if self.source_language is not None and self.source_language == self.target_language:
+            raise ConfigError(
+                f"source_language and target_language are both {self.target_language!r}"
+            )
+
+        if self.ref_audio is not None:
+            if self.ref_text is None or not self.ref_text.strip():
+                # ICL mode conditions on the reference transcript, so it is
+                # required; x-vector-only mode drops quality noticeably.
+                raise ConfigError(
+                    "--ref-audio requires --ref-text (the exact transcript of the "
+                    "reference clip). Omit both to auto-select a donor from the video."
+                )
+        return self
+
+    @property
+    def input_path(self) -> Path:
+        """The single input path (video or audio)."""
+        path = self.video if self.video is not None else self.audio
+        assert path is not None  # guaranteed by the model validator
+        return path
+
+    @property
+    def is_video(self) -> bool:
+        """True when the input is a video file."""
+        return self.video is not None
+
+    def fingerprint(self) -> str:
+        """Stable hash of the settings that affect pipeline output.
+
+        Used for cache invalidation: changing the target language, whisper
+        model, donor, or duration bounds must re-run the affected stages.
+        """
+        import hashlib
+        import json
+
+        payload = self.model_dump(mode="json")
+        for volatile in ("output_dir", "force"):
+            payload.pop(volatile, None)
+        blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------- #
+# Device helpers
+# --------------------------------------------------------------------------- #
+
+
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve ``auto`` to the best available torch device.
+
+    Kept dependency-light by importing torch lazily; returns ``"cpu"`` when torch
+    is unavailable or reports no CUDA device.
+    """
+    if requested and requested != "auto":
+        return requested
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a hard runtime dep
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def release_gpu_memory() -> bool:
+    """Return cached GPU memory to the driver; ``True`` if anything was released.
+
+    Each heavy stage loads its own multi-GB model (Whisper ~3 GB, Qwen3-TTS
+    ~3.5 GB). When a stage's model goes out of scope, PyTorch keeps the blocks in
+    its caching allocator, so the next stage can hit an out-of-memory error even
+    though the previous model is already gone. Calling this between stages makes
+    that memory available again.
+
+    Cheap and safe to call anywhere: it is a no-op without CUDA.
+    """
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a hard runtime dep
+        return False
+    if not torch.cuda.is_available():
+        return False
+
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    return True

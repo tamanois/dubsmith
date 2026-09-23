@@ -1,0 +1,24 @@
+"""Local video dubbing pipeline (MVP).
+
+Turns a single-speaker video into a dub in a target language using the speaker's
+own voice timbre. See ``PLAN.md`` for scope and roadmap.
+
+Module map:
+    config      -- job/settings models and language normalisation
+    errors      -- domain exception hierarchy
+    logging_utils -- job-scoped structured logging
+    models      -- model registry, download and path resolution
+    media       -- ffmpeg/ffprobe wrappers and loudness utilities
+    subtitles   -- SRT rendering
+    asr         -- speech recognition and segmentation
+    translate   -- OpenAI-compatible translation
+    tts         -- voice cloning with Qwen3-TTS
+    timing      -- time-stretching and timeline placement
+    orchestrate -- stage runner tying everything together
+"""
+
+from __future__ import annotations
+
+__all__ = ["__version__"]
+
+__version__ = "0.1.0"

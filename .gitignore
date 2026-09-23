@@ -1,4 +1,22 @@
 *.wav
 *.mp3
+*.flac
+*.m4a
+*.mp4
+*.mkv
+*.mov
+*.webm
 models/
 .venv
+
+# Job artifacts (dubbed video, subtitles, reports, manifests)
+output/
+
+# Local configuration: may contain API keys
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.stretch_tmp/

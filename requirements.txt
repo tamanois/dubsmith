@@ -1,8 +1,41 @@
+# Python runtime dependencies.
+#
+#   pip install -r requirements.txt
+#
+# Install numpy and typing_extensions FIRST if your environment struggles to
+# resolve them together with torch (see packages.md).
+#
+# System binaries (ffmpeg, rubberband) are NOT installed here.
+# See README.md -> "Prerequisites" for the copy-paste install commands.
+
 numpy==1.26.4
 typing_extensions
+
+# Deep-learning runtime
 torch>=2.1.0
+
+# Audio + media
 soundfile
-qwen_tts
-#packaging
-#ninja
+librosa
+
+# Validation
+pydantic>=2.0
+
+# Pipeline stages
+qwen_tts                # voice cloning / TTS (Qwen3-TTS)
+faster-whisper          # ASR (ships its own Silero VAD, no extra dependency)
+pyloudnorm              # EBU R128 loudness measurement + normalisation
+openai                  # OpenAI-compatible client used for translation
+
+# Optional: faster TTS inference. Needs a C++ toolchain and a compatible GPU;
+# the pipeline falls back to PyTorch SDPA without it.
 #flash-attn
+
+# Optional: CUDA 12 runtime libraries for **GPU speech recognition**.
+# CTranslate2 (used by faster-whisper) links against CUDA 12 specifically, while
+# recent torch wheels ship CUDA 13 (which provides libcublas.so.13). On such a
+# machine ASR logs "libcublas.so.12 is not found or cannot be loaded" and only
+# runs on CPU. Installing these two wheels fixes GPU ASR; the pipeline preloads
+# them automatically, so no LD_LIBRARY_PATH export is needed.
+#nvidia-cublas-cu12
+#nvidia-cudnn-cu12
