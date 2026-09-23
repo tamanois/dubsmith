@@ -1,0 +1,8 @@
+numpy==1.26.4
+typing_extensions
+torch>=2.1.0
+soundfile
+qwen_tts
+#packaging
+#ninja
+#flash-attn
