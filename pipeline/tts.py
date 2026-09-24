@@ -16,7 +16,7 @@ clear error instead of the library's generic one.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -263,6 +263,79 @@ class TTSEngine:
             ref_text=ref_text,
             x_vector_only_mode=self.x_vector_only,
         )
+
+    def prepare_hybrid_prompt(
+        self,
+        *,
+        accent_audio: Path | str,
+        accent_text: str,
+        timbre: DonorClip | None = None,
+        timbre_audio: Path | str | None = None,
+    ) -> None:
+        """Take the accent from one clip and the timbre from another.
+
+        The checkpoint conditions on two independent signals: ``ref_code`` (the
+        reference's speech codes, which drive pronunciation and prosody) and
+        ``ref_spk_embedding`` (who the speaker is). Sourcing them from different
+        clips yields native pronunciation in the original speaker's voice - the
+        combination plain cloning cannot express, because it derives both from a
+        single reference.
+
+        Args:
+            accent_audio: Native target-language clip supplying the phonetics.
+            accent_text: Its exact transcript; mandatory, because ICL mode aligns
+                the speech codes against the reference text.
+            timbre: Speaker to keep, taken from the source video.
+            timbre_audio: Speaker to keep, taken from a file.
+
+        Raises:
+            TTSError: If the accent transcript is missing, neither timbre source is
+                given, or the library's prompt item cannot be combined.
+        """
+        if not accent_text or not accent_text.strip():
+            raise TTSError(
+                "accent_text is required: the accent clip's transcript is what "
+                "aligns its speech codes so they can condition pronunciation."
+            )
+        if timbre is None and timbre_audio is None:
+            raise TTSError("prepare_hybrid_prompt needs a timbre source.")
+
+        accent_items = self.model.create_voice_clone_prompt(
+            ref_audio=str(accent_audio),
+            ref_text=accent_text,
+            x_vector_only_mode=False,
+        )
+
+        # x-vector mode returns the speaker embedding without needing a transcript
+        # (its speech codes are discarded anyway).
+        if timbre is not None:
+            timbre_items = self.model.create_voice_clone_prompt(
+                ref_audio=(
+                    np.asarray(timbre.samples, dtype=np.float32),
+                    int(timbre.sample_rate),
+                ),
+                ref_text=timbre.text,
+                x_vector_only_mode=True,
+            )
+        else:
+            timbre_items = self.model.create_voice_clone_prompt(
+                ref_audio=str(timbre_audio),
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+
+        # Keep the accent item's ref_code/ref_text/flags so `ref_ids` stay aligned
+        # with the codes, and swap in the other clip's speaker embedding.
+        try:
+            combined = replace(
+                accent_items[0], ref_spk_embedding=timbre_items[0].ref_spk_embedding
+            )
+        except (AttributeError, TypeError) as exc:  # pragma: no cover - library change
+            raise TTSError(
+                "Could not combine accent and timbre prompts; the installed qwen-tts "
+                "version may have changed VoiceClonePromptItem."
+            ) from exc
+        self._prompt = [combined]
 
     # -- synthesis --------------------------------------------------------- #
 

@@ -99,6 +99,7 @@ class FakeTTSEngine:
         self.prompt_kind: str | None = None
         self.prompt_calls = 0
         self.synth_calls = 0
+        self.hybrid: dict[str, Any] | None = None
 
     def prepare_prompt(self, donor: Any) -> None:
         self.prompt_kind = "donor"
@@ -107,6 +108,23 @@ class FakeTTSEngine:
     def prepare_prompt_from_file(self, ref_audio: Path | str, ref_text: str) -> None:
         self.prompt_kind = "file"
         self.prompt_calls += 1
+
+    def prepare_hybrid_prompt(
+        self,
+        *,
+        accent_audio: Path | str,
+        accent_text: str,
+        timbre: Any = None,
+        timbre_audio: Path | str | None = None,
+    ) -> None:
+        self.prompt_kind = "hybrid"
+        self.prompt_calls += 1
+        self.hybrid = {
+            "accent_audio": accent_audio,
+            "accent_text": accent_text,
+            "timbre": timbre,
+            "timbre_audio": timbre_audio,
+        }
 
     def synthesize(self, texts: Sequence[str], *, language: str) -> list[np.ndarray | None]:
         self.synth_calls += 1
@@ -291,6 +309,88 @@ class TestDonorHandling:
         )
         pipeline.run()
         assert tts.prompt_kind == "file"
+
+
+class TestReferenceAccentMode:
+    """Timbre and accent come from different clips in this mode."""
+
+    def build(self, tmp_path: Path, transcript: Transcript, **kwargs: Any):
+        accent = write_input(tmp_path, seconds=3.0, name="accent.wav")
+        pipeline, _, _, tts = make_pipeline(
+            tmp_path,
+            transcript,
+            accent_mode="reference-accent",
+            accent_audio=accent,
+            accent_text="Bonjour, je suis Joel.",
+            **kwargs,
+        )
+        return pipeline, tts, accent
+
+    def test_selects_the_hybrid_prompt_path(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, tts, accent = self.build(tmp_path, simple_transcript)
+        pipeline.run()
+
+        assert tts.prompt_kind == "hybrid"
+        assert tts.hybrid is not None
+        assert tts.hybrid["accent_audio"] == accent
+        assert tts.hybrid["accent_text"] == "Bonjour, je suis Joel."
+        # Timbre fell back to an auto-selected donor from the source speech.
+        assert tts.hybrid["timbre"] is not None
+        assert tts.hybrid["timbre_audio"] is None
+
+    def test_explicit_reference_audio_becomes_the_timbre_source(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        ref = write_input(tmp_path, seconds=4.0, name="ref.wav")
+        pipeline, tts, _ = self.build(tmp_path, simple_transcript, ref_audio=ref)
+        pipeline.run()
+
+        assert tts.prompt_kind == "hybrid"
+        assert tts.hybrid is not None
+        # No donor selection happened, so no clip object, just the file path.
+        assert tts.hybrid["timbre"] is None
+        assert tts.hybrid["timbre_audio"] == ref
+
+    def test_report_names_both_clips(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, accent = self.build(tmp_path, simple_transcript)
+        report = pipeline.run().report
+
+        assert report["accent_mode"] == "reference-accent"
+        assert report["donor"]["source"] == "auto"
+        assert report["donor"]["accent"]["path"] == str(accent)
+        assert report["donor"]["accent"]["transcript_provided"] is True
+
+    def test_report_names_the_timbre_clip_when_given(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        ref = write_input(tmp_path, seconds=4.0, name="ref.wav")
+        pipeline, _, accent = self.build(tmp_path, simple_transcript, ref_audio=ref)
+        report = pipeline.run().report
+
+        assert report["donor"]["source"] == "reference-audio"
+        assert report["donor"]["path"] == str(ref)
+        assert report["donor"]["accent"]["path"] == str(accent)
+
+    def test_cached_run_still_reports_the_accent_clip(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """A second run reuses 04_dubbed, so donor.json is not rewritten."""
+        pipeline, _, accent = self.build(tmp_path, simple_transcript)
+        pipeline.run()
+        rerun_report = pipeline.run().report
+
+        assert rerun_report["donor"]["accent"]["path"] == str(accent)
+
+    def test_other_modes_keep_a_flat_donor_record(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        donor = pipeline.run().report["donor"]
+        assert "accent" not in donor
 
 
 class TestEdgeCases:

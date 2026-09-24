@@ -300,10 +300,16 @@ class JobConfig(BaseModel):
     background_gain_db: float = Field(default=0.0, ge=-30.0, le=30.0)
 
     # Voice accent.
-    #   "preserve"     -> clone the speaker's voice AND accent (ICL mode)
-    #   "speaker-only" -> keep only the speaker embedding, letting the model use
-    #                     its own phonetics for the target language
+    #   "preserve"         -> clone the speaker's voice AND accent (ICL mode)
+    #   "speaker-only"     -> keep only the speaker embedding, letting the model
+    #                         use its own phonetics for the target language
+    #   "reference-accent" -> keep the speaker's timbre but take pronunciation and
+    #                         prosody from --accent-audio/--accent-text
     accent_mode: str = "preserve"
+    #: Native target-language clip whose phonetics the dub should adopt.
+    accent_audio: Path | None = None
+    #: Exact transcript of ``accent_audio`` (required: it aligns the speech codes).
+    accent_text: str | None = None
 
     keep_subtitles: bool = True
     force: bool = False
@@ -317,14 +323,24 @@ class JobConfig(BaseModel):
     @classmethod
     def _check_accent(cls, value: str) -> str:
         key = str(value).strip().lower().replace("_", "-")
-        aliases = {"preserve": "preserve", "icl": "preserve", "source": "preserve",
-                   "speaker-only": "speaker-only", "xvector": "speaker-only",
-                   "x-vector": "speaker-only", "speaker": "speaker-only"}
+        aliases = {
+            "preserve": "preserve",
+            "icl": "preserve",
+            "source": "preserve",
+            "speaker-only": "speaker-only",
+            "xvector": "speaker-only",
+            "x-vector": "speaker-only",
+            "speaker": "speaker-only",
+            "reference-accent": "reference-accent",
+            "ref-accent": "reference-accent",
+            "hybrid": "reference-accent",
+        }
         try:
             return aliases[key]
         except KeyError:
             raise ConfigError(
-                f"Unknown accent mode {value!r}. Use: preserve or speaker-only"
+                f"Unknown accent mode {value!r}. Use: preserve, speaker-only or "
+                "reference-accent"
             ) from None
 
     @field_validator("target_language")
@@ -342,7 +358,7 @@ class JobConfig(BaseModel):
             raise ConfigError("source_language must be an explicit language, not 'auto'")
         return normalized
 
-    @field_validator("video", "audio", "ref_audio", "output_dir")
+    @field_validator("video", "audio", "ref_audio", "accent_audio", "output_dir")
     @classmethod
     def _expand(cls, value: Path | None) -> Path | None:
         return value.expanduser() if value is not None else None
@@ -358,15 +374,32 @@ class JobConfig(BaseModel):
             )
 
         if self.ref_audio is not None:
-            # ICL cloning conditions on the reference transcript, so it is
-            # required there; speaker-only cloning uses just the speaker
-            # embedding and ignores the text.
-            needs_transcript = self.accent_mode != "speaker-only"
+            # ICL cloning conditions on the reference transcript, so it is required
+            # there. The other modes ignore it: speaker-only drops the codes
+            # entirely, and reference-accent takes them from --accent-audio.
+            needs_transcript = self.accent_mode == "preserve"
             if needs_transcript and (self.ref_text is None or not self.ref_text.strip()):
                 raise ConfigError(
                     "--ref-audio requires --ref-text (the exact transcript of the "
                     "reference clip). Omit both to auto-select a donor from the video."
                 )
+
+        if self.accent_mode == "reference-accent":
+            if self.accent_audio is None:
+                raise ConfigError(
+                    "--accent-mode reference-accent requires --accent-audio: a clip "
+                    "of a native target-language speaker, used for pronunciation only."
+                )
+            if self.accent_text is None or not self.accent_text.strip():
+                raise ConfigError(
+                    "--accent-audio requires --accent-text (its exact transcript), "
+                    "which aligns the accent clip's speech codes."
+                )
+        elif self.accent_audio is not None:
+            raise ConfigError(
+                "--accent-audio only applies to --accent-mode reference-accent; add "
+                "that flag or drop --accent-audio."
+            )
         return self
 
     @property

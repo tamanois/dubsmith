@@ -163,10 +163,21 @@ class TestJobConfigValidation:
             ("xvector", "speaker-only"),
             ("x-vector", "speaker-only"),
             ("Speaker_Only", "speaker-only"),
+            ("reference-accent", "reference-accent"),
+            ("hybrid", "reference-accent"),
+            ("ref-accent", "reference-accent"),
+            ("Reference_Accent", "reference-accent"),
         ],
     )
     def test_accent_mode_aliases(self, raw: str, expected: str) -> None:
-        assert JobConfig(audio=Path("a.wav"), accent_mode=raw).accent_mode == expected
+        # reference-accent additionally demands its two clips.
+        extra = (
+            {"accent_audio": Path("accent.wav"), "accent_text": "Bonjour"}
+            if expected == "reference-accent"
+            else {}
+        )
+        job = JobConfig(audio=Path("a.wav"), accent_mode=raw, **extra)  # type: ignore[arg-type]
+        assert job.accent_mode == expected
 
     def test_unknown_accent_mode_is_rejected(self) -> None:
         with pytest.raises(ConfigError, match="Unknown accent mode"):
@@ -174,6 +185,62 @@ class TestJobConfigValidation:
 
     def test_accent_mode_defaults_to_preserve(self) -> None:
         assert JobConfig(audio=Path("a.wav")).accent_mode == "preserve"
+
+
+class TestReferenceAccentMode:
+    """`reference-accent` splits phonetics from timbre across two clips."""
+
+    @staticmethod
+    def build(**overrides: object) -> JobConfig:
+        payload: dict[str, object] = {
+            "audio": Path("a.wav"),
+            "accent_mode": "reference-accent",
+            "accent_audio": Path("accent.wav"),
+            "accent_text": "Bonjour",
+        }
+        payload.update(overrides)
+        return JobConfig(**payload)  # type: ignore[arg-type]
+
+    def test_accepts_an_accent_clip(self) -> None:
+        job = self.build()
+        assert job.accent_audio == Path("accent.wav")
+        assert job.accent_text == "Bonjour"
+
+    def test_requires_an_accent_clip(self) -> None:
+        with pytest.raises(ConfigError, match="requires --accent-audio"):
+            self.build(accent_audio=None)
+
+    def test_requires_the_accent_transcript(self) -> None:
+        with pytest.raises(ConfigError, match="requires --accent-text"):
+            self.build(accent_text=None)
+        with pytest.raises(ConfigError, match="requires --accent-text"):
+            self.build(accent_text="   ")
+
+    def test_accent_clip_without_the_mode_is_rejected(self) -> None:
+        """Silently ignoring --accent-audio would be worse than failing."""
+        with pytest.raises(ConfigError, match="only applies to --accent-mode"):
+            JobConfig(audio=Path("a.wav"), accent_audio=Path("accent.wav"))
+
+    def test_timbre_reference_does_not_need_a_transcript(self) -> None:
+        """The donor clip supplies only an embedding here, so no transcript."""
+        job = self.build(ref_audio=Path("donor.wav"))
+        assert job.ref_text is None
+
+    def test_auto_donor_needs_neither_reference_nor_transcript(self) -> None:
+        job = self.build()
+        assert job.ref_audio is None and job.ref_text is None
+
+    def test_existing_modes_are_unaffected(self) -> None:
+        assert JobConfig(audio=Path("a.wav")).accent_mode == "preserve"
+        speaker_only = JobConfig(
+            audio=Path("a.wav"), ref_audio=Path("r.wav"), accent_mode="speaker-only"
+        )
+        assert speaker_only.accent_audio is None
+        assert speaker_only.ref_text is None
+
+    def test_accent_clip_is_expanded(self) -> None:
+        job = self.build(accent_audio=Path("~/accent.wav"))
+        assert "~" not in str(job.accent_audio)
 
     def test_expands_user_home(self) -> None:
         job = JobConfig(audio=Path("~/clip.wav"))

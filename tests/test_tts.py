@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -291,11 +292,130 @@ class TestAccentMode:
         assert model.prompts[0]["x_vector_only_mode"] is True
 
 
+@dataclass
+class FakePromptItem:
+    '''Duck-typed stand-in for the checkpoint's VoiceClonePromptItem.
+
+    It has to be a real dataclass because the hybrid path rebuilds it with
+    dataclasses.replace.
+    '''
+
+    ref_code: Any = None
+    ref_spk_embedding: Any = None
+    x_vector_only_mode: bool = False
+    icl_mode: bool = True
+    ref_text: str | None = None
+
+
+class HybridQwenModel(FakeQwenModel):
+    '''Tags each prompt item with the clip it came from, so provenance is testable.'''
+
+    def create_voice_clone_prompt(self, **kwargs: Any) -> list[FakePromptItem]:
+        self.prompts.append(kwargs)
+        ref = kwargs['ref_audio']
+        label = ref if isinstance(ref, str) else 'array'
+        return [
+            FakePromptItem(
+                ref_code=f'code:{label}',
+                ref_spk_embedding=f'embedding:{label}',
+                x_vector_only_mode=kwargs['x_vector_only_mode'],
+                icl_mode=not kwargs['x_vector_only_mode'],
+                ref_text=kwargs['ref_text'],
+            )
+        ]
+
+
+class TestHybridPrompt:
+    '''reference-accent takes codes from the accent clip, timbre from the voice.'''
+
+    def prepared(self, **kwargs: Any) -> tuple[TTSEngine, HybridQwenModel]:
+        model = HybridQwenModel()
+        engine = engine_with(model)  # type: ignore[arg-type]
+        engine.prepare_hybrid_prompt(
+            accent_audio=kwargs.pop('accent_audio', 'accent.wav'),
+            accent_text=kwargs.pop('accent_text', 'bonjour'),
+            **kwargs,
+        )
+        return engine, model
+
+    def test_accent_clip_is_read_in_icl_mode(self) -> None:
+        '''Codes only carry pronunciation when ICL mode is on.'''
+        _, model = self.prepared(timbre_audio='donor.wav')
+        assert model.prompts[0]['x_vector_only_mode'] is False
+        assert model.prompts[0]['ref_audio'] == 'accent.wav'
+
+    def test_timbre_clip_is_read_in_xvector_mode(self) -> None:
+        '''Only an embedding is wanted, so no timbre transcript is needed.'''
+        _, model = self.prepared(timbre_audio='donor.wav')
+        assert model.prompts[1]['x_vector_only_mode'] is True
+        assert model.prompts[1]['ref_text'] == ''
+
+    def test_result_takes_codes_from_accent_and_embedding_from_timbre(self) -> None:
+        engine, _ = self.prepared(timbre_audio='donor.wav')
+        assert isinstance(engine._prompt, list) and len(engine._prompt) == 1
+        item = engine._prompt[0]
+        assert item.ref_code == 'code:accent.wav'
+        assert item.ref_spk_embedding == 'embedding:donor.wav'
+        assert item.ref_text == 'bonjour'
+        assert item.icl_mode is True
+        assert item.x_vector_only_mode is False
+
+    def test_donor_clip_is_accepted_as_the_timbre_source(self) -> None:
+        donor = DonorClip(
+            samples=audio(3.0), sample_rate=SR, text='hello', start=0, end=3, segment_id=0
+        )
+        engine, model = self.prepared(timbre=donor)
+        assert model.prompts[1]['x_vector_only_mode'] is True
+        assert engine._prompt[0].ref_spk_embedding == 'embedding:array'
+
+    def test_requires_an_accent_transcript(self) -> None:
+        engine = engine_with(HybridQwenModel())  # type: ignore[arg-type]
+        with pytest.raises(TTSError, match='accent_text is required'):
+            engine.prepare_hybrid_prompt(
+                accent_audio='accent.wav', accent_text='  ', timbre_audio='donor.wav'
+            )
+
+    def test_requires_a_timbre_source(self) -> None:
+        engine = engine_with(HybridQwenModel())  # type: ignore[arg-type]
+        with pytest.raises(TTSError, match='needs a timbre source'):
+            engine.prepare_hybrid_prompt(accent_audio='accent.wav', accent_text='bonjour')
+
+    def test_unusable_prompt_items_are_reported(self) -> None:
+        '''A checkpoint returning objects without the field must fail loudly.'''
+
+        class OpaqueModel(HybridQwenModel):
+            def create_voice_clone_prompt(self, **kwargs: Any) -> list[Any]:
+                return [SimpleNamespace(ref_code='x')]
+
+        engine = engine_with(OpaqueModel())  # type: ignore[arg-type]
+        with pytest.raises(TTSError, match='Could not combine'):
+            engine.prepare_hybrid_prompt(
+                accent_audio='accent.wav', accent_text='bonjour', timbre_audio='donor.wav'
+            )
+
+    def test_hybrid_prompt_reaches_generation(self) -> None:
+        engine, model = self.prepared(timbre_audio='donor.wav')
+        engine.synthesize(['bonjour'], language='French')
+        assert model.calls[0]['voice_clone_prompt'][0].ref_code == 'code:accent.wav'
+
+    def test_existing_prompts_are_untouched(self) -> None:
+        '''Regression guard: the two original paths still produce one item each.'''
+        from_file = engine_with(FakeQwenModel())
+        from_file.prepare_prompt_from_file('ref.wav', 'bonjour')
+        assert from_file._prompt == 'prompt-token'
+
+        from_donor = engine_with(FakeQwenModel())
+        from_donor.prepare_prompt(
+            DonorClip(samples=audio(3.0), sample_rate=SR, text='hi', start=0, end=3, segment_id=0)
+        )
+        assert from_donor._prompt == 'prompt-token'
+
+
 class TestResolveDtype:
     def test_cuda_uses_bfloat16(self) -> None:
         import torch
 
-        assert resolve_dtype("cuda:0") == torch.bfloat16
+        assert resolve_dtype('cuda:0') == torch.bfloat16
 
     def test_cpu_uses_float32(self) -> None:
         import torch

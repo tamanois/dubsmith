@@ -349,13 +349,26 @@ class Pipeline:
                 pass
 
         if self.job.ref_audio is not None:
-            return {
+            info: dict[str, Any] = {
                 "source": "reference-audio",
                 "path": str(self.job.ref_audio),
                 "transcript_provided": bool((self.job.ref_text or "").strip()),
                 "accent_mode": self.job.accent_mode,
             }
-        return None
+        elif self.job.accent_mode == "reference-accent":
+            # Timbre came from the video, so it is unknown without donor.json; the
+            # accent clip is still known from the config.
+            info = {"accent_mode": self.job.accent_mode}
+        else:
+            return None
+
+        if self.job.accent_audio is not None:
+            info["accent"] = {
+                "source": "reference-audio",
+                "path": str(self.job.accent_audio),
+                "transcript_provided": bool((self.job.accent_text or "").strip()),
+            }
+        return info
 
     def _stage_transcribe(self, audio_path: Path, tmp_dir: Path) -> Transcript:
         """Transcribe the audio, caching the transcript."""
@@ -443,10 +456,13 @@ class Pipeline:
         def build() -> dict[int, Path]:
             engine = self._resolve_tts()
 
+            # Resolve the timbre source once: an explicit reference file, else the
+            # best segment of the source speech. The accent mode decides how the
+            # prompt is then built, not where the voice comes from.
+            donor = None
             if self.job.ref_audio is not None:
                 self.log.info("Using reference voice %s", self.job.ref_audio)
-                engine.prepare_prompt_from_file(self.job.ref_audio, self.job.ref_text or "")
-                donor_info = {
+                donor_info: dict[str, Any] = {
                     "source": "reference-audio",
                     "path": str(self.job.ref_audio),
                     "transcript_provided": bool((self.job.ref_text or "").strip()),
@@ -459,7 +475,6 @@ class Pipeline:
                     donor.segment_id,
                     donor.duration,
                 )
-                engine.prepare_prompt(donor)
                 donor_info = {
                     "source": "auto",
                     "segment_id": donor.segment_id,
@@ -468,6 +483,31 @@ class Pipeline:
                     "duration": round(donor.duration, 2),
                     "transcript": donor.text,
                 }
+
+            if self.job.accent_mode == "reference-accent":
+                assert self.job.accent_audio is not None  # guaranteed by JobConfig
+                self.log.info(
+                    "Hybrid voice: timbre from %s, accent from %s",
+                    donor_info.get("path") or f"segment {donor_info['segment_id']}",
+                    self.job.accent_audio,
+                )
+                engine.prepare_hybrid_prompt(
+                    accent_audio=self.job.accent_audio,
+                    accent_text=self.job.accent_text or "",
+                    timbre=donor,
+                    timbre_audio=self.job.ref_audio,
+                )
+                donor_info["accent"] = {
+                    "source": "reference-audio",
+                    "path": str(self.job.accent_audio),
+                    "transcript_provided": bool((self.job.accent_text or "").strip()),
+                }
+            elif self.job.ref_audio is not None:
+                engine.prepare_prompt_from_file(self.job.ref_audio, self.job.ref_text or "")
+            else:
+                assert donor is not None  # set in the branch above
+                engine.prepare_prompt(donor)
+
             donor_info["accent_mode"] = self.job.accent_mode
             # Persisted so the report can state the donor even when the stage is
             # served from cache on a later run.

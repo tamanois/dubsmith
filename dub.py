@@ -89,7 +89,10 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ref-text",
         default=None,
-        help="Exact transcript of --ref-audio (required with it, enables ICL mode).",
+        help=(
+            "Exact transcript of --ref-audio. Required with it in 'preserve' mode "
+            "(where the model conditions on both); ignored by the other modes."
+        ),
     )
 
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
@@ -161,12 +164,27 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--accent-mode",
         dest="accent_mode",
         default="preserve",
-        choices=["preserve", "speaker-only"],
+        choices=["preserve", "speaker-only", "reference-accent"],
         help=(
             "'preserve' clones the speaker's accent along with their voice; "
             "'speaker-only' keeps only the timbre embedding so the model uses its "
-            "own phonetics for the target language."
+            "own phonetics for the target language; 'reference-accent' keeps the "
+            "speaker's timbre but takes pronunciation from --accent-audio."
         ),
+    )
+    parser.add_argument(
+        "--accent-audio",
+        type=Path,
+        default=None,
+        help=(
+            "Clip of a native target-language speaker whose pronunciation the dub "
+            "should adopt. Requires --accent-text and --accent-mode reference-accent."
+        ),
+    )
+    parser.add_argument(
+        "--accent-text",
+        default=None,
+        help="Exact transcript of --accent-audio (required with it).",
     )
     parser.add_argument(
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
@@ -247,6 +265,8 @@ def cmd_dub(argv: Sequence[str]) -> int:
         separator=args.separator,
         duck_db=args.duck_db,
         accent_mode=args.accent_mode,
+        accent_audio=args.accent_audio,
+        accent_text=args.accent_text,
         keep_subtitles=not args.no_subtitles,
         force=args.force,
     )

@@ -16,9 +16,9 @@ decisions, and [`AGENTS.md`](AGENTS.md) for the project context.
 | **Speakers** | Single speaker (multi-speaker is roadmap P1) |
 | **Source language** | One language, auto-detected (multi-language is P5) |
 | **Target language** | English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
-| **Voice** | Cloned from the source speaker, **accent preserved** (native target accent is P2) |
-| **Output** | Dubbed video/audio + source & translated SRT subtitles |
-| **Not included** | Lip sync (P4), background music separation (P1) |
+| **Voice** | Cloned from the source speaker, with three accent modes (see [Accent modes](#accent-modes)) |
+| **Output** | Dubbed video/audio + source & translated SRT subtitles, original music/ambience preserved |
+| **Not included** | Lip sync (P4), multi-speaker diarization (P1) |
 
 ---
 
@@ -166,75 +166,294 @@ Optional models (registered but not needed for the MVP):
 | `tts_tokenizer` | `Qwen/Qwen3-TTS-Tokenizer-12Hz` | standalone tokenizer (already bundled in `tts_base`) |
 
 You can also copy a model directory in by hand — anything present under
-`MODELS_DIR` is detected automatically. Override the location with
-`MODELS_DIR` in `.env` or `--models-dir`.
+`MODELS_DIR` is detected automatically. Override the location with `MODELS_DIR`
+in `.env`, which every command then honours. The download command also takes
+`--models-dir` directly:
+
+```bash
+python dub.py models --download all --models-dir /data/models
+```
+
+Check which models are visible (and what to do about the ones that aren't):
+
+```bash
+python dub.py models --list
+```
+
+A dubbing run fails with an actionable message naming the exact download command
+if a required model is missing, so you can also just try a dub and see.
 
 ---
 
 ## Usage
 
-### Dub a video (auto-detect language and donor voice)
+### Which command do I want?
+
+| If you want… | Use | What it changes |
+|---|---|---|
+| a first working dub, zero setup | `--video talk.mp4 --target fr` | detects the source language, picks the donor voice from the video, preserves the original music/ambience |
+| a voice that isn't the video's speaker | `--ref-audio ref.wav --ref-text "…"` | clones `ref.wav` for both timbre and accent |
+| to drop the source accent | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
+| a native accent in the original voice | `--accent-mode reference-accent --accent-audio nat.wav --accent-text "…"` | timbre from the video's speaker, pronunciation from `nat.wav` |
+| no music behind the voice | `--no-background` | discards the separated bed instead of ducking it |
+| an absolute loudness target | `--loudness lufs --lufs -16` | forces a level instead of matching the source |
+| to redo a run from scratch | `--force` | ignores the stage cache |
+| to judge a run without listening | *nothing* | read `report.json` in the job folder |
+
+Every option is described in [Options in full](#options-in-full);
+`python dub.py --help` prints the same list.
+
+### Commands, grouped by purpose
+
+**Set up**
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # one-time
+pip install -r requirements.txt                      # runtime dependencies
+pip install -r requirements-dev.txt                  # + pytest
+
+python dub.py models --download all                  # ~6.5 GB of weights
+python dub.py models --list                          # what is present already?
+```
+
+**Dub something**
+
+```bash
+# video -> dubbed video, source language auto-detected
 python dub.py --video talk.mp4 --target fr
+
+# audio only: no ffmpeg needed, writes dub.wav + subtitles
+python dub.py --audio interview.wav --target es
+
+# trust your own language detection instead of Whisper's
+python dub.py --video talk.mp4 --source en --target de
+
+# skip the subtitle files
+python dub.py --video talk.mp4 --target ja --no-subtitles
 ```
 
-The reference voice is taken automatically from the longest clean speech
-segment, and its transcript comes from the ASR pass — so no manual setup needed.
+With no `--ref-audio`, the reference voice is taken automatically from the
+longest clean speech segment and its transcript comes from the ASR pass, so
+there is nothing to prepare by hand.
 
-### Dub an audio file
+**Choose the voice**
 
 ```bash
-python dub.py --audio interview.wav --target es
+# clone a specific recording instead of the speaker in the video
+python dub.py --video talk.mp4 --target fr \
+  --ref-audio "voice.wav" \
+  --ref-text "the exact words spoken in voice.wav"
+
+# keep the speaker's timbre, drop their accent
+python dub.py --video talk.mp4 --target fr --accent-mode speaker-only
+
+# keep the speaker's timbre, borrow a native accent
+python dub.py --video talk.mp4 --target fr \
+  --accent-mode reference-accent \
+  --accent-audio "native.wav" \
+  --accent-text "the exact words spoken in native.wav"
 ```
 
-Audio-only jobs need no `ffmpeg` and produce a dubbed WAV plus subtitles.
+Any format `libsndfile` reads works for reference and accent clips:
+`.wav` `.flac` `.mp3` `.ogg` `.aiff`, a URL, or a `(samples, rate)` tuple.
+`--ref-text` must be the **exact transcript** of `--ref-audio` because the model
+conditions on both (ICL mode); the same is true of `--accent-text` for
+`--accent-audio`. See [Accent modes](#accent-modes) for which mode needs which.
 
-### Use an explicit reference voice
+**Control the audio bed and level**
+
+```bash
+python dub.py --video talk.mp4 --target fr --no-background    # voice only
+python dub.py --video talk.mp4 --target fr --duck-db 10       # bury the music further
+python dub.py --video talk.mp4 --target fr --separator none   # treat the source as one track
+python dub.py --video talk.mp4 --target fr --loudness lufs --lufs -16
+```
+
+**Control timing**
+
+```bash
+python dub.py --video talk.mp4 --target fr --min-stretch 0.75  # allow faster speech, trim less
+python dub.py --video talk.mp4 --target fr --max-stretch 1.10  # cap how far lines are slowed
+python dub.py --video talk.mp4 --target fr --stretcher sox     # pick a specific backend
+```
+
+**Repeatable and diagnostic runs**
+
+```bash
+python dub.py --video talk.mp4 --target fr --force     # ignore the cache
+python dub.py --video talk.mp4 --target fr -v          # debug logging
+python dub.py --video talk.mp4 --target fr --device cpu # rule the GPU out
+```
+
+### Fast iteration
+
+A 5-minute video takes a few minutes to dub, which is slow to iterate on. Slice
+out a short section and dub that instead — the pipeline behaves identically,
+just faster:
+
+```bash
+ffmpeg -ss 30 -t 60 -i talk.mp4 -c copy clip60.mp4
+python dub.py --video clip60.mp4 --target fr
+```
+
+Note that `-c copy` cuts on the nearest keyframe, so `clip60.mp4` may start a
+second or two earlier than requested. That is fine for trying out options.
+
+### Accent modes
+
+Accent and timbre are stored separately by the checkpoint: pronunciation and
+prosody ride in the reference *speech codes*, while vocal identity rides in the
+*speaker embedding*. That split is what makes these three modes possible.
+
+| `--accent-mode` | Speech codes (accent, pacing) | Speaker embedding (timbre) | Use when |
+|---|---|---|---|
+| `preserve` *(default)* | the reference voice, or the auto-selected donor | same clip | You want the original speaker, including their accent |
+| `speaker-only` | none — the model chooses | the reference voice | The source accent is too strong and you want the model's own phonetics |
+| `reference-accent` | **`--accent-audio`** | the reference voice, or the auto donor | The dub still sounds foreign and you have a native-target clip to borrow pronunciation from |
+
+`speaker-only` is the cheap option: it needs no extra clip, but it also gives up
+control over delivery, so pacing drifts with the model. `reference-accent` costs
+you one clip and its transcript, and buys a delivery you can actually choose.
+
+### Borrow a native accent without losing the voice
+
+Hand over a recording of a native speaker. A news or podcast segment works
+better than a slow, careful personal reading — see
+[Reference pacing](#reference-pacing). The voice stays the speaker's; the
+pronunciation becomes the clip's:
 
 ```bash
 python dub.py --video talk.mp4 --target fr \
-  --ref-audio "Me - Voice extract.wav" \
-  --ref-text "Bonjour, je suis Joël, développeur cloud…"
+  --accent-mode reference-accent \
+  --accent-audio "native-narration.mp3" \
+  --accent-text "the exact words spoken in native-narration.mp3"
 ```
 
-`--ref-text` must be the **exact transcript** of `--ref-audio`; the model
-conditions on both (ICL mode). Any format `libsndfile` reads works:
-`.wav` `.flac` `.mp3` `.ogg` `.aiff`, a URL, or a `(samples, rate)` tuple.
-With `--accent-mode speaker-only` the transcript is ignored and therefore optional.
+Both flags are required together, and `--accent-text` must be the exact
+transcript of `--accent-audio` — it is what aligns the codes being borrowed.
+`--ref-audio` is optional: leave it out and the timbre is auto-selected from the
+video, exactly as in the other modes. Keep the accent clip short; 10–20 seconds
+is plenty, and a longer clip mostly costs synthesis time.
 
-> **Reference pacing matters.** The model imitates the reference clip's speaking
-> rate, so a slow, deliberate donor makes every dubbed line longer. Measured on
-> this repo's TED talk: a slow personal recording as donor needed ~30% more
-> compression than the source speaker did, quadrupling trimming (11 s → 23 s).
-> Prefer a reference whose pace is close to the speaker being dubbed, or lower
-> `--min-stretch` to allow faster speech.
+Measured on this repo's TED talk, same French lines and same donor, so the three
+rows are directly comparable:
 
-### Common options
-
-| Option | Default | Description |
+| Mode | Timbre similarity to donor | French acoustic fit (logprob, higher is better) |
 |---|---|---|
-| `--target` | `fr` | Target language (code or name) |
-| `--source` | auto | Force the source language |
-| `--device` | `auto` | `auto`, `cuda:0`, or `cpu` |
-| `--stretcher` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none` |
-| `--min-stretch` | `0.85` | Most compression allowed to fit a slot (lower = faster speech, fewer words trimmed) |
-| `--max-stretch` | `1.18` | Most slow-down allowed to fill a slot |
-| `--loudness` | `match-source` | `match-source` sits the dub at the original track's level; `lufs` forces `--lufs` |
-| `--lufs` | `-16` | Absolute LUFS target, used with `--loudness lufs` |
-| `--no-background` | off | Drop the original music/ambience instead of preserving it |
-| `--separator` | `auto` | `auto`, `demucs`, or `none` |
-| `--duck-db` | `6.0` | How far the background is pulled down under dialogue |
-| `--accent-mode` | `preserve` | `preserve` keeps the speaker's accent; `speaker-only` keeps only their timbre so the model uses native target-language phonetics |
-| `--output-dir` | `output` | Where job folders are written |
-| `--no-subtitles` | off | Skip SRT generation |
-| `--force` | off | Ignore cached stages and re-run everything |
-| `-v` / `--verbose` | off | Debug logging |
+| `preserve` | 0.9841 | −0.138 |
+| `speaker-only` | 0.9876 | −0.081 |
+| `reference-accent` | 0.9854 | **−0.057** |
+| *(same speaker, different utterance)* | 0.9808 | — |
 
-```bash
-python dub.py --help
-python dub.py models --help
-```
+All three keep the timbre above the natural same-speaker baseline; the hybrid mode
+moves the pronunciation furthest toward native French.
+
+### Reference pacing
+
+The model imitates the reference clip's speaking rate, so a slow, deliberate
+recording lengthens every dubbed line. Longer lines need more compression, and
+once the stretch limit is reached the surplus has to be trimmed. This applies to
+the donor (`--ref-audio`) and the accent clip (`--accent-audio`) alike.
+
+Measured on this repo's TED talk — same source, same voice, only the reference
+pacing differs:
+
+| Reference used as | Pace | Speech trimmed |
+|---|---|---|
+| auto donor (the source speaker) | ~3.5 words/s | 11.4 s |
+| slow personal recording, as donor | ~2.0 words/s | **23.0 s** |
+| slow personal recording, as accent clip | ~2.0 words/s | 13.4 s |
+| fast narrated clip, as accent clip | ~3.6 words/s | **2.3 s** |
+
+Two conclusions worth carrying into your own reference choices. Borrowing only an
+accent is cheaper than borrowing the whole voice: the same slow clip cost 13.4 s
+as an accent source but 23.0 s as the donor. And a brisk narrated clip beats a
+slow reading by a wide margin — nearly double the speech rate cut trimming by a
+factor of six.
+
+So prefer a reference whose pace is close to the speaker you are dubbing, and
+prefer a narrated clip over a careful personal recording. Failing that, lower
+`--min-stretch` to allow faster speech.
+
+Need a transcript and never wrote one down? Transcribing the clip with the same
+model the pipeline uses is accurate enough in practice — the run behind the table
+above used a machine transcript of the accent clip. Just avoid paraphrasing: the
+text has to match the audio it describes, so correct any obviously normalised
+numbers or names by hand.
+
+### Options in full
+
+**Input and language** — exactly one of `--video` / `--audio` is required.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--video PATH` | – | Video input. Enables muxing, so you get `video_dubbed.mp4`. Needs `ffmpeg`. |
+| `--audio PATH` | – | Audio-only input. Produces `dub.wav` + subtitles, needs no `ffmpeg`. |
+| `--target LANG` | `fr` | Language to dub into. Accepts a code (`fr`) or a name (`French`). |
+| `--source LANG` | auto | Overrides the detected source language. Useful when a clip is too short or too noisy for reliable detection. |
+
+**Voice** — see [Accent modes](#accent-modes) for how these interact.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--ref-audio PATH` | auto | Clones this recording instead of the speaker found in the video. |
+| `--ref-text TEXT` | – | Exact transcript of `--ref-audio`. Required with it in `preserve` mode; ignored in the other two modes. |
+| `--accent-mode MODE` | `preserve` | Where pronunciation comes from: `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip). |
+| `--accent-audio PATH` | – | Native target-language clip to borrow pronunciation from. Requires `--accent-mode reference-accent`. |
+| `--accent-text TEXT` | – | Exact transcript of `--accent-audio`. Required with it. |
+
+**Audio bed and loudness**
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--no-background` | off | Discards the original music/ambience. By default it is separated out and ducked under the dub instead. |
+| `--separator BACKEND` | `auto` | `auto`, `demucs` (split speech from the bed), or `none` (treat the source as a single track). |
+| `--duck-db DB` | `6.0` | How far the background drops while dialogue plays. Higher = the voice sits more forward. |
+| `--loudness POLICY` | `match-source` | `match-source` puts the dub at the original track's measured level; `lufs` forces `--lufs` instead. |
+| `--lufs VALUE` | `-16` | Absolute loudness target in LUFS. Only used with `--loudness lufs`. |
+
+**Timing** — these trade speech clarity against staying in sync.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--min-stretch RATIO` | `0.85` | Most a line may be compressed to fit its slot. Lower = faster speech, so fewer words get trimmed, but it can start to sound hurried. |
+| `--max-stretch RATIO` | `1.18` | Most a line may be slowed to fill its slot. Raising this makes speech sound unnatural, so prefer fixing the translation. |
+| `--stretcher BACKEND` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none`. `none` disables stretching (lines then only overrun or trim). Falls back automatically if a binary is missing. |
+
+**Models and hardware**
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--device DEVICE` | `auto` | `auto`, `cuda:0`, or `cpu`. `cpu` is much slower but proves the GPU is not the problem. |
+| `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate. |
+| `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
+| `MODELS_DIR` (env) | `models` | Where weights live. Set in `.env`; the download command also takes `--models-dir`. |
+
+**Output and caching**
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--output-dir DIR` | `output` | Where job folders are written. Each input gets its own `<stem>` folder. |
+| `--no-subtitles` | off | Skips both SRT files. |
+| `--force` | off | Ignores the stage cache and rebuilds everything. |
+| `-v` / `--verbose` | off | Debug logging, including which device each stage actually used. |
+
+### Verified commands
+
+These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
+figures come from each run's `report.json`.
+
+| Command | Result |
+|---|---|
+| `--video talk.mp4 --target fr` | 11.4 s of speech trimmed; sync exact; background preserved |
+| `--video talk.mp4 --target fr --ref-audio slow.wav --ref-text "…"` | 23.0 s trimmed — the slow reference lengthened every line |
+| `--video talk.mp4 --target fr --accent-mode speaker-only` | timbre 0.9876, French fit −0.081 |
+| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio slow.wav --accent-text "…"` | timbre 0.9854, French fit −0.057, 13.4 s trimmed |
+| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…"` | **best overall**: 2.3 s trimmed, 0 drift, loudness matched, background preserved |
+
+The last row is the configuration to aim for: a fast-paced native clip as the
+accent source gives near-native pronunciation with almost no speech lost. Full
+run takes about 2 minutes 45 seconds.
 
 ---
 
@@ -274,8 +493,9 @@ output/talk/
 | `loudness_peak_limited` | `true` when the limiter engaged to avoid clipping |
 | `background_preserved` | `true` when the original music/ambience was kept |
 | `duck_db` | Attenuation applied under dialogue (`null` when no background) |
-| `accent_mode` | `preserve` or `speaker-only` |
-| `donor` | Which reference voice was used: an explicit file, or the auto-selected segment |
+| `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
+| `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
+| `donor.accent` | Present only in `reference-accent` mode: the accent clip's path and whether a transcript was supplied |
 | `clamped_segments` | Lines that hit the ±15–20% stretch limit |
 | `overrun_segments` | Lines that spilled into the pause after them (free, no speech lost) |
 | `overrun_seconds_total` | Total speech fitted into those pauses |
@@ -305,10 +525,27 @@ if it does not, the material was too dynamic to reach the target cleanly.
 
 ### Caching
 
-Stages are cached per job in `manifest.json`, keyed by a fingerprint of the job
-settings. Re-running the same command does nothing; use `--force` to override.
-Changing any setting (target language, donor, device, stretch bounds…) changes
-the fingerprint and re-runs the affected job from scratch.
+Stages are cached in `<job folder>/manifest.json`, keyed by a fingerprint of
+every job setting. Re-running an identical command does nothing at all — that is
+what makes iterating on a long video cheap.
+
+The fingerprint is a hash of the whole configuration, so **changing any option
+re-runs the whole job**: the target language, the accent mode, the reference or
+accent clip, the stretch bounds, the device. There is no partial invalidation, so
+a run that only changes `--accent-mode` re-does the ASR and translation as well.
+That is deliberate — it keeps a result reproducible from one command — but it
+means experimenting costs a full run each time. Slice the input short
+(see [Fast iteration](#fast-iteration)) when you plan to try several settings.
+
+Because the fingerprint distinguishes settings, you can safely point several
+different runs at the same `--output-dir`: each input gets its own `<stem>`
+folder, and a run whose settings differ from the last one starts fresh rather
+than reusing stale audio.
+
+```bash
+python dub.py --video talk.mp4 --target fr --force        # ignore the cache entirely
+rm -rf output/talk                                        # or just start clean
+```
 
 ---
 
@@ -334,7 +571,8 @@ Two design points worth knowing:
 
 - **Accent comes from the donor clip, timbre from cloning.** With no
   `--ref-audio`, the source speaker is the donor, so the accent is *preserved*.
-  A native-accent dub is roadmap P2.
+  `--accent-mode speaker-only` drops the donor's phonetics altogether;
+  `--accent-mode reference-accent` replaces them with a native clip's.
 - **Timing errors never accumulate.** Each line is anchored to its own original
   start time; a line that does not fit spills into the pause after it and any
   residue beyond that is trimmed. Lines are never pushed late, so a long
@@ -345,7 +583,8 @@ Two design points worth knowing:
 ## Tests
 
 All tests run **without** a GPU, downloaded models, or ffmpeg — heavy components
-are injected as fakes and binaries are mocked.
+are injected as fakes and binaries are mocked. The whole suite runs in about
+15 seconds.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -353,7 +592,15 @@ python -m pytest
 ```
 
 ```
-253 passed
+359 passed
+```
+
+Run a single area while iterating:
+
+```bash
+python -m pytest tests/test_tts.py -q          # voice cloning, accent modes
+python -m pytest tests/test_pipeline.py -q     # end-to-end orchestration
+python -m pytest -k accent -q                  # everything accent-related
 ```
 
 ---
@@ -370,6 +617,9 @@ python -m pytest
 | `Translation response was not valid JSON` | Lower `LLM_CHUNK_SIZE` in `.env`, or use a model better at JSON |
 | `Translation request to … failed` | The LLM server isn't reachable — check `LLM_BASE_URL` |
 | `--ref-audio requires --ref-text` | Add the exact transcript, or drop both flags to auto-pick a donor |
+| `--accent-audio only applies to --accent-mode reference-accent` | Add that flag, or remove `--accent-audio` |
+| `--accent-mode reference-accent requires --accent-audio` | Add the native-target clip, or use another mode |
+| `--accent-audio requires --accent-text` | Transcribe the accent clip; the codes cannot be aligned without it |
 | `does not support voice cloning` | Pointed at a CustomVoice/VoiceDesign checkpoint; use `tts_base` |
 | `Unsupported language 'xx'` | Use one of the ten supported languages |
 | CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it) |
@@ -379,7 +629,9 @@ python -m pytest
 | Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
 | Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
 | Music fights the voice | Raise `--duck-db` (default 6 dB) |
-| Dub still has the speaker's accent | Try `--accent-mode speaker-only`, which keeps the timbre but drops the donor's phonetics |
+| Dub still has the speaker's accent | Try `--accent-mode speaker-only`, which keeps the timbre but drops the donor's phonetics. If that is not enough, use `--accent-mode reference-accent` with a native clip |
+| Still sounds foreign in `reference-accent` mode | Check `--accent-text` matches the clip word for word — mismatched text misaligns the borrowed codes. A longer, more natural accent clip also helps |
+| The dub is rushed, or words are missing | The reference clip's pacing is being imitated, and a slow reference lengthens every line. Use a faster-paced reference — see [Reference pacing](#reference-pacing) |
 
 Logs are written to stderr and include a job id. Set `LOG_JSON=1` for
 machine-readable logs.
@@ -402,7 +654,7 @@ pipeline/
 ├── tts.py                 donor selection + voice cloning
 ├── timing.py              stretching backends + timeline assembly
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (227 tests)
+tests/                     pytest suite (359 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
@@ -419,8 +671,12 @@ PLAN.md                    roadmap: MVP + P1–P6
   increasingly required by platforms. A consent gate is planned for P6.
 - **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
   Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
-- **Known MVP gaps**, all tracked in `PLAN.md`: multi-speaker video, background
-  music preservation, native target accent, lip sync, multi-language sources,
-  and iterative length control in the translation loop.
+- **Known MVP gaps**, all tracked in `PLAN.md`: multi-speaker diarization, lip
+  sync, multi-language source videos, and iterative length control in the
+  translation loop. Background preservation and native-accent borrowing are
+  implemented (see [Accent modes](#accent-modes)).
+- **Accent borrowing needs a supplied clip.** `reference-accent` takes
+  pronunciation from `--accent-audio`; it does not yet choose or generate a
+  native voice by itself. Fully unattended native accent is roadmap P2.
 - **Changing any setting re-runs the whole job** — the cache fingerprint is
   per-job, not per-stage. Fine for a CLI; worth refining before P6.

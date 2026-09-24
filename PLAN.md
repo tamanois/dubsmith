@@ -21,7 +21,7 @@
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 330 passing | `tests/` |
+| Tests | ✅ 359 passing | `tests/` |
 
 Verification performed:
 
@@ -125,19 +125,96 @@ speaker, and ICL cloning conditions on their speech codes, so their English
 phonetics came along. Added `--accent-mode speaker-only`, which keeps only the
 speaker embedding and lets the model use its own target-language phonetics.
 
-Measured on the same French lines with the same donor:
+Measured on the same French lines with the same donor (one controlled run, so the
+three rows are directly comparable):
 
-| Mode | Timbre similarity to donor | French acoustic fit (avg logprob) |
-|---|---|---|
-| `preserve` (default) | 0.9911 | −0.139 |
-| `speaker-only` | 0.9873 | **−0.061** |
-| *(same speaker, different utterance)* | 0.9869 | — |
+| Mode | Timbre similarity to donor | French acoustic fit (avg logprob) | English-forced logprob (higher = more English-like) |
+|---|---|---|---|
+| `preserve` (default) | 0.9841 | −0.138 | −0.351 |
+| `speaker-only` | 0.9876 | −0.081 | −0.262 |
+| **`reference-accent`** | 0.9854 | **−0.057** | −0.215 |
+| *(same speaker, different utterance)* | 0.9808 | — | — |
+
+All three modes retain timbre above the natural same-speaker baseline (0.9808).
+Forced to French, `reference-accent` gives the best French acoustic fit; forced to
+English, it is the *least* English-like of the three. Both signals point the same
+way: the accent moves furthest toward native French, while the voice stays the
+speaker's. Listening is still the ground truth, but the direction is unambiguous.
 
 Speaker-only retains timbre within natural same-speaker variation while fitting
 French phonetics noticeably better, so the accent problem may need no
 voice-conversion stage at all. Listening is still the ground truth; the full
 two-stage path (VoiceDesign accent reference + voice conversion) remains the
 fallback if it proves insufficient.
+
+**4. Still audibly accented (addressed by `reference-accent`).** The user
+listened again and `speaker-only` was not enough. Asking the model to pick its
+own phonetics gives up control over delivery; the fix is to *supply* the
+pronunciation instead of hoping for it.
+
+The checkpoint splits what we need: `ref_code` carries pronunciation and prosody,
+while `ref_spk_embedding` carries vocal identity. `x_vector_only_mode`/`icl_mode`
+only decide which of the two the model *uses*, so they can be sourced from
+different clips. New `TTSEngine.prepare_hybrid_prompt()` reads the accent clip in
+ICL mode and the timbre clip in x-vector mode, then rebuilds one prompt item via
+`dataclasses.replace(accent_item, ref_spk_embedding=timbre_item.ref_spk_embedding)`.
+Because the timbre side is only ever an embedding, it needs no transcript.
+
+| `--accent-mode` | Speech codes (accent, pacing) | Speaker embedding (timbre) |
+|---|---|---|
+| `preserve` | the reference voice / auto donor | same clip |
+| `speaker-only` | none — the model decides | the reference voice / auto donor |
+| `reference-accent` | `--accent-audio` | the reference voice / auto donor |
+
+Additive by design: no mode was renamed, removed, or re-defaulted, and
+`--accent-audio` without the matching mode is a hard error rather than a silent
+no-op. The accent clip is recorded in `report.json` under `donor.accent`, and
+`_donor_info()` re-derives it on cache hits so a second run still reports it.
+
+Full-pipeline runs on the 4:47 TED talk (English → French), both end to end with
+real Whisper, real LLM, real Demucs and real Qwen3-TTS:
+
+| | `preserve` + slow French donor | `reference-accent` (hybrid) |
+|---|---|---|
+| Segments | 59 | 60 |
+| Speech trimmed to keep sync | 22.98 s | **13.36 s** |
+| Speech reclaimed into pauses | 10.51 s | 7.32 s |
+| Lines shifted late / max drift | 0 / 0.000 s | 0 / 0.000 s |
+| Loudness vs source | −0.0 dB | −0.0 dB |
+| Background preserved | ✅ | ✅ |
+| Round-trip WER (per segment) | 1.6% | 1.2% |
+| Wall clock | — | 2 m 48 s (2× realtime) |
+
+Read that table with care: the two runs used different segmentations, so it is
+*not* a controlled comparison. The controlled experiment is the A/B table above;
+these rows only show that the mode works end to end without regressing sync,
+loudness, background or intelligibility. Round-trip WER is measured per segment
+rather than on the assembled track, where Whisper hallucinates into the silence
+gaps.
+
+Known cost: the accent clip's *pacing* rides along with its accent. A slow
+reference lengthens every line, which means more compression and more trimming —
+the same coupling documented for `--ref-audio`. Mitigation is a naturally-paced
+accent clip; the structural fix is P3's length feedback loop.
+
+**Confirmed by the user on the same video, with a faster accent clip.** Swapping
+the slow personal recording for a 14.8 s narrated news clip (~3.6 words/s, and an
+MP3, confirming the accent path is not WAV-only) cut trimmed speech to **2.32 s**,
+with 0 drift, loudness delta −0.0 and the background preserved. That is the best
+configuration measured so far, and it settles the pacing question empirically:
+
+| Reference used as | Pace | Speech trimmed |
+|---|---|---|
+| auto donor (the source speaker) | ~3.5 words/s | 11.4 s |
+| slow personal recording, as donor | ~2.0 words/s | 23.0 s |
+| slow personal recording, as accent clip | ~2.0 words/s | 13.4 s |
+| fast narrated clip, as accent clip | ~3.6 words/s | **2.3 s** |
+
+Two things follow. Borrowing only the accent is cheaper than borrowing the whole
+voice (13.4 s vs 23.0 s for the same slow clip). And reference *pace* dominates
+all of it: doubling the speech rate cut trimming sixfold, which is a larger
+effect than any timing knob we expose. Guidance recorded in the README is
+therefore to prefer a brisk narrated clip over a careful personal reading.
 
 Deviations from the original plan (deliberate, documented):
 
@@ -188,13 +265,16 @@ voice timbre**, ideally with the **target language's accent**.
 - One video in → one dubbed video out, via a single CLI command.
 - Single source language (auto-detected at video level, overridable by flag).
 - Single speaker; target language **French**.
-- Voice cloning with the speaker's own timbre (accent preserved — D9).
+- Voice cloning with the speaker's own timbre.
+- Accent handling: `preserve` (default), `speaker-only`, or `reference-accent`
+  (borrow a native clip's pronunciation while keeping the voice's timbre).
 - Audio re-timed to the source timeline (no lip sync).
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
-- Multi-speaker diarization (P1), background music/SFX preservation (P1).
-- Native target accent via voice conversion (P2).
+- Multi-speaker diarization (P1).
+- Fully automatic native accent: `reference-accent` needs a supplied clip, so an
+  unattended native-accent path via voice conversion is still P2.
 - Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
 - Lip sync (P4), multi-source-language videos (P5), service-ification (P6).
 
@@ -232,7 +312,9 @@ output/
 
 The donor voice is either provided (`--ref-audio` + `--ref-text`) or, by default,
 auto-extracted from the video: the longest clean segment's audio + its Whisper
-transcript. `ref-text` must match the donor clip exactly (ICL mode).
+transcript. `ref-text` must match the donor clip exactly (ICL mode) — except in
+`speaker-only` and `reference-accent` modes, where the donor contributes only a
+speaker embedding (`x_vector_only_mode=True`) and no transcript is involved.
 
 ### 3.3 Tech stack
 
