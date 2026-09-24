@@ -39,6 +39,9 @@ class ModelSpec:
     dir_name: str
     description: str
     license: str
+    #: How the weights are obtained: "huggingface" or "demucs" (torch hub, and
+    #: fetched lazily by the package, so it is only pre-warmed here).
+    source: str = "huggingface"
 
 
 REGISTRY: dict[str, ModelSpec] = {
@@ -78,6 +81,14 @@ REGISTRY: dict[str, ModelSpec] = {
         description="Standalone speech tokenizer (optional; bundled with tts_base)",
         license="Apache-2.0",
     ),
+    "demucs": ModelSpec(
+        name="demucs",
+        repo_id="htdemucs (torch hub)",
+        dir_name="demucs",
+        description="Speech/background separation for keeping music and ambience",
+        license="MIT",
+        source="demucs",
+    ),
 }
 
 #: Models the MVP cannot run without.
@@ -100,12 +111,21 @@ def _spec(name: str) -> ModelSpec:
 
 
 def is_available(name: str, models_dir: Path | str = "models") -> bool:
-    """True when the model directory exists and holds at least one file.
+    """True when the model can be used without downloading anything now.
 
     A manually populated directory (e.g. copied over from another machine) counts
     as available, so the downloader is a convenience rather than a requirement.
+    Package-backed models (Demucs) report availability when the package is
+    importable; their weights are fetched by the package on first use, or
+    pre-warmed by :func:`download_model`.
     """
     spec = _spec(name)
+
+    if spec.source == "demucs":
+        import importlib.util
+
+        return importlib.util.find_spec("demucs") is not None
+
     root = Path(models_dir) / spec.dir_name
     if not root.is_dir():
         return False
@@ -121,9 +141,12 @@ def resolve_model(name: str, models_dir: Path | str = "models") -> Path:
     spec = _spec(name)
     root = Path(models_dir) / spec.dir_name
     if not is_available(name, models_dir):
+        remedy = (
+            "pip install demucs" if spec.source == "demucs" else download_hint(name)
+        )
         raise ModelNotFoundError(
             f"Model {name!r} ({spec.repo_id}) not found at {root}",
-            remedy=download_hint(name),
+            remedy=remedy,
         )
     return root
 
@@ -136,13 +159,28 @@ def download_model(
 ) -> Path:
     """Download ``name`` into ``models_dir`` and return the directory.
 
-    Uses ``huggingface_hub.snapshot_download`` (already a dependency of
-    transformers, so no extra package is required).
+    Hugging Face models are fetched with ``huggingface_hub.snapshot_download``
+    (already a dependency of transformers, so no extra package is required).
+    Package-backed models such as Demucs are pre-warmed instead: their weights
+    live in the torch hub cache and are downloaded by the package itself.
+
+    Raises:
+        DependencyError: If a package-backed model's package is not installed.
     """
     from huggingface_hub import snapshot_download
 
     spec = _spec(name)
     root = Path(models_dir) / spec.dir_name
+
+    if spec.source == "demucs":
+        # Fetch the weights into the torch hub cache so the first job does not
+        # pay for the download.
+        from demucs.pretrained import get_model
+
+        get_model("htdemucs")
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     if is_available(name, models_dir) and not force:
         return root
 

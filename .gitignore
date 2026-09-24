@@ -11,6 +11,7 @@ models/
 
 # Job artifacts (dubbed video, subtitles, reports, manifests)
 output/
+input/
 
 # Local configuration: may contain API keys
 .env

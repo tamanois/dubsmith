@@ -178,11 +178,17 @@ class TTSEngine:
         device: str = "auto",
         dtype: Any | None = None,
         batch_size: int = 8,
+        x_vector_only: bool = False,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.device = device
         self._dtype = dtype
         self.batch_size = max(1, int(batch_size))
+        #: Use only the reference's speaker embedding, ignoring its speech codes.
+        #: ICL mode (False) also conditions on the reference phonetics, which is
+        #: what carries the speaker's *accent*; speaker-only mode drops those and
+        #: lets the model use its own phonetics for the target language.
+        self.x_vector_only = bool(x_vector_only)
         self._model: Any | None = None
         self._prompt: Any | None = None
         self._sample_rate: int | None = None
@@ -243,17 +249,19 @@ class TTSEngine:
         self._prompt = self.model.create_voice_clone_prompt(
             ref_audio=(np.asarray(donor.samples, dtype=np.float32), int(donor.sample_rate)),
             ref_text=donor.text,
-            x_vector_only_mode=False,
+            x_vector_only_mode=self.x_vector_only,
         )
 
     def prepare_prompt_from_file(self, ref_audio: Path | str, ref_text: str) -> None:
         """Build the clone prompt from an explicit reference file and transcript."""
-        if not ref_text or not ref_text.strip():
+        # ICL mode conditions on the transcript, so it is required there; in
+        # speaker-only mode the text is ignored and may legitimately be absent.
+        if not self.x_vector_only and (not ref_text or not ref_text.strip()):
             raise TTSError("ref_text is required to clone from a reference file (ICL mode).")
         self._prompt = self.model.create_voice_clone_prompt(
             ref_audio=str(ref_audio),
             ref_text=ref_text,
-            x_vector_only_mode=False,
+            x_vector_only_mode=self.x_vector_only,
         )
 
     # -- synthesis --------------------------------------------------------- #

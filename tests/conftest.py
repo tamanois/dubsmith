@@ -41,3 +41,18 @@ def simple_transcript() -> Transcript:
             Segment(id=2, start=5.0, end=8.0, text="I am fine, thanks for asking."),
         ],
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_load_demucs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite fast and isolated by disabling real separation.
+
+    The orchestrator would otherwise pick up the installed Demucs model on every
+    pipeline test. Tests that need a background stem inject their own fake
+    separator, so the real path stays covered without loading weights.
+    """
+    from pipeline.separation import NullSeparator
+
+    monkeypatch.setattr(
+        "pipeline.orchestrate.detect_separator", lambda *args, **kwargs: NullSeparator()
+    )

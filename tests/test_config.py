@@ -125,6 +125,16 @@ class TestJobConfigValidation:
         job = JobConfig(audio=Path("a.wav"), ref_audio=Path("r.wav"), ref_text="Bonjour")
         assert job.ref_text == "Bonjour"
 
+    def test_speaker_only_mode_does_not_need_a_reference_transcript(self) -> None:
+        """The transcript is ignored in speaker-only mode, so it is not required."""
+        job = JobConfig(audio=Path("a.wav"), ref_audio=Path("r.wav"), accent_mode="speaker-only")
+        assert job.ref_audio == Path("r.wav")
+        assert job.ref_text is None
+
+    def test_preserve_mode_still_requires_the_transcript(self) -> None:
+        with pytest.raises(ConfigError, match="ref-text"):
+            JobConfig(audio=Path("a.wav"), ref_audio=Path("r.wav"), accent_mode="preserve")
+
     def test_rejects_identical_source_and_target(self) -> None:
         with pytest.raises(ConfigError, match="source_language and target_language"):
             JobConfig(audio=Path("a.wav"), source_language="en", target_language="en")
@@ -143,6 +153,27 @@ class TestJobConfigValidation:
             JobConfig(audio=Path("a.wav"), min_stretch=1.5)
         with pytest.raises(Exception):
             JobConfig(audio=Path("a.wav"), max_stretch=0.5)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("preserve", "preserve"),
+            ("icl", "preserve"),
+            ("speaker-only", "speaker-only"),
+            ("xvector", "speaker-only"),
+            ("x-vector", "speaker-only"),
+            ("Speaker_Only", "speaker-only"),
+        ],
+    )
+    def test_accent_mode_aliases(self, raw: str, expected: str) -> None:
+        assert JobConfig(audio=Path("a.wav"), accent_mode=raw).accent_mode == expected
+
+    def test_unknown_accent_mode_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown accent mode"):
+            JobConfig(audio=Path("a.wav"), accent_mode="telepathy")
+
+    def test_accent_mode_defaults_to_preserve(self) -> None:
+        assert JobConfig(audio=Path("a.wav")).accent_mode == "preserve"
 
     def test_expands_user_home(self) -> None:
         job = JobConfig(audio=Path("~/clip.wav"))

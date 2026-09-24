@@ -119,6 +119,56 @@ def build_dub_parser() -> argparse.ArgumentParser:
         help="Maximum slow-down applied to fill a slot.",
     )
     parser.add_argument(
+        "--loudness",
+        dest="loudness_target",
+        default=None,
+        choices=["match-source", "lufs"],
+        help=(
+            "Loudness policy: 'match-source' (default) sits the dub at the level "
+            "of the original track; 'lufs' forces --lufs."
+        ),
+    )
+    parser.add_argument(
+        "--lufs",
+        dest="target_lufs",
+        type=float,
+        default=None,
+        help="Absolute loudness target in LUFS, used when --loudness lufs.",
+    )
+    parser.add_argument(
+        "--no-background",
+        dest="keep_background",
+        action="store_false",
+        default=True,
+        help=(
+            "Discard the original music and ambience instead of preserving it. "
+            "By default the background is separated out and ducked under the dub."
+        ),
+    )
+    parser.add_argument(
+        "--separator",
+        default="auto",
+        choices=["auto", "demucs", "none"],
+        help="Backend used to split speech from background.",
+    )
+    parser.add_argument(
+        "--duck-db",
+        type=float,
+        default=6.0,
+        help="How far to pull the background down while dialogue plays, in dB.",
+    )
+    parser.add_argument(
+        "--accent-mode",
+        dest="accent_mode",
+        default="preserve",
+        choices=["preserve", "speaker-only"],
+        help=(
+            "'preserve' clones the speaker's accent along with their voice; "
+            "'speaker-only' keeps only the timbre embedding so the model uses its "
+            "own phonetics for the target language."
+        ),
+    )
+    parser.add_argument(
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
     )
     parser.add_argument("--force", action="store_true", help="Ignore cached stages.")
@@ -191,6 +241,12 @@ def cmd_dub(argv: Sequence[str]) -> int:
         llm_model=args.llm_model,
         min_stretch=args.min_stretch,
         max_stretch=args.max_stretch,
+        loudness_target=args.loudness_target,
+        target_lufs=args.target_lufs,
+        keep_background=args.keep_background,
+        separator=args.separator,
+        duck_db=args.duck_db,
+        accent_mode=args.accent_mode,
         keep_subtitles=not args.no_subtitles,
         force=args.force,
     )

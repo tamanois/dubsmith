@@ -41,10 +41,33 @@ class FakeTranscriber:
     def __init__(self, transcript: Transcript) -> None:
         self.transcript = transcript
         self.calls = 0
+        self.paths: list[Path] = []
 
     def __call__(self, audio_path: Path) -> Transcript:
         self.calls += 1
+        self.paths.append(Path(audio_path))
         return self.transcript
+
+
+class FakeSeparator:
+    """Splits audio into the same speech plus a constant background tone."""
+
+    name = "fake"
+
+    def __init__(self, background_amplitude: float = 0.05) -> None:
+        self.background_amplitude = background_amplitude
+        self.calls = 0
+
+    def separate(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self.calls += 1
+        data = np.asarray(samples, dtype=np.float32).reshape(-1)
+        t = np.arange(data.size, dtype=np.float64) / float(sample_rate)
+        background = (
+            self.background_amplitude * np.sin(2 * np.pi * 440.0 * t)
+        ).astype(np.float32)
+        return data, background
 
 
 class FakeTranslator:
@@ -105,10 +128,12 @@ def make_pipeline(
     *,
     translator: FakeTranslator | None = None,
     tts: FakeTTSEngine | None = None,
+    separator: Any | None = None,
     **job_kwargs: Any,
 ) -> tuple[Pipeline, FakeTranscriber, FakeTranslator, FakeTTSEngine]:
     audio = job_kwargs.pop("input_path", None) or write_input(tmp_path)
-    job = JobConfig(audio=audio, output_dir=tmp_path / "output", **job_kwargs)
+    output_dir = job_kwargs.pop("output_dir", None) or (tmp_path / "output")
+    job = JobConfig(audio=audio, output_dir=output_dir, **job_kwargs)
     transcriber = FakeTranscriber(transcript)
     translator = translator or FakeTranslator()
     tts = tts or FakeTTSEngine()
@@ -119,6 +144,7 @@ def make_pipeline(
         translator=translator,
         tts_engine=tts,
         stretcher=IdentityStretcher(),
+        separator=separator,
     )
     return pipeline, transcriber, translator, tts
 
@@ -171,28 +197,64 @@ class TestAudioJob:
         assert report["is_video"] is False
         assert report["clamped_segments"] >= 0
 
-    def test_report_loudness_describes_the_delivered_file(
+    def test_report_loudness_matches_the_source_by_default(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
-        """The reported loudness must match dub.wav, not the pre-normalisation mix."""
+        """The dub should sit at the level of the track it replaces."""
         pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
         result = pipeline.run()
         report = result.report
 
-        assert report["loudness_target_lufs"] == media.TARGET_LUFS
-        assert set(report) >= {
-            "loudness_dub_lufs",
-            "loudness_source_lufs",
-            "loudness_target_lufs",
-            "loudness_gain_db",
-            "loudness_peak_limited",
-        }
+        assert report["loudness_policy"] == "match-source"
+        assert report["loudness_source_lufs"] is not None
+        # Target is the source's own measured level.
+        assert report["loudness_target_lufs"] == pytest.approx(
+            report["loudness_source_lufs"], abs=0.01
+        )
 
         samples, sample_rate = media.load_audio(result.dub_track)
         actual = media.measure_loudness(samples, sample_rate)
         assert actual is not None
-        if report["loudness_dub_lufs"] is not None:
-            assert report["loudness_dub_lufs"] == pytest.approx(actual, abs=0.05)
+        # The reported figure describes the delivered file...
+        assert report["loudness_dub_lufs"] == pytest.approx(actual, abs=0.05)
+        # ...and the delivered file is not quieter than the source.
+        assert report["loudness_delta_vs_source"] == pytest.approx(0.0, abs=1.0)
+
+    def test_absolute_loudness_policy_is_honoured(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            loudness_target="lufs",
+            target_lufs=-30.0,
+        )
+        report = pipeline.run().report
+
+        assert report["loudness_policy"] == "lufs"
+        assert report["loudness_target_lufs"] == -30.0
+        assert report["loudness_dub_lufs"] == pytest.approx(-30.0, abs=1.0)
+
+    def test_dub_does_not_clip(self, tmp_path: Path, simple_transcript: Transcript) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        samples, _ = media.load_audio(pipeline.run().dub_track)
+        assert float(np.max(np.abs(samples))) <= 1.0
+
+    def test_accent_mode_is_reported_and_forwarded(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        tts = FakeTTSEngine()
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, tts=tts, accent_mode="speaker-only"
+        )
+        report = pipeline.run().report
+        assert report["accent_mode"] == "speaker-only"
+
+    def test_default_accent_mode_preserves_the_source_accent(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        assert pipeline.run().report["accent_mode"] == "preserve"
 
     def test_subtitles_can_be_disabled(self, tmp_path: Path, simple_transcript: Transcript) -> None:
         pipeline, _, _, _ = make_pipeline(
@@ -392,6 +454,104 @@ class TestLongTranslationUsesTheGap:
         last = self.placements(pipeline)[-1]
         assert last["overrun"] > 1.0
         assert last["trimmed"] == 0.0
+
+
+class TestBackgroundPreservation:
+    """The original music and ambience must survive the dub."""
+
+    def test_stems_are_written_and_reported(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        separator = FakeSeparator()
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript, separator=separator)
+        report = pipeline.run().report
+
+        assert separator.calls == 1
+        assert (pipeline.job_dir / "01b_speech.wav").is_file()
+        assert (pipeline.job_dir / "01c_background.wav").is_file()
+        assert report["background_preserved"] is True
+        assert report["duck_db"] == 6.0
+
+    def test_asr_and_donor_use_the_speech_stem(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, transcriber, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator()
+        )
+        pipeline.run()
+        assert transcriber.paths[-1].name == "01b_speech.wav"
+
+    def test_background_audio_reaches_the_output(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """Compare with and without a bed: the gaps must differ.
+
+        The two runs use separate output directories; sharing one would let the
+        second reuse the first's cached mix (caching is keyed on the job
+        fingerprint, which does not include an injected separator).
+        """
+        silent_pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, output_dir=tmp_path / "out_silent"
+        )
+        silent_result = silent_pipeline.run()
+        silent_samples, sample_rate = media.load_audio(silent_result.dub_track)
+
+        bedded_pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=FakeSeparator(background_amplitude=0.05),
+            output_dir=tmp_path / "out_bed",
+        )
+        bedded_result = bedded_pipeline.run()
+        bedded_samples, _ = media.load_audio(bedded_result.dub_track)
+
+        # After the last segment (8s) and before the end of the 10s input.
+        window = slice(int(8.6 * sample_rate), int(9.6 * sample_rate))
+        quiet = float(np.sqrt(np.mean(np.square(silent_samples[window], dtype=np.float64))))
+        with_bed = float(np.sqrt(np.mean(np.square(bedded_samples[window], dtype=np.float64))))
+
+        assert quiet < 1e-4  # nothing there without a bed
+        assert with_bed > quiet * 5  # audible ambience with one
+
+    def test_disabled_background_keeps_the_previous_behaviour(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, transcriber, _, _ = make_pipeline(
+            tmp_path, simple_transcript, keep_background=False, separator=FakeSeparator()
+        )
+        report = pipeline.run().report
+
+        assert report["background_preserved"] is False
+        assert report["duck_db"] is None
+        assert not (pipeline.job_dir / "01c_background.wav").exists()
+        # Without separation, ASR reads the plain extracted audio.
+        assert transcriber.paths[-1].name == "01_audio.wav"
+
+    def test_duck_depth_is_reported(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator(), duck_db=12.0
+        )
+        assert pipeline.run().report["duck_db"] == 12.0
+
+    def test_output_still_does_not_clip(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator(background_amplitude=0.9)
+        )
+        samples, _ = media.load_audio(pipeline.run().dub_track)
+        assert float(np.max(np.abs(samples))) <= 1.0
+
+    def test_output_length_is_unchanged_by_the_bed(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator()
+        )
+        samples, sample_rate = media.load_audio(pipeline.run().dub_track)
+        assert len(samples) / sample_rate == pytest.approx(10.0, abs=0.1)
 
 
 class TestVideoJob:

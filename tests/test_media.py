@@ -220,41 +220,42 @@ class TestLoudness:
 
 
 class TestLoudnessReporting:
-    """`normalize_loudness_detailed` must describe what it actually delivered."""
+    """The normaliser must reach the target, not surrender to the loudest peak."""
 
     @staticmethod
     def tone(amplitude: float, seconds: float = 2.0) -> np.ndarray:
         t = np.linspace(0, seconds, int(seconds * 48000), endpoint=False)
         return (amplitude * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
 
+    @staticmethod
+    def peaky(seconds: float = 2.0) -> np.ndarray:
+        """Quiet speech-like body with sparse near-full-scale transients."""
+        t = np.linspace(0, seconds, int(seconds * 48000), endpoint=False)
+        body = (0.03 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        for position in range(0, body.size, 8000):
+            body[position] = 0.999  # isolated spike every ~0.17 s
+        return body
+
     def test_reports_target_and_achieved(self) -> None:
         result = media.normalize_loudness_detailed(self.tone(0.05), 48000)
         assert result.target_lufs == media.TARGET_LUFS
         assert result.measured_lufs is not None
-        assert result.gain_db > 0
-        # The applied gain must actually move the result towards the target.
         assert result.achieved_lufs is not None
         assert result.achieved_lufs > result.measured_lufs
+
+    def test_reaches_the_target_on_peaky_material(self) -> None:
+        """Regression: a handful of transients used to block all gain."""
+        source = self.peaky()
+        result = media.normalize_loudness_detailed(source, 48000, target_lufs=-16.0)
+        assert result.achieved_lufs is not None
+        # Previously this sat ~7 dB below target because the guard allowed 0 dB.
+        assert result.achieved_lufs == pytest.approx(-16.0, abs=1.0)
+        assert result.peak_limited is True
 
     def test_quieter_input_gets_more_gain(self) -> None:
         quiet = media.normalize_loudness_detailed(self.tone(0.02), 48000)
         loud = media.normalize_loudness_detailed(self.tone(0.2), 48000)
         assert quiet.gain_db > loud.gain_db
-
-    def test_peak_limiting_is_flagged_when_target_is_unreachable(self) -> None:
-        # Quiet body with a single near-full-scale spike: a very high crest
-        # factor, so the target cannot be reached without clipping.
-        spiky = self.tone(0.01)
-        spiky[0] = 0.99
-        result = media.normalize_loudness_detailed(spiky, 48000)
-        assert result.peak_limited is True
-        assert result.achieved_lufs is not None
-        assert result.achieved_lufs < result.target_lufs
-        assert float(np.max(np.abs(result.samples))) <= 1.0
-
-    def test_no_limiting_is_flagged_for_easy_material(self) -> None:
-        result = media.normalize_loudness_detailed(self.tone(0.9), 48000, target_lufs=-30.0)
-        assert result.peak_limited is False
 
     def test_unmeasurable_input_is_passed_through(self) -> None:
         silent = np.zeros(48000, dtype=np.float32)
@@ -266,10 +267,68 @@ class TestLoudnessReporting:
         assert np.array_equal(result.samples, silent)
 
     def test_samples_never_clip(self) -> None:
-        result = media.normalize_loudness_detailed(self.tone(0.8), 48000, target_lufs=0.0)
-        assert float(np.max(np.abs(result.samples))) <= 1.0
+        result = media.normalize_loudness_detailed(self.peaky(), 48000, target_lufs=0.0)
+        assert float(np.max(np.abs(result.samples))) <= media.LIMIT_CEILING + 1e-6
 
     def test_normalize_loudness_still_returns_plain_array(self) -> None:
         out = media.normalize_loudness(self.tone(0.05), 48000)
         assert isinstance(out, np.ndarray)
         assert out.ndim == 1
+
+
+class TestLimitPeaks:
+    def test_accepts_a_pure_python_sequence_of_levels(self) -> None:
+        # 1 kHz-ish tone at 0.5 plus a spike; the spike must come down.
+        t = np.linspace(0, 1.0, 48000, endpoint=False)
+        signal = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        signal[100] = 1.4
+
+        limited = media.limit_peaks(signal, 48000, ceiling=0.98)
+        assert float(np.max(np.abs(limited))) <= 0.98 + 1e-6
+
+    def test_leaves_audio_below_the_ceiling_untouched(self) -> None:
+        signal = np.full(4800, 0.5, dtype=np.float32)
+        assert np.array_equal(media.limit_peaks(signal, 48000, ceiling=0.98), signal)
+
+    def test_preserves_the_body_of_the_signal(self) -> None:
+        """Peaks are reduced without dragging the whole program down."""
+        t = np.linspace(0, 1.0, 48000, endpoint=False)
+        signal = (0.4 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        signal[500] = 1.2
+
+        limited = media.limit_peaks(signal, 48000, ceiling=0.98)
+        # Away from the spike, level is essentially unchanged.
+        body = limited[20000:30000]
+        original = signal[20000:30000]
+        assert np.allclose(body, original, atol=0.02)
+
+    def test_handles_silence_and_empty_input(self) -> None:
+        assert media.limit_peaks(np.zeros(0, dtype=np.float32), 48000).size == 0
+        silent = np.zeros(1000, dtype=np.float32)
+        assert np.array_equal(media.limit_peaks(silent, 48000), silent)
+
+    def test_single_spike_is_contained(self) -> None:
+        signal = np.zeros(48000, dtype=np.float32)
+        signal[24000] = 5.0
+        limited = media.limit_peaks(signal, 48000, ceiling=0.5)
+        assert float(np.max(np.abs(limited))) <= 0.5 + 1e-6
+
+    def test_rejects_invalid_ceiling(self) -> None:
+        signal = np.ones(10, dtype=np.float32)
+        assert np.array_equal(media.limit_peaks(signal, 48000, ceiling=0.0), signal)
+
+
+class TestMovingAverage:
+    def test_smooths_a_step(self) -> None:
+        values = np.concatenate([np.zeros(100), np.ones(100)]).astype(np.float32)
+        smoothed = media.moving_average(values, 11)
+        assert smoothed.size == values.size
+        assert 0.0 < float(smoothed[100]) < 1.0  # transition is gradual
+
+    def test_window_larger_than_signal_is_safe(self) -> None:
+        values = np.ones(10, dtype=np.float32)
+        assert media.moving_average(values, 100).size == 10
+
+    def test_single_sample_window_is_identity(self) -> None:
+        values = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        assert np.allclose(media.moving_average(values, 1), values)

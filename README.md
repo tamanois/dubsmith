@@ -201,6 +201,14 @@ python dub.py --video talk.mp4 --target fr \
 `--ref-text` must be the **exact transcript** of `--ref-audio`; the model
 conditions on both (ICL mode). Any format `libsndfile` reads works:
 `.wav` `.flac` `.mp3` `.ogg` `.aiff`, a URL, or a `(samples, rate)` tuple.
+With `--accent-mode speaker-only` the transcript is ignored and therefore optional.
+
+> **Reference pacing matters.** The model imitates the reference clip's speaking
+> rate, so a slow, deliberate donor makes every dubbed line longer. Measured on
+> this repo's TED talk: a slow personal recording as donor needed ~30% more
+> compression than the source speaker did, quadrupling trimming (11 s → 23 s).
+> Prefer a reference whose pace is close to the speaker being dubbed, or lower
+> `--min-stretch` to allow faster speech.
 
 ### Common options
 
@@ -212,6 +220,12 @@ conditions on both (ICL mode). Any format `libsndfile` reads works:
 | `--stretcher` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none` |
 | `--min-stretch` | `0.85` | Most compression allowed to fit a slot (lower = faster speech, fewer words trimmed) |
 | `--max-stretch` | `1.18` | Most slow-down allowed to fill a slot |
+| `--loudness` | `match-source` | `match-source` sits the dub at the original track's level; `lufs` forces `--lufs` |
+| `--lufs` | `-16` | Absolute LUFS target, used with `--loudness lufs` |
+| `--no-background` | off | Drop the original music/ambience instead of preserving it |
+| `--separator` | `auto` | `auto`, `demucs`, or `none` |
+| `--duck-db` | `6.0` | How far the background is pulled down under dialogue |
+| `--accent-mode` | `preserve` | `preserve` keeps the speaker's accent; `speaker-only` keeps only their timbre so the model uses native target-language phonetics |
 | `--output-dir` | `output` | Where job folders are written |
 | `--no-subtitles` | off | Skip SRT generation |
 | `--force` | off | Ignore cached stages and re-run everything |
@@ -253,9 +267,15 @@ output/talk/
 | `dub_seconds` | Length of the dub track (should match the source) |
 | `loudness_source_lufs` | Loudness of the original audio |
 | `loudness_dub_lufs` | Loudness actually delivered |
-| `loudness_target_lufs` | Target (default −16 LUFS) |
-| `loudness_gain_db` | Gain applied to reach it |
-| `loudness_peak_limited` | `true` if the target needed more gain than the peak allowed |
+| `loudness_target_lufs` | What the dub aimed for |
+| `loudness_policy` | `match-source` or `lufs` |
+| `loudness_delta_vs_source` | Positive when the dub is louder than the original |
+| `loudness_gain_db` | Total gain applied to reach the target |
+| `loudness_peak_limited` | `true` when the limiter engaged to avoid clipping |
+| `background_preserved` | `true` when the original music/ambience was kept |
+| `duck_db` | Attenuation applied under dialogue (`null` when no background) |
+| `accent_mode` | `preserve` or `speaker-only` |
+| `donor` | Which reference voice was used: an explicit file, or the auto-selected segment |
 | `clamped_segments` | Lines that hit the ±15–20% stretch limit |
 | `overrun_segments` | Lines that spilled into the pause after them (free, no speech lost) |
 | `overrun_seconds_total` | Total speech fitted into those pauses |
@@ -268,10 +288,11 @@ Two of these deserve attention:
 - **`clamped_segments` above zero** means the translation was too long for its
   slot, so timing hit the stretch limit. Tighten the translation (or shorten the
   lines) rather than raising `--max-stretch`, which would sound unnatural.
-- **`loudness_peak_limited: true`** means the dub landed quieter than the −16 LUFS
-  target because reaching it would have clipped. Speech often has a high crest
-  factor, so this is normal and safe — the alternative is distortion. For
-  reference, a typical run delivers ~5 dB louder than the original track.
+- **`loudness_peak_limited: true`** means the limiter reduced a few peaks so the
+target could be reached without clipping. Speech is peakier than mastered audio,
+and without limiting a handful of transients would hold the whole program several
+dB too quiet. The delivered loudness should still match `loudness_target_lufs`;
+if it does not, the material was too dynamic to reach the target cleanly.
 - **`trimmed_seconds_total`** is the one to watch. Translated speech is often
   longer than the source (French runs roughly 15–40% longer than English), and
   the stretch limit caps how far a line can be compressed. A line is first
@@ -294,19 +315,20 @@ the fingerprint and re-runs the affected job from scratch.
 ## How it works
 
 ```
-video/audio ──► 1. audio extract ──► 2. ASR + VAD ──► 3. translate (LLM)
-                                                              │
-                  6. mux + SRT ◄── 5. fit to timeline ◄── 4. clone + synthesise
+video/audio ──► 1. audio extract ──► 2. separate ──► 3. ASR + VAD ──► 4. translate (LLM)
+                                  (speech | bed)                        │
+            7. mux + SRT ◄── 6. mix + duck ◄── 5. clone + synthesise ◄───┘
 ```
 
 | # | Stage | Module | What it does |
 |---|---|---|---|
 | 1 | Audio | `pipeline/media.py` | ffmpeg extract (video) or direct read (audio), mono 48 kHz |
-| 2 | ASR | `pipeline/asr.py` | faster-whisper + Silero VAD, word timestamps, drops non-speech |
-| 3 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
-| 4 | Synthesise | `pipeline/tts.py` | donor selection + Qwen3-TTS voice cloning |
-| 5 | Timing | `pipeline/timing.py` | per-segment stretch into the original slot, no drift |
-| 6 | Deliver | `pipeline/orchestrate.py` | mix, loudness, subtitles, mux, report |
+| 2 | Separate | `pipeline/separation.py` | Demucs splits speech from music/ambience; ASR then reads the clean speech stem |
+| 3 | ASR | `pipeline/asr.py` | faster-whisper + Silero VAD, word timestamps, drops non-speech |
+| 4 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
+| 5 | Synthesise | `pipeline/tts.py` | donor selection + Qwen3-TTS voice cloning, per-line limiting |
+| 6 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked background |
+| 7 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
 
 Two design points worth knowing:
 
@@ -354,6 +376,10 @@ python -m pytest
 | Dub sounds rushed or slow | Check `report.json` → `clamped_segments`; tighten the translation |
 | Some words are cut off | `report.json` → `trimmed_segments`: the translation is too long for its slot. Shorten it, or lower `--min-stretch` |
 | Dub drifts out of sync | Should not happen — lines are never shifted late. If `shifted_segments > 0`, check `timing.json` for genuinely overlapping source speech |
+| Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
+| Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
+| Music fights the voice | Raise `--duck-db` (default 6 dB) |
+| Dub still has the speaker's accent | Try `--accent-mode speaker-only`, which keeps the timbre but drops the donor's phonetics |
 
 Logs are written to stderr and include a job id. Set `LOG_JSON=1` for
 machine-readable logs.

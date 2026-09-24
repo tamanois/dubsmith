@@ -9,7 +9,6 @@ audio-only inputs and never needs a second ffmpeg pass.
 from __future__ import annotations
 
 import json
-import math
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -35,16 +34,23 @@ __all__ = [
     "measure_loudness",
     "normalize_loudness",
     "normalize_loudness_detailed",
+    "limit_peaks",
+    "moving_average",
     "save_normalized",
     "DEFAULT_SAMPLE_RATE",
     "TARGET_LUFS",
+    "LIMIT_CEILING",
 ]
 
 DEFAULT_SAMPLE_RATE = 48_000
 
 #: Broadcast-style loudness target (EBU R128 / streaming convention, ~-16 LUFS).
+#: Used only when the source track's loudness cannot be measured.
 TARGET_LUFS = -16.0
 _TARGET_LUFS = TARGET_LUFS
+
+#: Peak ceiling the limiter enforces, just under full scale.
+LIMIT_CEILING = 0.98
 
 
 def require_binary(name: str, *, hint: str | None = None) -> str:
@@ -277,6 +283,68 @@ def measure_loudness(samples: np.ndarray, sample_rate: int) -> float | None:
     return value
 
 
+def moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    """Centred moving average via cumulative sums (O(n), not O(n·window)).
+
+    ``np.convolve`` would be prohibitively slow on a multi-minute timeline with a
+    multi-thousand-sample window, which is the size the limiter needs.
+    """
+    data = np.asarray(values, dtype=np.float64).reshape(-1)
+    if window <= 1 or data.size == 0:
+        return data.astype(np.float32)
+
+    window = min(window, data.size)
+    pad_left = window // 2
+    pad_right = window - 1 - pad_left
+    padded = np.pad(data, (pad_left, pad_right), mode="edge")
+    cumulative = np.concatenate(([0.0], np.cumsum(padded, dtype=np.float64)))
+    averaged = (cumulative[window:] - cumulative[:-window]) / window
+    return averaged.astype(np.float32)
+
+
+def limit_peaks(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    ceiling: float = LIMIT_CEILING,
+    release_ms: float = 150.0,
+) -> np.ndarray:
+    """Reduce peaks to ``ceiling`` without lowering the body of the signal.
+
+    Synthesised speech is peakier than mastered audio (measured crest factor
+    ~23 dB against the source's ~19 dB), and a few isolated transients would
+    otherwise force the whole program to sit several dB too quiet: normalising
+    for them costs the level of everything else.
+
+    Gain is derived from an envelope that is the *maximum* of the instantaneous
+    magnitude and a release-smoothed version of it. Because the envelope is never
+    below the instantaneous magnitude, the resulting gain can never let a sample
+    exceed the ceiling — no clipping by construction.
+
+    Args:
+        samples: Input audio.
+        sample_rate: Sample rate in Hz.
+        ceiling: Maximum absolute output level (1.0 = full scale).
+        release_ms: Envelope release time; longer is smoother but reduces more.
+
+    Returns:
+        Limited audio (the input unchanged when it already fits).
+    """
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if data.size == 0 or ceiling <= 0:
+        return data
+
+    magnitude = np.abs(data)
+    peak = float(magnitude.max())
+    if peak <= ceiling:
+        return data
+
+    window = max(1, int(sample_rate * release_ms / 1000.0))
+    envelope = np.maximum(magnitude, moving_average(magnitude, window))
+    gain = np.minimum(1.0, ceiling / np.maximum(envelope, 1e-12))
+    return (data * gain).astype(np.float32)
+
+
 def normalize_loudness(
     samples: np.ndarray,
     sample_rate: int,
@@ -285,8 +353,8 @@ def normalize_loudness(
 ) -> np.ndarray:
     """Apply a gain so the clip sits at ``target_lufs``.
 
-    The gain is limited so the result cannot clip, and the input is returned
-    unchanged when loudness is unmeasurable. See
+    Peak growth is controlled by :func:`limit_peaks` rather than by refusing the
+    gain, so the target is actually reachable on speech. See
     :func:`normalize_loudness_detailed` for the numbers behind the result.
     """
     return normalize_loudness_detailed(
@@ -299,19 +367,21 @@ def normalize_loudness_detailed(
     sample_rate: int,
     *,
     target_lufs: float = _TARGET_LUFS,
-    headroom_db: float = 0.1,
+    ceiling: float = LIMIT_CEILING,
+    max_passes: int = 3,
+    tolerance_lu: float = 0.3,
 ) -> "LoudnessResult":
-    """Normalise loudness and report what actually happened.
+    """Normalise loudness to ``target_lufs`` and report what happened.
 
-    Speech often has a high crest factor, so reaching a broadcast target such as
-    -16 LUFS can require more gain than the peak allows. Rather than clipping (or
-    quietly under-delivering), the gain is capped at the largest value that keeps
-    the signal below full scale, and ``peak_limited`` records that this happened
-    so the shortfall is visible instead of silent.
+    Unlike a plain peak-safe gain, the requested gain is *applied* and peaks are
+    then limited, so speech (which has a high crest factor) can actually reach a
+    broadcast target. Limiting changes loudness non-linearly, so the pass is
+    repeated until the result is within ``tolerance_lu`` or ``max_passes`` is
+    reached.
 
     Returns:
-        A :class:`LoudnessResult` carrying the processed samples plus the
-        measured, target and achieved loudness.
+        A :class:`LoudnessResult` with the processed samples, the measured and
+        achieved loudness, the total gain applied, and whether limiting engaged.
     """
     data = np.asarray(samples, dtype=np.float32)
     measured = measure_loudness(data, sample_rate)
@@ -325,21 +395,31 @@ def normalize_loudness_detailed(
             peak_limited=False,
         )
 
-    desired_gain_db = target_lufs - measured
-    peak = float(np.max(np.abs(data))) if data.size else 0.0
-    max_gain_db = (
-        -20.0 * math.log10(peak) - headroom_db if 0.0 < peak < 1.0 else 0.0
-    )
-    gain_db = min(desired_gain_db, max_gain_db)
-    processed = (data * (10.0 ** (gain_db / 20.0))).astype(np.float32)
+    current = data
+    total_gain_db = 0.0
+    limited = False
+
+    for _ in range(max(1, max_passes)):
+        present = measure_loudness(current, sample_rate)
+        if present is None:
+            break
+        delta_db = target_lufs - present
+        if abs(delta_db) <= tolerance_lu:
+            break
+
+        amplified = current * (10.0 ** (delta_db / 20.0))
+        if float(np.max(np.abs(amplified))) > ceiling:
+            limited = True
+        current = limit_peaks(amplified, sample_rate, ceiling=ceiling)
+        total_gain_db += delta_db
 
     return LoudnessResult(
-        samples=processed,
+        samples=current.astype(np.float32),
         target_lufs=target_lufs,
         measured_lufs=measured,
-        achieved_lufs=measure_loudness(processed, sample_rate),
-        gain_db=gain_db,
-        peak_limited=gain_db < desired_gain_db - 1e-6,
+        achieved_lufs=measure_loudness(current, sample_rate),
+        gain_db=total_gain_db,
+        peak_limited=limited,
     )
 
 

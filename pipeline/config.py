@@ -14,6 +14,7 @@ __all__ = [
     "LANGUAGE_ALIASES",
     "SUPPORTED_LANGUAGES",
     "normalize_language",
+    "normalize_loudness_policy",
     "JobConfig",
     "Settings",
     "read_env_file",
@@ -122,6 +123,27 @@ def language_code_for_name(name: str | None) -> str | None:
 
 ENV_PREFIX = ""
 
+#: Accepted spellings for the loudness policy, normalised to two canonical forms.
+_LOUDNESS_POLICIES: dict[str, str] = {
+    "match-source": "match-source",
+    "match_source": "match-source",
+    "match": "match-source",
+    "source": "match-source",
+    "lufs": "lufs",
+    "fixed": "lufs",
+    "absolute": "lufs",
+}
+
+
+def normalize_loudness_policy(value: str) -> str:
+    """Map a user-supplied loudness policy onto ``match-source`` or ``lufs``."""
+    key = str(value).strip().lower()
+    try:
+        return _LOUDNESS_POLICIES[key]
+    except KeyError:
+        supported = ", ".join(sorted(set(_LOUDNESS_POLICIES.values())))
+        raise ConfigError(f"Unknown loudness target {value!r}. Use: {supported}") from None
+
 
 def read_env_file(path: Path) -> dict[str, str]:
     """Parse a minimal ``KEY=VALUE`` dotenv file.
@@ -163,9 +185,24 @@ class Settings(BaseModel):
     llm_timeout_s: float = 180.0
     llm_chunk_size: int = Field(default=40, ge=1)
 
+    # Loudness policy. "match-source" puts the dub at the level of the track it
+    # replaces; "lufs" forces the absolute target below.
+    loudness_target: str = "match-source"
+    target_lufs: float = Field(default=-16.0, ge=-60.0, le=0.0)
+
+    # Background preservation.
+    keep_background: bool = True
+    separator: str = "auto"
+    duck_db: float = Field(default=6.0, ge=0.0, le=30.0)
+
     models_dir: Path = Path("models")
     log_level: str = "INFO"
     log_json: bool = False
+
+    @field_validator("loudness_target")
+    @classmethod
+    def _check_loudness_policy(cls, value: str) -> str:
+        return normalize_loudness_policy(value)
 
     @classmethod
     def from_env(
@@ -196,6 +233,15 @@ class Settings(BaseModel):
             "llm_model": pick("LLM_MODEL", cls.model_fields["llm_model"].default),
             "llm_timeout_s": pick("LLM_TIMEOUT_S", cls.model_fields["llm_timeout_s"].default),
             "llm_chunk_size": pick("LLM_CHUNK_SIZE", cls.model_fields["llm_chunk_size"].default),
+            "loudness_target": pick(
+                "LOUDNESS_TARGET", cls.model_fields["loudness_target"].default
+            ),
+            "target_lufs": pick("LOUDNESS_LUFS", cls.model_fields["target_lufs"].default),
+            "keep_background": pick(
+                "KEEP_BACKGROUND", cls.model_fields["keep_background"].default
+            ),
+            "separator": pick("BACKGROUND_SEPARATOR", cls.model_fields["separator"].default),
+            "duck_db": pick("DUCK_DB", cls.model_fields["duck_db"].default),
             "models_dir": pick("MODELS_DIR", cls.model_fields["models_dir"].default),
             "log_level": pick("LOG_LEVEL", cls.model_fields["log_level"].default),
             "log_json": pick("LOG_JSON", cls.model_fields["log_json"].default),
@@ -238,8 +284,48 @@ class JobConfig(BaseModel):
     # ASR gating: segments the model itself distrusts are dropped.
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
+    # Loudness policy; None inherits from Settings.
+    #   "match-source" -> sit at the level of the track being replaced
+    #   "lufs"         -> force target_lufs
+    loudness_target: str | None = None
+    target_lufs: float | None = Field(default=None, ge=-60.0, le=0.0)
+
+    # Background preservation (music, ambience, room tone).
+    keep_background: bool = True
+    #: Separator backend: auto | demucs | none.
+    separator: str = "auto"
+    #: Attenuation applied to the background while dialogue plays.
+    duck_db: float = Field(default=6.0, ge=0.0, le=30.0)
+    #: Static offset applied to the background stem (lift or lower the bed).
+    background_gain_db: float = Field(default=0.0, ge=-30.0, le=30.0)
+
+    # Voice accent.
+    #   "preserve"     -> clone the speaker's voice AND accent (ICL mode)
+    #   "speaker-only" -> keep only the speaker embedding, letting the model use
+    #                     its own phonetics for the target language
+    accent_mode: str = "preserve"
+
     keep_subtitles: bool = True
     force: bool = False
+
+    @field_validator("loudness_target")
+    @classmethod
+    def _check_loudness(cls, value: str | None) -> str | None:
+        return None if value is None else normalize_loudness_policy(value)
+
+    @field_validator("accent_mode")
+    @classmethod
+    def _check_accent(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {"preserve": "preserve", "icl": "preserve", "source": "preserve",
+                   "speaker-only": "speaker-only", "xvector": "speaker-only",
+                   "x-vector": "speaker-only", "speaker": "speaker-only"}
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown accent mode {value!r}. Use: preserve or speaker-only"
+            ) from None
 
     @field_validator("target_language")
     @classmethod
@@ -272,9 +358,11 @@ class JobConfig(BaseModel):
             )
 
         if self.ref_audio is not None:
-            if self.ref_text is None or not self.ref_text.strip():
-                # ICL mode conditions on the reference transcript, so it is
-                # required; x-vector-only mode drops quality noticeably.
+            # ICL cloning conditions on the reference transcript, so it is
+            # required there; speaker-only cloning uses just the speaker
+            # embedding and ignores the text.
+            needs_transcript = self.accent_mode != "speaker-only"
+            if needs_transcript and (self.ref_text is None or not self.ref_text.strip()):
                 raise ConfigError(
                     "--ref-audio requires --ref-text (the exact transcript of the "
                     "reference clip). Omit both to auto-select a donor from the video."

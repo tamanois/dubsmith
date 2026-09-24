@@ -31,6 +31,12 @@ openai                  # OpenAI-compatible client used for translation
 # the pipeline falls back to PyTorch SDPA without it.
 #flash-attn
 
+# Optional: background preservation (keeps the original music and ambience).
+# Without it the dub replaces the whole audio track, so music and room tone are
+# lost. The weights (~80 MB) live in the torch hub cache and download on first
+# use, or on demand with:  python dub.py models --download demucs
+#demucs
+
 # Optional: CUDA 12 runtime libraries for **GPU speech recognition**.
 # CTranslate2 (used by faster-whisper) links against CUDA 12 specifically, while
 # recent torch wheels ship CUDA 13 (which provides libcublas.so.13). On such a

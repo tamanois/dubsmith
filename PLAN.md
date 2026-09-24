@@ -21,7 +21,7 @@
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 268 passing | `tests/` |
+| Tests | ✅ 330 passing | `tests/` |
 
 Verification performed:
 
@@ -97,6 +97,47 @@ Also fixed from this run: a GPU OOM warning during synthesis (the ASR model's
 ~3 GB was still in PyTorch's cache when TTS loaded) — stages now call
 `release_gpu_memory()`, and a TTS batch that OOMs is halved rather than failing
 the job.
+
+### Review fixes: loudness, background, accent
+
+The user reviewed the dubbed video. Three findings, all addressed:
+
+**1. Too quiet (fixed).** The dub sat 3.25 dB below the source. The mix peaked at
+−0.06 dBFS from isolated TTS transients, so the peak guard allowed ~0 dB of the
++6.74 dB needed, and the fixed −16 LUFS target ignored the source's own level.
+Fixes: `media.limit_peaks()` (envelope limiter), per-line limiting at −3 dBFS, and
+a `match-source` loudness policy that defaults to the original track's measured
+level. Result: `loudness_delta_vs_source` −0.0, crest factor 22.7 → 19.4 dB (the
+original is 18.6), zero clipped samples.
+
+**2. Music and ambience vanished (fixed — was roadmap P1).** `build_timeline`
+assembled a speech-only track and `mux_audio` replaced the whole audio stream, so
+the soundtrack was discarded by design. New `pipeline/separation.py` (Demucs
+`htdemucs`, stereo-native at 44.1 kHz, resampled around the model) splits speech
+from background; `pipeline/mixing.py` lays the dub over the bed, ducked 6 dB under
+dialogue with 150 ms ramps. ASR and donor selection now read the clean speech
+stem, which also reduced segment count 63 → 58. Separation costs 11.8 s for a
+287 s video (~24× realtime).
+
+**3. Source accent carried into the target language (improved for free).** Accent
+lives in the reference audio: with no `--ref-audio` the donor *is* the source
+speaker, and ICL cloning conditions on their speech codes, so their English
+phonetics came along. Added `--accent-mode speaker-only`, which keeps only the
+speaker embedding and lets the model use its own target-language phonetics.
+
+Measured on the same French lines with the same donor:
+
+| Mode | Timbre similarity to donor | French acoustic fit (avg logprob) |
+|---|---|---|
+| `preserve` (default) | 0.9911 | −0.139 |
+| `speaker-only` | 0.9873 | **−0.061** |
+| *(same speaker, different utterance)* | 0.9869 | — |
+
+Speaker-only retains timbre within natural same-speaker variation while fitting
+French phonetics noticeably better, so the accent problem may need no
+voice-conversion stage at all. Listening is still the ground truth; the full
+two-stage path (VoiceDesign accent reference + voice conversion) remains the
+fallback if it proves insufficient.
 
 Deviations from the original plan (deliberate, documented):
 

@@ -258,6 +258,39 @@ class TestModelTypeGuard:
         assert engine.model.model.tts_model_type == "base"
 
 
+class TestAccentMode:
+    """Speaker-only mode keeps the timbre embedding but drops the accent."""
+
+    def test_icl_mode_is_the_default(self) -> None:
+        model = FakeQwenModel()
+        engine = engine_with(model)
+        engine.prepare_prompt_from_file("ref.wav", "bonjour")
+        assert model.prompts[0]["x_vector_only_mode"] is False
+
+    def test_speaker_only_mode_is_forwarded(self) -> None:
+        model = FakeQwenModel()
+        engine = TTSEngine("models/fake", device="cpu", x_vector_only=True)
+        engine._model = model
+        engine.prepare_prompt_from_file("ref.wav", "bonjour")
+        assert model.prompts[0]["x_vector_only_mode"] is True
+
+    def test_speaker_only_mode_does_not_require_a_transcript(self) -> None:
+        model = FakeQwenModel()
+        engine = TTSEngine("models/fake", device="cpu", x_vector_only=True)
+        engine._model = model
+        engine.prepare_prompt_from_file("ref.wav", "")  # must not raise
+        assert model.prompts[0]["x_vector_only_mode"] is True
+
+    def test_donor_prompt_honours_the_mode(self) -> None:
+        model = FakeQwenModel()
+        engine = TTSEngine("models/fake", device="cpu", x_vector_only=True)
+        engine._model = model
+        engine.prepare_prompt(
+            DonorClip(samples=audio(3.0), sample_rate=SR, text="hi", start=0, end=3, segment_id=0)
+        )
+        assert model.prompts[0]["x_vector_only_mode"] is True
+
+
 class TestResolveDtype:
     def test_cuda_uses_bfloat16(self) -> None:
         import torch

@@ -27,7 +27,7 @@ import numpy as np
 import soundfile as sf
 
 from .errors import DependencyError, TimingError
-from .media import run_command, write_audio
+from .media import limit_peaks, run_command, write_audio
 
 __all__ = [
     "TimeStretcher",
@@ -401,9 +401,9 @@ def build_timeline(
             )
         )
 
-    # Guard against summing overlapping lines into clipping.
-    peak = float(np.max(np.abs(track))) if track.size else 0.0
-    if peak > 1.0:
-        track = (track / peak).astype(np.float32)
+    # Guard against summing overlapping lines into clipping. A limiter is used
+    # rather than scaling the whole track: scaling would drop the level of every
+    # line to accommodate a single transient.
+    track = limit_peaks(track, sample_rate)
 
     return Timeline(samples=track, sample_rate=sample_rate, placements=placements)
