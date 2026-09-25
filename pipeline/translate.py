@@ -23,9 +23,11 @@ from .errors import DependencyError, TranslationError
 
 __all__ = [
     "TranslationRequest",
+    "ShortenRequest",
     "Translator",
     "OpenAICompatTranslator",
     "build_messages",
+    "build_shorten_messages",
     "extract_json_object",
     "chunked",
     "LENGTH_TOLERANCE",
@@ -54,12 +56,39 @@ written style. Match the formality implied by the source.
 """
 
 
+#: Appended to the system prompt only when a word budget is actually supplied,
+#: so a run with budgets disabled sends a byte-identical prompt to a run made
+#: before budgets existed.
+WORD_BUDGET_RULE = """
+7. Each line carries "max_words": the most words that fit its slot when spoken. \
+Treat it as a hard ceiling, but do not pad a line to reach it: if the same \
+meaning fits in fewer words, use fewer."""
+
+
 class TranslationRequest(BaseModel):
     """One line to translate, with the slot it must fit."""
 
     id: int
     text: str
     duration: float = 0.0
+    #: Longest the translation may be, when a speaking rate is known.
+    max_words: int | None = None
+
+
+class ShortenRequest(BaseModel):
+    """A line whose translation turned out too long to fit its slot."""
+
+    id: int
+    #: The translation that was tried and proved too long.
+    text: str
+    #: The source line, given so the rewrite cannot drop its meaning.
+    source: str = ""
+    #: How long the previous translation took to speak.
+    spoken_seconds: float = 0.0
+    #: How long it actually had.
+    available_seconds: float = 0.0
+    #: Ceiling for the rewrite, derived from the measured speaking rate.
+    max_words: int = 0
 
 
 class Translator(Protocol):
@@ -75,6 +104,15 @@ class Translator(Protocol):
         """Translate requests, returning ``{id: translated_text}``."""
         ...
 
+    def shorten(
+        self,
+        requests: Sequence[ShortenRequest],
+        *,
+        target_language: str,
+    ) -> dict[int, str]:
+        """Rewrite lines that proved too long, returning ``{id: text}``."""
+        ...
+
 
 def chunked(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
     """Yield successive slices of at most ``size`` items."""
@@ -85,10 +123,14 @@ def chunked(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
 
 
 def _render_line(request: TranslationRequest) -> str:
-    return json.dumps(
-        {"id": request.id, "seconds": round(request.duration, 2), "text": request.text},
-        ensure_ascii=False,
-    )
+    payload: dict[str, Any] = {
+        "id": request.id,
+        "seconds": round(request.duration, 2),
+    }
+    if request.max_words:
+        payload["max_words"] = request.max_words
+    payload["text"] = request.text
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def build_messages(
@@ -120,6 +162,8 @@ def build_messages(
         source_clause=source_clause,
         percent=int(LENGTH_TOLERANCE * 100),
     )
+    if any(request.max_words for request in requests):
+        system += WORD_BUDGET_RULE
 
     parts: list[str] = []
     if context:
@@ -129,6 +173,62 @@ def build_messages(
     parts.extend(_render_line(request) for request in requests)
     return [
         {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+
+SHORTEN_SYSTEM_PROMPT = """You are a professional audiovisual dubbing adaptor.
+
+The lines below were already translated into {target}, but they came out too long: \
+spoken aloud they overrun the time slot available for them. Rewrite each one so that \
+it fits.
+
+Rules:
+1. Reply with ONLY a JSON object of the form \
+{{"translations":[{{"id":<int>,"text":"<rewritten line>"}}]}}.
+2. Include every requested id exactly once, in the same order. Never invent ids.
+3. Each rewrite must be at most its "max_words" words. Fewer is better than more.
+4. Preserve the meaning. Cut padding first: filler and hedges ("actually", \
+"really", "you know", "in fact"), redundant connectives, and restated ideas.
+5. Never drop a fact, number, unit, name or acronym. If the line cannot be made \
+short enough without losing information, keep the information and cut everything else.
+6. Keep proper nouns, numbers, units, and acronyms unchanged.
+7. Use natural spoken {target}, matching the register of the previous version.
+8. Never add notes, explanations, transliterations, or the untranslated source.
+"""
+
+
+def build_shorten_messages(
+    requests: Sequence[ShortenRequest],
+    *,
+    target_language: str,
+) -> list[dict[str, str]]:
+    """Build the chat messages used to rewrite overlong lines.
+
+    Args:
+        requests: Lines that overran their slot, with the ceiling for each.
+        target_language: Canonical target language name.
+
+    Returns:
+        OpenAI-style message list.
+    """
+    parts = ["Lines to shorten:"]
+    for request in requests:
+        parts.append(
+            json.dumps(
+                {
+                    "id": request.id,
+                    "max_words": request.max_words,
+                    "spoken_seconds": round(request.spoken_seconds, 2),
+                    "available_seconds": round(request.available_seconds, 2),
+                    "previous": request.text,
+                    "meaning_to_preserve": request.source,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return [
+        {"role": "system", "content": SHORTEN_SYSTEM_PROMPT.format(target=target_language)},
         {"role": "user", "content": "\n".join(parts)},
     ]
 
@@ -272,6 +372,26 @@ class OpenAICompatTranslator:
 
         return results
 
+    def shorten(
+        self,
+        requests: Sequence[ShortenRequest],
+        *,
+        target_language: str,
+    ) -> dict[int, str]:
+        """Rewrite overlong lines so they fit their slot.
+
+        Only ever called for lines that were measured as too long, so a failure
+        here costs nothing: the caller keeps the audio it already has.
+        """
+        if not requests:
+            return {}
+
+        results: dict[int, str] = {}
+        for batch in chunked(list(requests), self.chunk_size):
+            messages = build_shorten_messages(batch, target_language=target_language)
+            results.update(self._run_batch({r.id for r in batch}, messages))
+        return results
+
     # -- internals --------------------------------------------------------- #
 
     def _translate_batch(
@@ -280,8 +400,14 @@ class OpenAICompatTranslator:
         messages: list[dict[str, str]],
     ) -> dict[int, str]:
         """Translate one batch, retrying once with an explicit repair instruction."""
-        expected = {request.id for request in batch}
+        return self._run_batch({request.id for request in batch}, messages)
 
+    def _run_batch(
+        self,
+        expected: set[int],
+        messages: list[dict[str, str]],
+    ) -> dict[int, str]:
+        """Send one batch and return its ids, repairing a malformed reply once."""
         parsed = self._call(messages)
         result = _parse_translations(parsed)
         missing = expected - result.keys()

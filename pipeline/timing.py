@@ -336,6 +336,10 @@ class Placement:
     overrun: float = 0.0
     #: Seconds dropped because the line exceeded its slot *and* the following gap.
     trimmed: float = 0.0
+    #: Duration of the synthesised line before stretching, in seconds.
+    synth_seconds: float = 0.0
+    #: Seconds of the slot still silent after stretching (0.0 when it fills).
+    deficit: float = 0.0
 
 
 @dataclass

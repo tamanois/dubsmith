@@ -281,6 +281,22 @@ class JobConfig(BaseModel):
     min_stretch: float = Field(default=0.85, gt=0.05, le=1.0)
     max_stretch: float = Field(default=1.18, ge=1.0, le=3.0)
 
+    # Length repair. Translations routinely come out longer than their slot;
+    # re-wording the offending lines fits them without deleting speech.
+    #: Rewrite the lines that would otherwise have words cut, then re-synthesise
+    #: only those. Lines that already fit are never touched.
+    refine: bool = True
+    #: How many times a line may be rewritten before falling back to trimming.
+    refine_max_passes: int = Field(default=1, ge=0, le=5)
+    #: Seconds of overrun to tolerate before a line is worth rewriting.
+    refine_threshold: float = Field(default=0.05, ge=0.0, le=5.0)
+
+    # How the translator is told to size each line.
+    #   "off"   -> only the slot duration is given (the long-standing behaviour)
+    #   "words" -> also give a word ceiling derived from the measured speaking
+    #              rate, which a language model can actually act on
+    length_budget: str = "off"
+
     # ASR gating: segments the model itself distrusts are dropped.
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
@@ -341,6 +357,24 @@ class JobConfig(BaseModel):
             raise ConfigError(
                 f"Unknown accent mode {value!r}. Use: preserve, speaker-only or "
                 "reference-accent"
+            ) from None
+
+    @field_validator("length_budget")
+    @classmethod
+    def _check_length_budget(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "off": "off",
+            "none": "off",
+            "seconds": "off",
+            "words": "words",
+            "word": "words",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown length budget {value!r}. Use: off or words"
             ) from None
 
     @field_validator("target_language")

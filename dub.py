@@ -187,6 +187,52 @@ def build_dub_parser() -> argparse.ArgumentParser:
         help="Exact transcript of --accent-audio (required with it).",
     )
     parser.add_argument(
+        "--refine",
+        dest="refine",
+        action="store_true",
+        default=True,
+        help=(
+            "Rewrite and re-synthesise the lines that would otherwise have words "
+            "cut, so a long translation is fitted by wording rather than trimming. "
+            "Lines that already fit are left untouched. (default: on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-refine",
+        dest="refine",
+        action="store_false",
+        help="Disable the length repair and trim overlong lines as before.",
+    )
+    parser.add_argument(
+        "--refine-max-passes",
+        dest="refine_max_passes",
+        type=int,
+        default=1,
+        help="How many times a line may be rewritten before trimming. (default: 1)",
+    )
+    parser.add_argument(
+        "--refine-threshold",
+        dest="refine_threshold",
+        type=float,
+        default=0.05,
+        help=(
+            "Seconds a line must overrun its slot (and the following pause) "
+            "before it is worth rewriting. (default: 0.05)"
+        ),
+    )
+    parser.add_argument(
+        "--length-budget",
+        dest="length_budget",
+        default="off",
+        choices=["off", "words"],
+        help=(
+            "'words' also tells the translator how many words fit each slot, "
+            "measured from a target-language reference clip; 'off' sends only the "
+            "duration, as before. Needs --accent-audio or a target-language "
+            "--ref-audio. (default: off)"
+        ),
+    )
+    parser.add_argument(
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
     )
     parser.add_argument("--force", action="store_true", help="Ignore cached stages.")
@@ -267,6 +313,10 @@ def cmd_dub(argv: Sequence[str]) -> int:
         accent_mode=args.accent_mode,
         accent_audio=args.accent_audio,
         accent_text=args.accent_text,
+        refine=args.refine,
+        refine_max_passes=args.refine_max_passes,
+        refine_threshold=args.refine_threshold,
+        length_budget=args.length_budget,
         keep_subtitles=not args.no_subtitles,
         force=args.force,
     )

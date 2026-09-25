@@ -11,8 +11,10 @@ import pytest
 from pipeline.errors import TranslationError
 from pipeline.translate import (
     OpenAICompatTranslator,
+    ShortenRequest,
     TranslationRequest,
     build_messages,
+    build_shorten_messages,
     chunked,
     extract_json_object,
 )
@@ -263,4 +265,118 @@ class TestTranslatorTransport:
         with pytest.raises(TranslationError):
             translator.translate(
                 requests_payload(1), source_language="en", target_language="French"
+            )
+
+
+class TestShortenMessages:
+    """The rewrite prompt carries everything needed to shorten without losing meaning."""
+
+    @staticmethod
+    def request(**overrides: Any) -> ShortenRequest:
+        payload: dict[str, Any] = {
+            "id": 3,
+            "text": "une phrase vraiment tres longue",
+            "source": "a very long sentence",
+            "spoken_seconds": 4.42,
+            "available_seconds": 3.48,
+            "max_words": 9,
+        }
+        payload.update(overrides)
+        return ShortenRequest(**payload)
+
+    def test_states_the_ceiling_and_the_pressures(self) -> None:
+        messages = build_shorten_messages([self.request()], target_language="French")
+        user = messages[1]["content"]
+        assert '"id": 3' in user
+        assert '"max_words": 9' in user
+        assert '"spoken_seconds": 4.42' in user
+        assert '"available_seconds": 3.48' in user
+
+    def test_carries_the_previous_wording_and_the_source(self) -> None:
+        messages = build_shorten_messages([self.request()], target_language="French")
+        user = messages[1]["content"]
+        assert "une phrase vraiment tres longue" in user
+        assert "a very long sentence" in user
+
+    def test_forbids_dropping_facts_and_names_the_target(self) -> None:
+        system = build_shorten_messages([self.request()], target_language="French")[0]["content"]
+        assert "French" in system
+        assert "number" in system and "name" in system
+
+    def test_every_line_becomes_one_json_object(self) -> None:
+        messages = build_shorten_messages(
+            [self.request(id=0), self.request(id=1)], target_language="German"
+        )
+        assert messages[1]["content"].count('"id":') == 2
+
+
+class TestWordBudget:
+    """A budget changes the prompt only when one is supplied."""
+
+    def test_absent_when_no_budget_is_known(self) -> None:
+        messages = build_messages(
+            [TranslationRequest(id=0, text="a", duration=1.0)],
+            source_language="en",
+            target_language="French",
+        )
+        assert "max_words" not in messages[0]["content"]
+        assert "max_words" not in messages[1]["content"]
+
+    def test_present_when_a_budget_is_known(self) -> None:
+        messages = build_messages(
+            [TranslationRequest(id=0, text="a", duration=2.0, max_words=5)],
+            source_language="en",
+            target_language="French",
+        )
+        assert '"max_words": 5' in messages[1]["content"]
+        assert "max_words" in messages[0]["content"]
+
+    def test_the_duration_hint_is_kept(self) -> None:
+        messages = build_messages(
+            [TranslationRequest(id=0, text="a", duration=2.0, max_words=5)],
+            source_language="en",
+            target_language="French",
+        )
+        assert '"seconds": 2.0' in messages[1]["content"]
+
+
+class TestShortenCalls:
+    """The shorten backend reuses the same transport and repair path."""
+
+    def test_rewrites_are_returned_by_id(self) -> None:
+        payload = json.dumps({"translations": [{"id": 0, "text": "Bref."}]})
+        translator = make_translator([payload])
+        result = translator.shorten(
+            [ShortenRequest(id=0, text="long", max_words=2)], target_language="French"
+        )
+        assert result == {0: "Bref."}
+
+    def test_empty_requests_skip_the_api(self) -> None:
+        translator = make_translator([])
+        assert translator.shorten([], target_language="French") == {}
+        assert translator.client.completions.calls == []
+
+    def test_missing_id_is_repaired_once(self) -> None:
+        translator = make_translator(
+            [
+                json.dumps({"translations": [{"id": 0, "text": "a"}]}),
+                json.dumps({"translations": [{"id": 0, "text": "a"}, {"id": 1, "text": "b"}]}),
+            ]
+        )
+        result = translator.shorten(
+            [ShortenRequest(id=0, text="x", max_words=1), ShortenRequest(id=1, text="y", max_words=1)],
+            target_language="French",
+        )
+        assert result == {0: "a", 1: "b"}
+        assert len(translator.client.completions.calls) == 2
+
+    def test_transport_failure_raises_a_domain_error(self) -> None:
+        # Two failures: the client first retries without `response_format`, so a
+        # single queued error would be masked by an empty second response.
+        translator = make_translator(
+            [RuntimeError("connection refused"), RuntimeError("connection refused")]
+        )
+        with pytest.raises(TranslationError, match="failed"):
+            translator.shorten(
+                [ShortenRequest(id=0, text="x", max_words=1)], target_language="French"
             )

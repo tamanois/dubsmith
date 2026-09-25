@@ -367,13 +367,20 @@ pacing differs:
 
 Two conclusions worth carrying into your own reference choices. Borrowing only an
 accent is cheaper than borrowing the whole voice: the same slow clip cost 13.4 s
-as an accent source but 23.0 s as the donor. And a brisk narrated clip beats a
-slow reading by a wide margin — nearly double the speech rate cut trimming by a
-factor of six.
+as an accent source but 23.0 s as the donor. And reference pace is a **trade, not
+a win**: a faster reference shortens the translation so less speech needs cutting,
+but it also leaves the voice finishing early — on this video the fast clip left
+15.2 s of silence spread over 23 lines, in slots where the original speaker is
+still talking on screen.
 
-So prefer a reference whose pace is close to the speaker you are dubbing, and
-prefer a narrated clip over a careful personal recording. Failing that, lower
-`--min-stretch` to allow faster speech.
+Those two failures are not equally bad. Silence is a pause; deleted words are
+information loss. So prefer a reference that leans *slightly* fast, and let
+[the length repair](#when-a-translation-is-too-long-for-its-slot) handle the lines
+that still come out long — it removes the deletion without adding silence, which
+no choice of reference pace can do. Measured across five clip speeds, roughly half
+the lines missed their slot at *every* pace, so pacing alone cannot fix this.
+
+Failing all that, lower `--min-stretch` to allow faster speech.
 
 Need a transcript and never wrote one down? Transcribing the clip with the same
 model the pipeline uses is accurate enough in practice — the run behind the table
@@ -382,7 +389,6 @@ text has to match the audio it describes, so correct any obviously normalised
 numbers or names by hand.
 
 ### Options in full
-
 **Input and language** — exactly one of `--video` / `--audio` is required.
 
 | Option | Default | What it achieves |
@@ -420,10 +426,18 @@ numbers or names by hand.
 | `--max-stretch RATIO` | `1.18` | Most a line may be slowed to fill its slot. Raising this makes speech sound unnatural, so prefer fixing the translation. |
 | `--stretcher BACKEND` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none`. `none` disables stretching (lines then only overrun or trim). Falls back automatically if a binary is missing. |
 
-**Models and hardware**
+**Length repair** — fixes a long translation by wording rather than by cutting audio.
 
 | Option | Default | What it achieves |
 |---|---|---|
+| `--refine` / `--no-refine` | on | Rewrites the lines that would otherwise have words cut, then re-synthesises just those. Lines that already fit are untouched; a rewrite is kept only if it measurably reduces the overflow. `--no-refine` restores the previous trim-only behaviour. |
+| `--refine-max-passes N` | `1` | How many times a line may be rewritten before falling back to trimming. `0` disables the repair. |
+| `--refine-threshold SECONDS` | `0.05` | How far a line must overrun its slot *and* the pause after it before it is worth rewriting. Raise it to repair fewer, worse lines. |
+| `--length-budget MODE` | `off` | `words` also tells the translator how many words fit each slot, measured from a target-language reference clip. `off` sends only the duration, as before. Needs `--accent-audio` or a target-language `--ref-audio`; without one it falls back to `off` automatically. |
+
+**Models and hardware**
+
+| Option | Default | What it achieves ||---|---|---|
 | `--device DEVICE` | `auto` | `auto`, `cuda:0`, or `cpu`. `cpu` is much slower but proves the GPU is not the problem. |
 | `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate. |
 | `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
@@ -438,8 +452,53 @@ numbers or names by hand.
 | `--force` | off | Ignores the stage cache and rebuilds everything. |
 | `-v` / `--verbose` | off | Debug logging, including which device each stage actually used. |
 
-### Verified commands
+### When a translation is too long for its slot
 
+Translated speech is routinely longer than the source: French needs roughly 15–40%
+more time than English for the same content. The stretch clamp absorbs part of
+that, and a line is allowed to spill into the pause that follows it, but anything
+beyond that used to be **cut** — words deleted to keep the video in sync.
+
+The length repair avoids the cut by fixing the *text* instead:
+
+1. After the first synthesis pass, each line's spoken length is measured against
+   its slot plus the following pause.
+2. Lines that would overflow are sent back to the translator together, with their
+   previous wording, the source line, and a word ceiling derived from how much
+   time is actually available.
+3. Only those lines are re-synthesised. A rewrite is adopted **only** if it
+   measurably reduces the overflow, so a line can never come out worse.
+
+Three properties make it safe to leave on:
+
+- **Lines that already fit are never touched** — their audio is bit-for-bit
+  identical to a run with `--no-refine`, which is asserted in the test suite.
+- **A failed repair is a no-op.** If the translator is unreachable, or a custom
+  translator cannot rewrite, the run logs a warning and keeps the audio it has.
+- **Nothing is re-shortened on a re-run.** Rewrites always start from the original
+  translation, recorded in `03_script.json`, and the spoken version is kept
+  separately in `03b_spoken.json` — which is also what the target subtitles use,
+  so they never display words the viewer cannot hear.
+
+Measured on the 4:47 TED talk, English → French, identical settings apart from
+the flag:
+
+| Metric | `--no-refine` | with repair |
+|---|---|---|
+| Speech deleted | 3.76 s | **0.0 s** |
+| Worst single line deleted | **59%** | **0%** |
+| Lines losing >10% of their speech | 5 | **0** |
+| Lines that had to be cut | 8 | 0 |
+| Output exceeding slot + pause | 4.79 s | 0.51 s |
+| Silence left in slots | 18.35 s | 17.11 s |
+| Round-trip intelligibility (WER) | 1.5% | 1.2% |
+| Drift / loudness / background | — | unchanged |
+
+The repair rewrote 3 of 57 lines in one extra translator call. Its cost is a
+second synthesis pass over just those lines, which took the stage from 56 s to
+73 s.
+
+### Verified commands
 These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
 figures come from each run's `report.json`.
 
@@ -450,6 +509,7 @@ figures come from each run's `report.json`.
 | `--video talk.mp4 --target fr --accent-mode speaker-only` | timbre 0.9876, French fit −0.081 |
 | `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio slow.wav --accent-text "…"` | timbre 0.9854, French fit −0.057, 13.4 s trimmed |
 | `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…"` | **best overall**: 2.3 s trimmed, 0 drift, loudness matched, background preserved |
+| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…" --refine` (default) | **0.0 s trimmed**: 3 lines rewritten, worst-line deletion 59% → 0%, WER 1.5% → 1.2% |
 
 The last row is the configuration to aim for: a fast-paced native clip as the
 accent source gives near-native pronunciation with almost no speech lost. Full
@@ -464,11 +524,15 @@ Everything for one job lands in `output/<input-stem>/`:
 ```
 output/talk/
 ├── 01_audio.wav         # normalised 48 kHz mono source audio
+├── 01b_speech.wav       # separated speech stem (when background is preserved)
+├── 01c_background.wav   # separated music/ambience stem
 ├── 02_transcript.json   # ASR result: segments, words, timings, language
 ├── 03_script.json       # source -> target text per segment
+├── 03b_spoken.json      # lines the length repair re-wrote (only those)
+├── 03c_refine.json      # what the length repair achieved
 ├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
 ├── 05_mix.wav           # assembled dub track, before normalisation
-├── timing.json          # per-segment stretch ratio and placement
+├── timing.json          # per-segment stretch ratio, placement and deficit
 ├── dub.wav              # final loudness-normalised dub audio
 ├── video_dubbed.mp4     # dubbed video (video input only)
 ├── subs_source.srt
@@ -496,11 +560,20 @@ output/talk/
 | `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
 | `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
 | `donor.accent` | Present only in `reference-accent` mode: the accent clip's path and whether a transcript was supplied |
-| `clamped_segments` | Lines that hit the ±15–20% stretch limit |
+| `clamped_segments` | Lines that hit a stretch limit (either direction) |
+| `clamped_long_segments` | …of which were too long to compress into their slot |
+| `clamped_short_segments` | …of which were too short to slow down enough to fill it |
+| `deficit_segments` | Lines that left silence in their slot |
+| `deficit_seconds_total` | Total silence left inside slots |
 | `overrun_segments` | Lines that spilled into the pause after them (free, no speech lost) |
 | `overrun_seconds_total` | Total speech fitted into those pauses |
+| `surplus_seconds_total` | Total speech exceeding slot + pause, i.e. at risk of being cut |
 | `trimmed_segments` | Lines where the residue had to be cut to keep the video in sync |
 | `trimmed_seconds_total` | Seconds of speech lost to those cuts |
+| `worst_line_deleted_ratio` | The largest share of a single line that was deleted |
+| `lines_over_10pct_deleted` | Lines that lost more than a tenth of their speech |
+| `speech_rate_wps` | Words per second the cloned voice actually delivered |
+| `refine` | What the length repair did: offenders, improved, seconds reclaimed |
 | `shifted_segments` | Lines pushed later to avoid overlapping another |
 
 Two of these deserve attention:
@@ -592,7 +665,7 @@ python -m pytest
 ```
 
 ```
-359 passed
+400 passed
 ```
 
 Run a single area while iterating:
@@ -624,7 +697,10 @@ python -m pytest -k accent -q                  # everything accent-related
 | `Unsupported language 'xx'` | Use one of the ten supported languages |
 | CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it) |
 | Dub sounds rushed or slow | Check `report.json` → `clamped_segments`; tighten the translation |
-| Some words are cut off | `report.json` → `trimmed_segments`: the translation is too long for its slot. Shorten it, or lower `--min-stretch` |
+| Some words are cut off | `report.json` → `trimmed_segments`: the translation is too long for its slot. Check `worst_line_deleted_ratio` too — a small total can hide one badly damaged line. Leave the length repair on (it is on by default), shorten the translation, or lower `--min-stretch` |
+| A line lost a lot of words despite a low `trimmed_seconds_total` | Look at `worst_line_deleted_ratio` and `lines_over_10pct_deleted`: damage is usually concentrated in one or two lines, not spread evenly |
+| Lines sound slow or have gaps | `report.json` → `deficit_seconds_total`: the translation is shorter than its slot. See [Reference pacing](#reference-pacing), or use `--length-budget words` with a target-language reference |
+| The repair did not help | Check `report.json` → `refine`. `attempted: false` means no line overflowed (nothing to fix) or the translator cannot rewrite; `improved: 0` means the rewrites did not fit either, so the old behaviour applied |
 | Dub drifts out of sync | Should not happen — lines are never shifted late. If `shifted_segments > 0`, check `timing.json` for genuinely overlapping source speech |
 | Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
 | Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
@@ -654,7 +730,7 @@ pipeline/
 ├── tts.py                 donor selection + voice cloning
 ├── timing.py              stretching backends + timeline assembly
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (359 tests)
+tests/                     pytest suite (400 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference

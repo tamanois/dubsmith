@@ -21,7 +21,7 @@
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 359 passing | `tests/` |
+| Tests | ✅ 400 passing | `tests/` |
 
 Verification performed:
 
@@ -211,13 +211,76 @@ configuration measured so far, and it settles the pacing question empirically:
 | fast narrated clip, as accent clip | ~3.6 words/s | **2.3 s** |
 
 Two things follow. Borrowing only the accent is cheaper than borrowing the whole
-voice (13.4 s vs 23.0 s for the same slow clip). And reference *pace* dominates
-all of it: doubling the speech rate cut trimming sixfold, which is a larger
-effect than any timing knob we expose. Guidance recorded in the README is
-therefore to prefer a brisk narrated clip over a careful personal reading.
+voice (13.4 s vs 23.0 s for the same slow clip). And reference *pace* is a trade
+rather than a win — the README presents it that way. The "prefer a brisk narrated
+clip" advice above was later corrected: see P3 below, which shows the pace knob
+trades silence against deleted words and cannot fix either.
+
+### P3 — length feedback to the translator (IMPLEMENTED)
+
+The problem was diagnosed with real data rather than assumed. On the TED run the
+report's `clamped_segments` split into **21 lines too short** (harmless: they left
+silence) and **8 too long** (harmful: they lost words). Damage was concentrated —
+2 of 58 lines carried 75% of all deleted speech, one losing **59% of its own
+words** — so the aggregate `trimmed_seconds_total` (0.83% of audio) looked fine
+while the result was audibly broken on those lines. Conclusion: optimise
+worst-line deletion, not the total.
+
+Three findings shaped the design:
+
+- **Pace cannot fix it.** Sweeping the accent clip's pace across five values moved
+  every metric monotonically, but in opposite directions: slowing the clip cut
+  silence 15.2 s → 4.3 s while deleted speech rose 0.7 s → 11.2 s. At the best
+  setting only 29/55 lines fitted, so ~47% miss at *every* pace. The mismatch is
+  textual, not temporal. (Re-pacing is therefore ruled out; the accent and timbre
+  probes showed it is cost-free but useless.)
+- **Deletion is worse than silence.** Silence is a pause; deleted words are lost
+  information. That asymmetry sets the priority order.
+- **Synthesis is stochastic.** Identical settings gave 0.71 s and 2.32 s of
+  trimming in two runs, so single-run deltas are unreliable; only large,
+  monotonic effects across many lines can be trusted.
+
+What was built (options 1+2, additive and default-on):
+
+1. **Instrumentation first** (`Placement.synth_seconds`/`deficit`, plus a report
+   split of `clamped_long/short_segments`, `worst_line_deleted_ratio`,
+   `lines_over_10pct_deleted`, `speech_rate_wps`). Without this the two failure
+   directions were indistinguishable, and "not degrading" was unfalsifiable.
+2. **Targeted shorten-and-retry** (`--refine`, default on). Lines that overflow
+   slot + following pause are sent back to the translator together with their
+   previous wording, the source line, and a word ceiling derived from the measured
+   overflow; only those lines are re-synthesised. Safe by construction: lines that
+   already fit are never touched, a rewrite is kept only if it measurably reduces
+   the overflow, and a failure is a non-fatal no-op. Rewrites start from the
+   original text so re-runs cannot double-shorten; the spoken version is stored in
+   `03b_spoken.json` and used for the target subtitles.
+3. **Gated word budget** (`--length-budget words`, default `off`). Converts the
+   slot into a word ceiling measured from a target-language reference clip, since
+   a language model can count words but cannot estimate seconds. The general form
+   was deliberately *not* shipped: with the default auto-donor the only reference
+   is the source speaker, whose rate describes the wrong language, so the budget
+   is skipped in that case rather than guessed.
+
+Verified end to end on the 4:47 TED talk, identical settings apart from the flag:
+
+| Metric | `--no-refine` | with repair |
+|---|---|---|
+| Speech deleted | 3.76 s | **0.0 s** |
+| Worst single line deleted | 59% | **0%** |
+| Lines losing >10% of speech | 5 | **0** |
+| Output exceeding slot + pause | 4.79 s | 0.51 s |
+| Silence left in slots | 18.35 s | 17.11 s |
+| Round-trip WER (per segment) | 1.5% | 1.2% |
+| Drift / loudness / background | — | unchanged |
+
+3 of 57 lines were rewritten in one extra translator call. Cost: the synthesis
+stage went from 56 s to 73 s. Caveat: the two runs segmented slightly differently
+(56 vs 57 lines) because ASR re-ran, so the sweep is not perfectly controlled; the
+within-run repair statistics and the worst-line ratio are the clean evidence. The
+rewrites were inspected by hand and preserve meaning, e.g. #39 went from 21 to 14
+words with the same content.
 
 Deviations from the original plan (deliberate, documented):
-
 - **`silero-vad` dependency dropped.** faster-whisper bundles an ONNX Silero VAD
   and enables it via `vad_filter=True`, so a separate package was redundant.
 - **Stretching has three backends** (`rubberband` → `sox` → `librosa`) instead of
@@ -268,6 +331,7 @@ voice timbre**, ideally with the **target language's accent**.
 - Voice cloning with the speaker's own timbre.
 - Accent handling: `preserve` (default), `speaker-only`, or `reference-accent`
   (borrow a native clip's pronunciation while keeping the voice's timbre).
+- Overlong lines repaired by re-wording rather than by cutting speech (`--refine`).
 - Audio re-timed to the source timeline (no lip sync).
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
@@ -276,6 +340,8 @@ voice timbre**, ideally with the **target language's accent**.
 - Fully automatic native accent: `reference-accent` needs a supplied clip, so an
   unattended native-accent path via voice conversion is still P2.
 - Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
+  The length-repair half is now implemented (see the P3 section above); reverb
+  matching and automatic QC remain.
 - Lip sync (P4), multi-source-language videos (P5), service-ification (P6).
 
 ### 3.2 Pipeline

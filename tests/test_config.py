@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from pipeline.config import (
     JobConfig,
@@ -276,3 +277,45 @@ class TestReleaseGpuMemory:
     def test_is_safe_to_call_repeatedly(self) -> None:
         for _ in range(3):
             release_gpu_memory()
+
+
+class TestLengthRepairOptions:
+    """Options controlling the length repair and the word budget."""
+
+    def test_repair_is_on_by_default(self) -> None:
+        job = JobConfig(audio=Path("a.wav"))
+        assert job.refine is True
+        assert job.refine_max_passes == 1
+        assert job.refine_threshold == pytest.approx(0.05)
+
+    def test_repair_can_be_switched_off(self) -> None:
+        assert JobConfig(audio=Path("a.wav"), refine=False).refine is False
+
+    def test_zero_passes_disables_repair_effectively(self) -> None:
+        assert JobConfig(audio=Path("a.wav"), refine_max_passes=0).refine_max_passes == 0
+
+    def test_negative_passes_are_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            JobConfig(audio=Path("a.wav"), refine_max_passes=-1)
+
+    def test_length_budget_defaults_to_seconds_only(self) -> None:
+        assert JobConfig(audio=Path("a.wav")).length_budget == "off"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("off", "off"),
+            ("none", "off"),
+            ("seconds", "off"),
+            ("words", "words"),
+            ("Word", "words"),
+            ("Words", "words"),
+            ("words", "words"),
+        ],
+    )
+    def test_length_budget_aliases(self, raw: str, expected: str) -> None:
+        assert JobConfig(audio=Path("a.wav"), length_budget=raw).length_budget == expected
+
+    def test_unknown_length_budget_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown length budget"):
+            JobConfig(audio=Path("a.wav"), length_budget="syllables")

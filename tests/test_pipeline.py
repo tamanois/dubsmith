@@ -16,12 +16,12 @@ import pytest
 import soundfile as sf
 
 from pipeline import media
-from pipeline.asr import Transcript
+from pipeline.asr import Segment, Transcript
 from pipeline.config import JobConfig, Settings
-from pipeline.errors import MediaError
+from pipeline.errors import MediaError, TranslationError
 from pipeline.orchestrate import Pipeline
 from pipeline.timing import IdentityStretcher
-from pipeline.translate import TranslationRequest
+from pipeline.translate import ShortenRequest, TranslationRequest
 
 SR = 48_000
 
@@ -722,3 +722,285 @@ class TestVideoJob:
         )
         with pytest.raises(MediaError, match="no audio stream"):
             pipeline.run()
+
+# --------------------------------------------------------------------------- #
+# Length repair (speech that a translation makes too long for its slot)
+# --------------------------------------------------------------------------- #
+
+
+def refine_transcript() -> Transcript:
+    """Line 0 is far too long for its slot; line 1 is the final line.
+
+    Segment 0 spans 2.0s and is followed by a 0.5s pause, so it may occupy 2.5s
+    before it would desynchronise the next line at 2.5s.
+    """
+    return Transcript(
+        language="en",
+        segments=[
+            Segment(id=0, start=0.0, end=2.0, text="A long English sentence."),
+            Segment(id=1, start=2.5, end=4.5, text="Short."),
+        ],
+    )
+
+
+class ScriptedTTSEngine(FakeTTSEngine):
+    """Returns one scripted row of durations per ``synthesize`` call.
+
+    Row 1 is the initial pass over every line; later rows serve the re-synthesis
+    of just the lines that needed rewriting.
+    """
+
+    def __init__(self, rows: Sequence[Sequence[float]], *, sample_rate: int = 24_000) -> None:
+        super().__init__(sample_rate)
+        self._rows = [list(row) for row in rows]
+        self._row = 0
+        self.text_batches: list[list[str]] = []
+
+    def _tone(self, seconds: float) -> np.ndarray:
+        count = max(1, int(seconds * self.sample_rate))
+        t = np.linspace(0.0, seconds, count, endpoint=False)
+        return (0.3 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
+
+    def synthesize(self, texts: Sequence[str], *, language: str) -> list[np.ndarray | None]:
+        self.synth_calls += 1
+        self.text_batches.append(list(texts))
+        row = self._rows[min(self._row, len(self._rows) - 1)]
+        self._row += 1
+        return [self._tone(seconds) for seconds in row[: len(texts)]]
+
+
+class ShorteningTranslator(FakeTranslator):
+    """A translator that can also rewrite lines that proved too long."""
+
+    def __init__(
+        self,
+        *,
+        shortenings: dict[int, str] | None = None,
+        fail: bool = False,
+        blank_ids: Sequence[int] = (),
+    ) -> None:
+        super().__init__(blank_ids)
+        self.shortenings = shortenings or {}
+        self.fail = fail
+        self.shorten_calls = 0
+        self.requested: list[ShortenRequest] = []
+
+    def shorten(
+        self, requests: Sequence[ShortenRequest], *, target_language: str
+    ) -> dict[int, str]:
+        self.shorten_calls += 1
+        self.requested = list(requests)
+        if self.fail:
+            raise TranslationError("translator unreachable")
+        return {
+            request.id: self.shortenings.get(request.id, "Bref.")
+            for request in requests
+        }
+
+
+def refine_pipeline(
+    tmp_path: Path,
+    *,
+    rows: Sequence[Sequence[float]],
+    translator: Any | None = None,
+    refine: bool = True,
+    output_dir: Path | None = None,
+) -> tuple[Pipeline, Any, ScriptedTTSEngine, ShorteningTranslator]:
+    """Build a pipeline whose TTS durations are scripted, so overflow is exact."""
+    tts = ScriptedTTSEngine(rows)
+    translator = translator or ShorteningTranslator(shortenings={0: "Bref."})
+    pipeline, _, _, _ = make_pipeline(
+        tmp_path,
+        refine_transcript(),
+        translator=translator,
+        tts=tts,
+        refine=refine,
+        output_dir=output_dir or (tmp_path / "output"),
+    )
+    return pipeline, translator, tts, translator
+
+
+class TestLengthRepair:
+    """Only overlong lines are re-worded; everything else is left alone."""
+
+    def test_only_the_overlong_line_is_rewritten(self, tmp_path: Path) -> None:
+        # Line 0 at 3.5s needs 2.98s after the clamp but has 2.5s; line 1 is last
+        # and unconstrained, so it must never be sent for rewriting.
+        pipeline, translator, tts, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        report = pipeline.run().report
+
+        assert translator.shorten_calls == 1
+        assert [r.id for r in translator.requested] == [0]
+        assert report["refine"]["attempted"] is True
+        assert report["refine"]["offenders"] == 1
+        assert report["refine"]["improved"] == 1
+        assert report["refine"]["llm_calls"] == 1
+        assert tts.synth_calls == 2
+
+    def test_the_second_pass_only_resynthesises_the_offender(self, tmp_path: Path) -> None:
+        pipeline, _, tts, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        pipeline.run()
+        assert tts.text_batches[0] == [
+            "[French] A long English sentence.",
+            "[French] Short.",
+        ]
+        assert tts.text_batches[1] == ["Bref."]
+
+    def test_the_fitted_result_loses_no_speech(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        report = pipeline.run().report
+        assert report["trimmed_seconds_total"] == 0.0
+        assert report["refine"]["seconds_recovered"] > 0.4
+
+    def test_without_refine_the_line_is_trimmed_as_before(self, tmp_path: Path) -> None:
+        pipeline, translator, tts, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
+        )
+        report = pipeline.run().report
+
+        assert translator.shorten_calls == 0
+        assert tts.synth_calls == 1
+        assert report["refine"]["attempted"] is False
+        # The old behaviour: the surplus beyond slot + gap is cut.
+        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+
+    def test_lines_that_fit_are_byte_identical_with_and_without_refine(
+        self, tmp_path: Path
+    ) -> None:
+        """The core safety property: repairing one line cannot disturb another."""
+        rows = [[3.5, 1.0], [1.8]]
+        plain, _, _, _ = refine_pipeline(
+            tmp_path, rows=rows, refine=False, output_dir=tmp_path / "plain"
+        )
+        plain.run()
+        repaired, _, _, _ = refine_pipeline(
+            tmp_path, rows=rows, refine=True, output_dir=tmp_path / "repaired"
+        )
+        repaired.run()
+
+        for job in ("plain", "repaired"):
+            assert (tmp_path / job / "input" / "04_dubbed" / "seg_0001.wav").is_file()
+        before = (tmp_path / "plain" / "input" / "04_dubbed" / "seg_0001.wav").read_bytes()
+        after = (tmp_path / "repaired" / "input" / "04_dubbed" / "seg_0001.wav").read_bytes()
+        assert before == after
+
+    def test_a_rewrite_that_does_not_help_is_discarded(self, tmp_path: Path) -> None:
+        # The retry comes back longer than what we already had.
+        pipeline, translator, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [4.0]])
+        report = pipeline.run().report
+
+        assert translator.shorten_calls == 1
+        assert report["refine"]["improved"] == 0
+        samples, rate = media.load_audio(
+            pipeline.job_dir / "04_dubbed" / "seg_0000.wav"
+        )
+        assert len(samples) / rate == pytest.approx(3.5, abs=0.02)
+        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+
+    def test_a_partial_improvement_is_kept(self, tmp_path: Path) -> None:
+        # 3.5s -> 3.0s still overflows (2.55s > 2.5s) but by less, so it is kept.
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [3.0]])
+        report = pipeline.run().report
+
+        assert report["refine"]["improved"] == 1
+        assert 0.0 < report["trimmed_seconds_total"] < 0.475
+
+    def test_a_failing_rewrite_is_not_fatal(self, tmp_path: Path) -> None:
+        translator = ShorteningTranslator(fail=True)
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], translator=translator
+        )
+        report = pipeline.run().report
+
+        assert report["refine"]["attempted"] is True
+        assert report["refine"]["improved"] == 0
+        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+
+    def test_a_translator_without_rewriting_is_handled(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], translator=FakeTranslator()
+        )
+        report = pipeline.run().report
+        assert report["refine"]["attempted"] is False
+
+    def test_the_original_translation_is_kept_for_idempotency(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        pipeline.run()
+        payload = json.loads(
+            (pipeline.job_dir / "03_script.json").read_text(encoding="utf-8")
+        )
+        assert payload["lines"][0]["target"] == "[French] A long English sentence."
+
+    def test_the_rewrite_is_recorded_and_reaches_the_subtitles(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        result = pipeline.run()
+
+        spoken = json.loads(
+            (result.job_dir / "03b_spoken.json").read_text(encoding="utf-8")
+        )
+        assert spoken == {"0": "Bref."}
+        assert result.target_srt is not None
+        assert "Bref." in result.target_srt.read_text(encoding="utf-8")
+
+    def test_the_request_carries_a_ceiling_derived_from_measurement(
+        self, tmp_path: Path
+    ) -> None:
+        pipeline, translator, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
+        pipeline.run()
+
+        request = translator.requested[0]
+        assert request.spoken_seconds == pytest.approx(2.98, abs=0.02)
+        assert request.available_seconds == pytest.approx(2.5, abs=0.02)
+        # 7 words in "[French] A long English sentence." scaled by 2.5/2.98
+        assert 0 < request.max_words <= 7
+
+
+class TestTimingDirectionSplit:
+    """The report must separate 'too long' from 'too short'."""
+
+    def test_the_two_directions_are_reported_separately(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
+        )
+        report = pipeline.run().report
+
+        assert report["clamped_segments"] == 2
+        assert report["clamped_long_segments"] == 1  # line 0 could not compress
+        assert report["clamped_short_segments"] == 1  # line 1 could not be slowed
+        assert report["deficit_seconds_total"] > 0.5
+        assert report["surplus_seconds_total"] > 0.4
+
+    def test_worst_line_deletion_is_surfaced(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
+        )
+        report = pipeline.run().report
+        # 0.475s cut from a 2.98s line.
+        assert report["worst_line_deleted_ratio"] == pytest.approx(0.16, abs=0.02)
+        assert report["lines_over_10pct_deleted"] == 1
+
+    def test_a_clean_run_reports_no_damage(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[1.9, 2.0], [1.8]])
+        report = pipeline.run().report
+        assert report["trimmed_seconds_total"] == 0.0
+        assert report["worst_line_deleted_ratio"] == 0.0
+        assert report["lines_over_10pct_deleted"] == 0
+
+    def test_measured_speaking_rate_is_reported(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[1.9, 2.0], [1.8]])
+        report = pipeline.run().report
+        # 7 target words (the fake translator prefixes "[French]") over 3.9s of
+        # speech.
+        assert report["speech_rate_wps"] == pytest.approx(1.79, abs=0.05)
+
+    def test_timing_json_carries_the_new_fields(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
+        )
+        pipeline.run()
+        payload = json.loads(
+            (pipeline.job_dir / "timing.json").read_text(encoding="utf-8")
+        )
+        assert payload[0]["synth_seconds"] == pytest.approx(3.5, abs=0.02)
+        assert payload[0]["deficit"] == 0.0
+        assert payload[1]["deficit"] > 0.5
