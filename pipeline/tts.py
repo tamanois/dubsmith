@@ -311,6 +311,39 @@ def _donor_ratio(
     return float(np.clip(position, 0.0, 1.0))
 
 
+#: How much shorter than the longest sibling a render may be and still be treated
+#: as a real candidate for the blended reference.
+_TRUNCATED_RENDER_FLOOR = 0.5
+
+
+def _is_truncated(candidate: np.ndarray, reference: np.ndarray) -> bool:
+    """True when ``candidate`` is far too short beside ``reference`` to be complete.
+
+    A genuinely terser take is shorter than its siblings, but not by half; the model
+    occasionally returns a fragment of the requested text instead.
+    """
+    return int(candidate.size) < _TRUNCATED_RENDER_FLOOR * int(reference.size)
+
+
+def _drop_truncated(renders: Sequence[np.ndarray]) -> list[np.ndarray]:
+    """Drop renders that clearly stopped early, keeping the fullest ones.
+
+    The model occasionally returns a fragment of the requested text - observed on a
+    real run as a 1.4 s clip for a 14 s transcript. A fragment is a *failed* render,
+    not a candidate voice: it covers only part of the text, yet the ratio search will
+    happily prefer it, because a short clip can score well on its own. Keeping only
+    renders within :data:`_TRUNCATED_RENDER_FLOOR` of the longest costs nothing,
+    since they have already been generated.
+
+    The longest render is within the floor of itself, so a non-empty input always
+    yields at least one candidate.
+    """
+    if not renders:
+        return []
+    longest = max(renders, key=lambda wav: int(wav.size))
+    return [wav for wav in renders if not _is_truncated(wav, longest)]
+
+
 @dataclass(frozen=True)
 class _BlendPass:
     """One rendered blend and how it scored on the language-matched scale."""
@@ -716,6 +749,10 @@ class TTSEngine:
         candidates = self._render(accent_text, language, count)
         if not candidates:
             raise TTSError("The model returned no audio for the blended reference.")
+        # A take that stopped early is a failed render, not a voice: it covers only
+        # part of the transcript, and it is exactly the kind of clip the ratio search
+        # below would prefer. Filtered before scoring so it cannot be chosen.
+        candidates = _drop_truncated(candidates)
 
         # Scoring is only paid for when it decides something: which take to keep, or
         # how far along the scale the blend ended up.
@@ -752,6 +789,10 @@ class TTSEngine:
             rendered = self._render(accent_text, language, 1)
             if not rendered:
                 break
+            if _is_truncated(rendered[0], made[-1].samples):
+                # A fragment, so there is nothing to measure: retry rather than
+                # let a partial render compete with a full one. Bounded by `planned`.
+                continue
             made.append(
                 self._measure_pass(
                     rendered[0], timbre_embedding, accent_embedding, donor_anchor

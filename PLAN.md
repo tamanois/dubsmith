@@ -19,9 +19,10 @@
 | ASR + VAD gating | ✅ | `pipeline/asr.py` |
 | Translation (OpenAI-compatible) | ✅ | `pipeline/translate.py` |
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
+| Speaker diarization (P1) | ✅ | `pipeline/diarize.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 429 passing | `tests/` |
+| Tests | ✅ 565 passing | `tests/` |
 
 Verification performed:
 
@@ -31,6 +32,12 @@ Verification performed:
 - `rubberband` 2.0.0 verified: `--time 1.10` on a 2.000 s clip yields 2.200 s, so
   the `ratio = target/source` convention in `pipeline/timing.py` is correct.
 - Missing-model path produces an actionable error naming the exact download command.
+- **Multi-speaker run** on the repo's real two-person clip (`input/louisavy.mp4`,
+  60 s, English → French, `reference-accent`): 2 speakers found over 15 segments,
+  a distinct donor per voice (segments 11 and 4, each one that speaker delivered),
+  and one 11.9 s / 13.3 s blend clip each at donor ratios 0.85 / 0.75. Per-speaker
+  audit (`audit_timbre.py`) reports 0 of 8 and 0 of 7 lines closer to the accent
+  voice, each measured against its own voice's scale.
 - **Real end-to-end runs** (real Whisper large-v3 + real LLM + real Qwen3-TTS,
   only the HTTP transport swapped for a local model via the injected translator):
   - Audio mode on a 23 s French voice clip → English dub in ~15 s (faster than
@@ -40,6 +47,9 @@ Verification performed:
     stream copied and the dub muxed in; round-trip ASR confirms the new audio.
 - Whisper download verified end to end: `whisper_large_v3` transcribes French and
   Chinese correctly (language detection at p=0.99).
+- Voice identity is measured, not only listened to: `audit_timbre.py` scores every
+  synthesised line against the blend clip and the accent clip on a language-matched
+  scale. Numbers in P3b and P3c.
 
 Issues found and fixed during e2e:
 
@@ -52,12 +62,21 @@ Issues found and fixed during e2e:
   falls back to CPU with a warning instead of aborting.
 - Video-only inputs now fail with an actionable message (many "video" files,
   including the TED sample used for testing, carry no audio stream at all).
+- **The `flash-attn` banner is import-time noise, not a missing feature.**
+  `qwen_tts` eagerly imports both tokenizer generations, and the 25 Hz one prints
+  "flash-attn is not installed" from its Whisper encoder while being imported. The
+  12 Hz checkpoint this pipeline requires never runs that code — `tokenizer_12hz/`
+  has no such module — and the transformer tower already uses PyTorch SDPA
+  (`attn_implementation="sdpa"`), so **installing flash-attn would not make this
+  pipeline faster**. The print is a bare `print`, not a log record, so silencing
+  it needs a one-line stdout guard around the import in `pipeline/tts.py`.
+  **Not yet applied.**
 
-Still to do before real acceptance: point `LLM_BASE_URL` at a running
-OpenAI-compatible server (no `llama-server` or GGUF model was available on this
-machine, so translation was validated with a local transformers model behind the
-real translator code path). A real multi-sentence single-speaker video with audio
-is still needed for a full-quality sign-off.
+**Acceptance for single-speaker videos is met.** `LLM_BASE_URL` points at a running
+OpenAI-compatible server, and the user has signed off on real end-to-end runs (a
+4:47 TED talk plus two short clips) in `reference-accent` mode. What remains
+unverified is the *long-video* half of the DoD (§3.6): nothing longer than 4:47 has
+been run, and that run still relied on the synthesis OOM-retry path.
 
 ### First real video: 4:47 TED talk, English → French
 
@@ -353,10 +372,11 @@ extracted `_resolve_donor` (`pipeline/orchestrate.py`), `accent_blend` /
 `dub.py`). Artifacts: `04_dubbed/reference_blend.wav`, `04_dubbed/blend.json`,
 `report.json → donor.blend`.
 
-**Status: implemented, unit-tested, and measured on a real run.** The suite (429
-tests) covers take selection (best margin, ties, degenerate embeddings, encoder
+**Status: implemented, unit-tested, and measured on a real run.** The suite
+covers take selection (best margin, ties, degenerate embeddings, encoder
 absent), prompt construction, the cached-reuse path, the single-stage escape
-hatch, the config guards and the orphaned-clip cleanup.
+hatch, the config guards, the orphaned-clip cleanup, and — from P3c — the donor
+ratio, the iteration loop and its early stop.
 
 Measured on the 4:47 TED talk, English → French, `reference-accent`, using the
 repo's real accent clip. Stage 1 cost 16.4 s of a 168 s run and produced a 12.7 s
@@ -475,6 +495,116 @@ and keeps the least accent-like one — the escape hatch for tuning by hand.
 `report.json` → `donor.blend` carries `iters`, `target_ratio` and `donor_ratio`,
 and a run that misses the target logs which way to turn the knob.
 
+### P1 — Multi-speaker dubbing (IMPLEMENTED)
+
+**The gap.** `AGENTS.md` asks to "identify each voice", but until now one donor
+served the whole video: speaker A's lines were cloned from speaker B whenever B
+talked longest. Every design choice below exists to avoid a second voice silently
+replacing the first.
+
+**Choosing a diarization backend, by measurement.** Three candidates were tried
+against the repo's real two-person clip rather than against a benchmark number:
+
+| Candidate | Verdict |
+|---|---|
+| **Reuse Qwen3-TTS's own speaker encoder** | **Refuted.** All pairwise cosines fell in 0.963–0.991 and the AHC merge profile ran 0.009→0.029 with *no* gap — the two people are not separable by it. A tempting shortcut, since the model is already loaded |
+| **`wespeaker`** | Rejected: not on PyPI (HTTP 404), git-install only, which would make `requirements.txt` depend on a moving commit |
+| **`funasr` + ERes2NetV2** | **Chosen.** ~30 transitive deps, but every heavyweight one is behind an `extra ==` marker, so it installs without dragging in `datasets`/`onnx`/`torchvision`. Verified non-destructive to the existing environment |
+
+With `iic/speech_eres2netv2_sv_zh-cn_16k-common` (192-dim) the same clip's pairs
+span **0.341–0.874**, and the average-linkage merge profile is flat to `0.379` then
+jumps to `0.468`. A threshold anywhere in that gap returns the same two speakers,
+which is what makes a *constant* defensible — hence `--speaker-threshold 0.40` as
+the default rather than an auto-tuned value. The dependency was measured before it
+was trusted, and the environment was pinned first (`pip install -c`) so a
+resolution conflict would fail loudly rather than silently upgrade numpy.
+
+**Design: embed and cluster, don't re-segment.** The pipeline is already
+per-segment, so all diarization has to produce is a *label* per segment:
+
+- Each segment is embedded and the embeddings are clustered, so the labels align
+  with the text by construction. A segment is never split — a line is assigned,
+  not re-cut — which is what keeps `02_transcript.json` and the subtitles valid.
+- Average-linkage AHC over cosine distance, then clusters shorter than
+  `--min-speaker-seconds` (3.0) are folded into their nearest neighbour: below the
+  3 s donor window there is no voice to clone, so such a cluster is noise, not a
+  speaker.
+- Labels are assigned by **first appearance**, so `SPK_0` is whoever talks first
+  and a rerun numbers them the same way.
+- A segment whose embedding fails inherits the previous segment's speaker, and a
+  leading run of failures takes the first assigned one. One bad two-second window
+  must not invent a third voice.
+- Everything except the `funasr` call is a pure function over arrays, which is why
+  the clustering is unit-tested exhaustively without a model.
+
+The orchestrator takes the labeler by injection (`Pipeline(diarizer=…)`, mirroring
+`separator`), so the suite never loads the embedding model — the same seam that
+keeps Demucs out of the tests.
+
+**Design: per-speaker voices, one prompt each.** Synthesis is grouped by speaker,
+so the prompt — which *is* the voice — is rebuilt when the voice changes and not
+once per line. A pinned `--ref-audio` is the same prompt for everyone, so it is
+built once rather than once per group; re-encoding the reference audio per group
+would be pure waste. Each speaker gets:
+
+- their **own donor**, selected from the segments *that speaker* delivered;
+- in `reference-accent` mode, their **own blend clip**
+  (`reference_blend_<speaker>.wav`), built by the same measured iteration as P3c.
+  A single shared blend cannot work: its codes and its embedding both describe one
+  speaker, which is precisely what makes it stable — and what makes it wrong for a
+  second voice. A one-voice job keeps the original `reference_blend.wav` filename,
+  so `audit_timbre.py` and the docs are unaffected.
+
+**The voice bible was folded into `donor.json`.** The plan called for a separate
+`voices.json`. `donor.json` already means "which voice this job used, and why", so
+it now carries `speaker_count`, `primary_speaker` and a `speakers` map (donor
+segment, segments owned, speech seconds, accent and blend records per voice). The
+dominant speaker's fields are *also* mirrored flat at the top level, so
+`donor.source` / `donor.accent` / `donor.blend` keep working for single-speaker
+jobs and for anything already reading them. `report.json` gains a `speakers`
+summary that is `null` — not a one-entry map — when the video has one voice, so
+previous reports are byte-for-byte unchanged.
+
+**Cost.** One embedding pass over the speech stem (cheap next to ASR), plus one
+prompt and, in `reference-accent` mode, one blend clip per voice. Batching is
+preserved *within* a speaker, so throughput matches the single-speaker path.
+
+**Backward compatibility.** `--diarizer auto` is the default but degrades to one
+voice when `funasr` is absent, with a warning naming the install command — the
+optional-dependency pattern already used for Demucs and `flash-attn`.
+`--diarizer none` is authoritative: it overrides even an injected labeler, because
+it is an explicit request to dub every line in one voice.
+
+**Not attempted, deliberately.** Speaker attribution is per segment, so
+overlapping speech goes to one speaker; the speaker *count* comes from the
+clustering rather than being declared, with `--speaker-threshold` as the knob.
+Both are noted in the README's limitations rather than papered over.
+
+**Supersedes an earlier hypothesis.** The first attempt was to reuse the Qwen3-TTS
+cloning encoder for diarization; it was refuted by measurement (see the table
+above) before any code was written on top of it. The lesson is recorded in D12.
+
+**Two defects the real run exposed**, both fixed rather than worked around:
+
+1. **`device="auto"` silently broke every embedding.** funasr passes the string to
+   torch, which has no `"auto"` device, and it fails *after* downloading and loading
+   the weights. Because the per-window handler absorbed the exception at debug
+   level, the symptom was a single-voice dub and a log line blaming the audio —
+   indistinguishable from a video that genuinely has one speaker. Now the device is
+   resolved before funasr sees it (`resolve_device`), the model is built once
+   *outside* the per-window handler so a load failure propagates, and the first
+   window failure is logged at warning level.
+2. **A truncated render could become the voice of the whole video.** For one
+   speaker the accent transcript came back as a 1.4 s clip, and because the ratio
+   search ranks on embedding similarity alone, a fragment that scores well won. A
+   fragment is a *failed* render rather than a candidate voice, so renders more than
+   half the length of the longest sibling shorter than it are now dropped before
+   scoring. Re-running the same job gives 11.9 s and 13.3 s blends at ratios 0.85
+   and 0.75.
+
+Both were found only by running the real clip: the unit tests passed throughout,
+because they inject a fake embedder and a scripted model.
+
 ---
 
 ## 1. Vision (from AGENTS.md)
@@ -503,6 +633,10 @@ voice timbre**, ideally with the **target language's accent**.
 | D8 | TTS | Qwen3-TTS Base (`generate_voice_clone`) | Already proven working in this repo |
 | D9 | Accent default | `preserve` (clone source speaker directly) | Matches D1; `native` mode comes in P2 |
 | D10 | `reference-accent` prompt | **Two-stage** by default: reconcile accent + timbre into one clip, then clone from it | Conditioning each line on two disagreeing sources lets sampling pick the winner per line, which is heard as the speaker changing mid-video. Kept `--accent-blend single-stage` as a documented escape hatch for A/B |
+| D11 | Blend strength | **Iterate Stage 1 and stop on a measured target**: `--blend-ratio 0.5` (position between the accent voice at 0 and the speaker's own voice at 1), capped by `--blend-iters 4` | One pass is biased toward the accent clip by construction (a ~165-token in-context example versus a single embedding token), which left the speaker's voice barely audible. The target is measured on a language-matched scale — the donor anchor is the donor's voice speaking the target language in x-vector mode — because a similarity against the source-language donor measures the language gap too. Defaults change behaviour and cost: every `reference-accent` run now iterates |
+| D12 | Diarization | **Embed and cluster ASR segments** with `funasr` + ERes2NetV2 (`iic/speech_eres2netv2_sv_zh-cn_16k-common`), `--speaker-threshold 0.40` | Measured against the repo's two-person clip rather than assumed: reusing the Qwen3-TTS cloning encoder was **refuted** (all pairs 0.963–0.991, no merge gap) and `wespeaker` is not on PyPI. ERes2NetV2 separates the same clip at 0.341–0.874 with a merge plateau (flat to 0.379, then 0.468), so a constant threshold is defensible. Embedding the existing segments avoids a second segmentation pass, which is what keeps the labels aligned with the text instead of re-cutting lines |
+| D13 | Multi-speaker voices | **Per-speaker donor, and one blend clip per voice** in `reference-accent` mode; `donor.json` is the voice bible, with the dominant speaker also mirrored flat | A shared blend clip cannot serve two voices — its codes and embedding describe one speaker, which is exactly what makes it stable, and exactly what makes it wrong for the second voice. Keeping the dominant speaker's fields at the top level of `donor` means single-speaker jobs, `audit_timbre.py` and the existing docs are unchanged; `report.json → speakers` stays `null` for one voice rather than becoming a one-entry map |
+| D14 | Diarization dependency | **Optional**, degrading to one voice with a warning | `funasr` pulls ~30 transitive packages; a user who wants a single-voice dub should not need them. Same pattern as Demucs and `flash-attn`: the feature is available, its absence is survivable and loud. `--diarizer none` is authoritative so an explicit request to keep one voice is never second-guessed |
 
 ---
 
@@ -513,7 +647,7 @@ voice timbre**, ideally with the **target language's accent**.
 **In**
 - One video in → one dubbed video out, via a single CLI command.
 - Single source language (auto-detected at video level, overridable by flag).
-- Single speaker; target language **French**.
+- One speaker, or several via diarization; target language **French**.
 - Voice cloning with the speaker's own timbre.
 - Accent handling: `preserve` (default), `speaker-only`, or `reference-accent`
   (borrow a native clip's pronunciation while keeping the voice's timbre).
@@ -522,111 +656,210 @@ voice timbre**, ideally with the **target language's accent**.
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
-- Multi-speaker diarization (P1).
+- Overlapping-speech separation: speakers are attributed per segment, so overlap
+  goes to the dominant speaker (P1 sub-item, see §4).
 - Fully automatic native accent: `reference-accent` needs a supplied clip, so an
   unattended native-accent path via voice conversion is still P2.
 - Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
-  The length-repair half is now implemented (see the P3 section above); reverb
-  matching and automatic QC remain.
+  The length-repair half is now implemented (see the P3 section above) and
+  loudness matching is done; reverb matching and an automated QC gate remain.
 - Lip sync (P4), multi-source-language videos (P5), service-ification (P6).
 
 ### 3.2 Pipeline
 
 ```
 video.mp4
-   │  ffmpeg: extract audio, resample 48 kHz mono, normalize loudness
+   │  ① ffmpeg: probe + decode → 48 kHz mono WAV
    ▼
-audio_48k.wav
-   │  Silero VAD → cut utterances, drop silence/music
+01_audio.wav
+   │  ② Demucs htdemucs: split speech from music/ambience (44.1 kHz stereo-native)
+   ├─► 01b_speech.wav    — feeds the stages below, and donor selection
+   ├─► 01c_background.wav — held back for the mix at ⑦
+   │
+   │  ③ faster-whisper large-v3 (+ bundled Silero VAD) → text + language
    ▼
-segments.json                # [{id, start, end}]
-   │  faster-whisper (word_timestamps=True) → transcript + timings
-   │  + language detected (video-level, single lang)
+02_transcript.json           # [{id, start, end, text, no_speech_prob}]
+   │  ④ diarize — embed each segment (funasr ERes2NetV2) and cluster the
+   │     embeddings into speakers; folds away clusters too short to clone
    ▼
-transcript.json              # [{id, start, end, text, words[]}]
-   │  LLM translation (OpenAI-compatible), one call per scene/batch
-   │  prompt: role, register, target language, per-segment length budget
+02b_speakers.json            # {segment_id: SPK_n}; segments carry their speaker
+   │  ⑤ LLM translation (OpenAI-compatible), chunked; optional word budget
    ▼
-script.json                  # [{id, start, end, source, target}]
-   │  Qwen3-TTS Base: build clone prompt once, synthesize each line
+03_script.json               # [{id, start, end, source, target}]
+   │  ⑥ blend — reference-accent only: accent codes + each speaker's embedding
+   │     rendered once per voice, then re-iterated toward that speaker until
+   │     `donor_ratio` reaches --blend-ratio (see P3c)
    ▼
-dubbed_segments/*.wav        # one file per segment
-   │  rubberband: fit each segment's duration to its source slot (anchored)
+04_dubbed/reference_blend[_<speaker>].wav
+   │  ⑦ Qwen3-TTS Base: one clone prompt per speaker, that speaker's lines
+   │     synthesised as a batch; overlong lines re-worded and re-synthesised
+   │     (--refine), each in its own voice
    ▼
-dubbed_segments_sync/*.wav
-   │  ffmpeg: place on timeline, mix, mux back onto video; write SRTs
+04_dubbed/seg_*.wav
+   │  ⑧ fit each line to its slot (rubberband → sox → librosa), place on the
+   │     timeline, duck the bed under dialogue, match EBU R128 loudness
+   ▼
+timing.json, 05_mix.wav, dub.wav
+   │  ⑨ ffmpeg: mux the dub back onto the video (stream copied); write SRTs
    ▼
 output/
   ├─ video_dubbed.mp4
   ├─ subs_source.srt
-  └─ subs_target.srt
+  ├─ subs_target.srt
+  ├─ report.json             # quality signals (see README)
+  └─ manifest.json           # stage cache, keyed by a job fingerprint
 ```
 
-The donor voice is either provided (`--ref-audio` + `--ref-text`) or, by default,
-auto-extracted from the video: the longest clean segment's audio + its Whisper
-transcript. `ref-text` must match the donor clip exactly (ICL mode) — except in
-`speaker-only` and `reference-accent` modes, where the donor contributes only a
-speaker embedding (`x_vector_only_mode=True`) and no transcript is involved.
+The donor voice is either provided (`--ref-audio`) or, by default, auto-selected
+**per speaker** from that speaker's own segments: the best clean speech segment by
+length, loudness and no-speech probability. `--ref-text` must match the donor clip
+exactly in ICL mode — except in `speaker-only` and `reference-accent` modes, where
+the donor contributes only a speaker embedding (`x_vector_only_mode=True`) and no
+transcript is involved.
+
+In `reference-accent` mode the donor no longer conditions the lines directly. The
+accent clip's codes and the donor's embedding are reconciled once into
+`reference_blend.wav` (stage ⑥), and every line is cloned from that clip, so its
+codes and its embedding cannot disagree. See P3b for why, and P3c for the
+blend-strength iteration that keeps the speaker's own voice dominant. With several
+speakers there is one such clip per voice, because one clip cannot describe two
+people (D13).
 
 ### 3.3 Tech stack
 
 | Stage | Tool | Notes |
 |-------|------|-------|
-| Media | `ffmpeg` + `soundfile` + `pyloudnorm` | ffmpeg is NOT yet on PATH — install first |
-| VAD | `silero-vad` | tiny, robust |
-| ASR | `faster-whisper` (`large-v3`) | word timestamps; avoids the pyannote/HF-token dependency for now |
-| Language ID | Whisper's detected language (+ optional `fasttext` `lid.176` cross-check) | single, video-level for MVP |
-| Translation | `openai` client → any OpenAI-compatible base URL | local `llama-server` or cloud |
-| TTS | `qwen-tts` (Qwen3TTSModel, Base) | proven in `clone.py` |
-| Timing | `rubberband-cli` (fallback `sox tempo`) | keep stretches within ~±15–20% |
-| Mux | `ffmpeg` | restore video track, burn/embed subtitles |
+| Media | `ffmpeg` + `soundfile` + `pyloudnorm` | ffmpeg 4.4.2 verified (probe, extract, mux with `-c:v copy`). Loudness is numpy + `pyloudnorm`, so audio-only jobs need no ffmpeg |
+| Separation | Demucs `htdemucs` | 44.1 kHz stereo-native, resampled around the model, ~24× realtime. Optional: without it the background is discarded |
+| VAD | bundled ONNX Silero via `faster-whisper`'s `vad_filter` | a separate `silero-vad` package was dropped as redundant |
+| ASR | `faster-whisper` (`large-v3`, CTranslate2) | word timestamps; preloads vendored CUDA libs, then falls back to CPU |
+| Language ID | Whisper's detected language | single, video-level for MVP |
+| Diarization | `funasr` + ERes2NetV2 (`iic/speech_eres2netv2_sv_zh-cn_16k-common`) | 192-dim embeddings at 16 kHz, ~30 MB cached under `~/.cache/modelscope`. Optional: without it every line is dubbed in one voice, with a warning |
+| Translation | `openai` client → any OpenAI-compatible base URL | local server or cloud; chunked, with a JSON-repair pass |
+| TTS | `qwen-tts` (Qwen3TTSModel, **Base** required) | cloning plus the two-stage blend. `flash-attn` is irrelevant here — see §0 |
+| Timing | `rubberband` → `sox` → `librosa` | three interchangeable backends, auto-detected; stretches clamped to ±15–18% |
+| Loudness | `pyloudnorm` (EBU R128) + a numpy limiter | `match-source` by default |
+| Mix | numpy ducking | 6 dB under dialogue, 150 ms ramps |
+| Mux / subs | `ffmpeg`, `pipeline/subtitles.py` | video stream copied, not re-encoded |
 
 ### 3.4 Job config
 
-A small JSON/YAML manifest per job (also the future queue-message shape):
+This is `pipeline/config.py`'s `JobConfig` (Pydantic), populated from CLI flags,
+and its fingerprint keys the stage cache — so changing any field below re-runs the
+affected stages. Also the future queue-message shape.
 
 ```yaml
+# Input — exactly one of video / audio
 video: input.mp4
-target_language: fr
-source_language: auto            # or explicit, e.g. "en"
-ref_audio: null                  # auto-extract from video if null
-ref_text: null                   # required when ref_audio is given (ICL mode)
+audio: null
+
+# Languages
+target_language: fr              # required; code or full name
+source_language: null            # auto-detect when null
+
+# Voice reference
+ref_audio: null                  # auto-select a donor from the video when null
+ref_text: null                   # required with ref_audio in `preserve` mode
+accent_mode: preserve            # preserve | speaker-only | reference-accent
+accent_audio: null               # required for reference-accent
+accent_text: null                # required with accent_audio
+accent_blend: two-stage          # two-stage | single-stage
+blend_takes: 3                   # first-pass candidates
+blend_iters: 4                   # max passes pulling toward the speaker
+blend_ratio: 0.5                 # stop target; 0 disables the search
+
+# Speakers
+diarizer: auto                   # auto | none (none = every line in one voice)
+speaker_threshold: 0.40          # cosine distance above which voices differ
+min_speaker_seconds: 3.0         # shorter clusters join their nearest neighbour
+
+# Timing
+min_stretch: 0.85
+max_stretch: 1.18
+length_budget: off               # off | words
+
+# Length repair
+refine: true
+refine_max_passes: 1
+refine_threshold: 0.05
+
+# ASR gating
+no_speech_threshold: 0.6
+
+# Audio bed
+keep_background: true
+separator: auto                  # auto | demucs | none
+duck_db: 6.0
+background_gain_db: 0.0
+
+# Loudness
+loudness_target: null            # match-source when null | lufs
+target_lufs: null
+
+# Models, device and output
+device: auto                     # auto | cuda:N | cpu
+whisper_model: large-v3
+llm_model: null                  # overrides LLM_MODEL for this run
 keep_subtitles: true
 output_dir: output/
+force: false                     # ignore the stage cache
 ```
 
 ### 3.5 Repository layout (tool-sized, service-ready)
 
 ```text
 qwen-tts/
-├── dub.py                    # CLI entrypoint (argparse)
+├── dub.py                    # CLI entrypoint (argparse) + model downloads
+├── audit_timbre.py           # per-line speaker-timbre audit (needs the GPU)
+├── main.py, clone.py         # scratch experiments, not part of the pipeline
 ├── pipeline/
-│   ├── config.py             # Pydantic job schema
-│   ├── media.py              # ffmpeg wrappers (extract, mux, loudness)
-│   ├── asr.py                # VAD + faster-whisper
-│   ├── translate.py          # OpenAI-compatible client + prompt
-│   ├── tts.py                # Qwen3TTSModel wrapper
-│   ├── timing.py             # rubberband fitting
-│   └── orchestrate.py        # runs stages, writes artifacts, caches
-├── models/                   # local checkpoints (existing)
+│   ├── config.py             # Pydantic job schema, env settings, languages
+│   ├── models.py             # model registry, download, path resolution
+│   ├── errors.py             # domain exception hierarchy
+│   ├── logging_utils.py      # per-job logging (text or JSON)
+│   ├── media.py              # ffmpeg wrappers, loudness, resampling
+│   ├── asr.py                # faster-whisper + VAD gating
+│   ├── diarize.py            # speaker embeddings + clustering (multi-speaker)
+│   ├── separation.py         # Demucs speech/background split
+│   ├── mixing.py             # ducking and bed mix (pure numpy)
+│   ├── translate.py          # OpenAI-compatible client, chunking, shorten()
+│   ├── tts.py                # Qwen3-TTS wrapper, donor selection, blend
+│   ├── timing.py             # stretching backends, timeline assembly
+│   ├── subtitles.py          # SRT writer
+│   └── orchestrate.py        # stages, artifacts, caching, report
+├── tests/                    # pytest suite (no GPU, models or ffmpeg)
+├── models/                   # local checkpoints (gitignored)
 └── PLAN.md
 ```
 
-Module boundaries mirror the future `app/{api,services,ai_workers,media}`
-layout, so P6 is mostly "add a queue + API in front of these functions".
+Module boundaries mirror the future `app/{api,services,ai_workers,media}` layout,
+so P6 is mostly "add a queue + API in front of these functions". Note that the
+names differ from `technical-guidelines.md`'s §2 tree: this is a flat `pipeline/`
+package rather than `app/{core,services,ai_workers,media,utils}`, and there is no
+`scripts/` or `Dockerfile` yet. The engineering standards that document declares —
+mypy `--strict`, Black/Ruff, >85% coverage, CI — are also not configured or
+enforced; that gap sits outside this roadmap and is tracked separately.
 
 ### 3.6 Definition of Done
 
 - One command runs the whole thing: `python dub.py --video in.mp4 --target fr`.
 - Produces `video_dubbed.mp4` + two SRTs.
-- Same voice timbre as the source speaker (subjective listen + SECS check).
-- Audio synchronized to the source timeline within ~100 ms at segment anchors.
-- Handles a ≤ 10-minute video on one RTX 3060 without OOM.
+- Same voice timbre as the source speaker — subjective listen ✅ **plus** SECS ✅
+  (`audit_timbre.py`, run by hand).
+- Audio synchronized to the source timeline within ~100 ms at segment anchors ✅
+  (measured drift 0.000 s; lines are never shifted late).
+- Handles a ≤ 10-minute video on one RTX 3060 without OOM — ⚠️ **unverified**.
+  The longest real run is 4:47, and it still hit `CUDACachingAllocator` OOM
+  retries during synthesis, which the batch-halving fallback absorbed.
 
 ### 3.7 Prerequisites to install
 
 ```
-ffmpeg  rubberband-cli  faster-whisper  silero-vad  pyloudnorm  openai
+ffmpeg                      # system binary, required for video in/out
+rubberband                  # optional system binary; sox or librosa otherwise
+python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
+                                            # pydantic, qwen_tts, faster-whisper,
+                                            # pyloudnorm, openai
 ```
 
 ---
@@ -638,23 +871,35 @@ ffmpeg  rubberband-cli  faster-whisper  silero-vad  pyloudnorm  openai
 | Phase | Focus | Key additions | Complexity |
 |-------|-------|---------------|------------|
 | **P0** | MVP (this doc §3) | Single-speaker dub, French, no lip sync | — |
-| **P1** | Multi-speaker + background | Diarization, voice bible, Demucs bg preservation | M |
-| **P2** | Native accent | VoiceDesign accent anchor + voice conversion; per-speaker accent knob | M |
-| **P3** | Quality & timing | Isochrony loop, reverb/loudness matching, QC + eval harness | M |
+| **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**; remaining: overlapping-speech separation | M |
+| **P2** | Native accent | Supplied-clip accent **done**; remaining: VoiceDesign anchor + voice conversion, per-speaker knob | M |
+| **P3** | Quality & timing | Isochrony loop **done**; remaining: reverb matching, automated QC gate + bake-off harness | M |
 | **P4** | Lip sync | LatentSync/MuseTalk, gated on face visibility | L |
 | **P5** | Multi-source-language | Per-utterance LID, per-segment source language | S–M |
 | **P6** | Service-ification | FastAPI + Celery/Redis, model residency, consent gate | L |
 
 ### P1 — Multi-speaker & background preservation
 
-- **Diarization**: pyannote `speaker-diarization-3.x` + 3D-Speaker embeddings;
-  build a **voice bible** `{speaker_id → {gender, timbre, accent, register}}`.
-- **Per-speaker cloning**: one clone prompt per speaker, reusing the same
-  reference-across-lines pattern from `clone.py`.
-- **Overlap**: flag overlapping speech; pick dominant speaker in v1, separate
-  later (MossFormer2/SepFormer).
-- **Background bed**: Demucs split dialogue vs. music/SFX; re-mix only dialogue.
+- **Diarization**: ✅ **done** — `pipeline/diarize.py` embeds each ASR segment with
+  ERes2NetV2 and clusters the embeddings (D12). The planned pyannote +
+  3D-Speaker route was dropped: pyannote needs a Hugging Face token and a heavier
+  stack for the same per-segment answer, and `wespeaker` is not on PyPI. The
+  backend is pluggable, so a better embedder is a one-class change.
+- **Voice bible**: ✅ **done** — `04_dubbed/donor.json` → `speakers`, plus the
+  `speakers` summary in `report.json` (D13). The planned separate `voices.json`
+  was unnecessary: `donor.json` already answers "which voice, and why".
+- **Per-speaker cloning**: ✅ **done** — one prompt per speaker, lines batched
+  within a speaker, and one blend clip per voice in `reference-accent` mode.
+- **Overlap**: flag overlapping speech; pick the dominant speaker in v1, separate
+  later (MossFormer2/SepFormer). **Remaining** — v1 behaviour is the current one:
+  a segment with overlap is attributed to a single speaker.
+- **Background bed**: ✅ **done** — `pipeline/separation.py` splits dialogue from
+  music/SFX with Demucs, and `pipeline/mixing.py` mixes the dub back over the bed,
+  ducked 6 dB under dialogue with 150 ms ramps (`--keep-background`, default on).
 - **Output**: multi-voice dub with preserved background.
+
+**Remaining work in P1 is overlap handling**, which is a quality refinement rather
+than a missing capability: the dub is multi-voice today.
 
 ### P2 — Native target accent (nice-to-have per D1)
 
@@ -668,11 +913,15 @@ ffmpeg  rubberband-cli  faster-whisper  silero-vad  pyloudnorm  openai
 
 ### P3 — Quality & timing
 
-- **Isochrony loop**: translate → synthesize → measure → re-prompt if too long
-  (max N iterations), then rubberband only for the remainder.
-- **Acoustics**: RT60 estimate + convolutive reverb matching; EBU R128 loudness.
-- **QC stage + eval harness**: SECS (speaker similarity), round-trip ASR WER,
-  timing-drift histogram, loudness compliance; threshold → review queue.
+- **Isochrony loop**: ✅ **done** — `--refine` re-words overlong lines instead of
+  cutting them, and `--length-budget words` gives the translator a ceiling it can
+  act on. See the P3 section in §0 for the measurements.
+- **Acoustics**: EBU R128 loudness ✅ (`match-source` by default, with a peak
+  limiter). **Remaining: RT60 estimate + convolutive reverb matching.**
+- **QC stage + eval harness**: the signals exist — SECS per line
+  (`audit_timbre.py`), round-trip WER, timing drift and loudness compliance in
+  `report.json`. **Remaining: threshold them into a gate and run it automatically
+  rather than by hand, plus a model bake-off harness.**
 - **Output**: measurable quality gates and a model bake-off harness.
 
 ### P4 — Lip sync
@@ -704,8 +953,10 @@ ffmpeg  rubberband-cli  faster-whisper  silero-vad  pyloudnorm  openai
 1. **Isochrony** is the top quality risk — de-risk in P0/P3, not later.
 2. **Accent fidelity** is only indirectly controllable; validate the P2 path on
    real clips before committing architecture to it.
-3. **Speaker consistency** over long videos may drift; per-speaker LoRA
-   fine-tuning on minutes of their audio is the fallback.
+3. **Speaker consistency** over long videos may drift. Largely addressed: the
+   `reference-accent` blend pins one clip as the reference for every line, so the
+   voice no longer re-decides per line or per run. Per-speaker LoRA fine-tuning on
+   minutes of their audio remains the fallback.
 4. **Lip sync** dominates cost; keep it gated and last.
 5. **Whisper hallucination** on silence/music — gate transcription with VAD +
    no-speech probability from day one.

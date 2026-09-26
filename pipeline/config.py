@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .diarize import DEFAULT_THRESHOLD, MIN_SPEAKER_S
 from .errors import ConfigError
 
 __all__ = [
@@ -344,6 +345,19 @@ class JobConfig(BaseModel):
     #: voice). Iteration stops as soon as it is met; ``0`` disables the search.
     blend_ratio: float | None = None
 
+    # Speaker separation.
+    #   "auto" -> cluster per-segment speaker embeddings, so each voice is cloned
+    #             from its own donor (needs the optional funasr dependency)
+    #   "none" -> treat the whole video as one speaker, as before
+    diarizer: str = "auto"
+    #: Cosine distance at which two voices count as different speakers. ``None``
+    #: uses the calibrated default; raise it for similar voices, lower it to split
+    #: a speaker the clustering merged.
+    speaker_threshold: float | None = None
+    #: Clusters shorter than this are folded into their nearest neighbour, because
+    #: a voice needs a few seconds of speech before it can be cloned.
+    min_speaker_seconds: float = Field(default=MIN_SPEAKER_S, ge=0.0, le=120.0)
+
     keep_subtitles: bool = True
     force: bool = False
 
@@ -426,6 +440,39 @@ class JobConfig(BaseModel):
         if not 0.0 <= ratio <= 1.0:
             raise ConfigError("--blend-ratio must be between 0 and 1")
         return ratio
+
+    @field_validator("diarizer")
+    @classmethod
+    def _check_diarizer(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "auto": "auto",
+            "on": "auto",
+            "true": "auto",
+            "embedding": "auto",
+            "none": "none",
+            "off": "none",
+            "false": "none",
+            "single": "none",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown diarizer {value!r}. Use: auto or none"
+            ) from None
+
+    @field_validator("speaker_threshold")
+    @classmethod
+    def _check_speaker_threshold(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        distance = float(value)
+        if not 0.0 < distance <= 2.0:
+            raise ConfigError(
+                "--speaker-threshold must be greater than 0 and at most 2"
+            )
+        return distance
 
     @field_validator("length_budget")
     @classmethod
@@ -546,6 +593,20 @@ class JobConfig(BaseModel):
     def resolved_blend_ratio(self) -> float:
         """Donor ratio that ends iteration early (default 0.5, ``0`` disables)."""
         return self.blend_ratio if self.blend_ratio is not None else 0.5
+
+    @property
+    def resolved_speaker_threshold(self) -> float:
+        """Cosine distance separating two voices (the calibrated default)."""
+        return (
+            self.speaker_threshold
+            if self.speaker_threshold is not None
+            else DEFAULT_THRESHOLD
+        )
+
+    @property
+    def multi_speaker(self) -> bool:
+        """True when the job asked for speaker separation."""
+        return self.diarizer != "none"
 
     @property
     def input_path(self) -> Path:

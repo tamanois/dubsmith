@@ -195,6 +195,8 @@ if a required model is missing, so you can also just try a dub and see.
 | a voice that isn't the video's speaker | `--ref-audio ref.wav --ref-text "…"` | clones `ref.wav` for both timbre and accent |
 | to drop the source accent | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
 | a native accent in the original voice | `--accent-mode reference-accent --accent-audio nat.wav --accent-text "…"` | timbre from the video's speaker, pronunciation from `nat.wav` |
+| every speaker in their own voice | *nothing* | finds the speakers and clones each one from their own voice — see [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers) |
+| one voice for the whole video | `--diarizer none` | the pre-P1 behaviour: whichever speaker talks most supplies the voice |
 | no music behind the voice | `--no-background` | discards the separated bed instead of ducking it |
 | an absolute loudness target | `--loudness lufs --lufs -16` | forces a level instead of matching the source |
 | to redo a run from scratch | `--force` | ignores the stage cache |
@@ -398,6 +400,71 @@ above the target means the search succeeded and stopped early; raising
 `--blend-ratio` would push further toward the speaker, at the cost of one extra
 synthesis of the accent transcript per pass.
 
+### Dubbing a video with several speakers
+
+An interview, a debate, a two-hander: with more than one voice in the source, a
+single donor cannot represent them. The pipeline finds the speakers and gives
+each one their own voice. This is on by default, so a one-voice video behaves
+exactly as it did before.
+
+```bash
+python dub.py --video debate.mp4 --target fr              # one voice per speaker
+python dub.py --video debate.mp4 --target fr --diarizer none   # force one voice
+```
+
+The log names what it found, and `report.json` → `speakers` breaks it down:
+
+```
+Diarization (embedding): 2 speaker(s) over 12 segment(s) - SPK_0 7, SPK_1 5
+Auto-selected donor for SPK_0: segment 3 (7.3s)
+Auto-selected donor for SPK_1: segment 8 (5.0s)
+```
+
+**How it decides.** Each ASR segment is embedded with a speaker-verification
+model and the embeddings are clustered, so every segment is assigned rather than
+re-segmented — a line is never cut in half, and the labels stay aligned with the
+text by construction. A cluster shorter than `--min-speaker-seconds` is folded
+into its nearest neighbour rather than becoming a speaker with no usable voice to
+clone from. Segments whose embedding fails inherit the previous speaker's, so one
+bad two-second window cannot invent a third voice.
+
+The default backend is ERes2NetV2, which ships inside `funasr`. It is an optional
+dependency: without it every line is dubbed in one voice and the log says so
+rather than failing the job. Install it with `pip install -r requirements-dev.txt`
+or uncomment it in `requirements.txt`.
+
+The threshold is the one number worth knowing about. It is a cosine *distance* on
+embeddings, and it is not portable across material — on the two-person clip in
+this repo the merge profile is flat to `0.379` and then jumps to `0.468`, so
+everything in that gap returns the same two speakers, which is why the default
+`0.40` is a defensible constant. If a video comes out over-split (one person
+becoming two) raise `--speaker-threshold`; if two people are merged into one,
+lower it. `02b_speakers.json` in the job folder records the labels the run used,
+so you can see the damage without re-running.
+
+**What each speaker costs.** Diarization adds one embedding pass over the speech
+stem, which is cheap next to ASR. Synthesis is then grouped by speaker — one
+prompt per voice rather than one per line — so a two-person video costs two
+prompts and two batches instead of one of each. In
+[`reference-accent`](#accent-modes) mode each voice needs its own blended
+reference, because a clip whose codes and embedding both describe one speaker
+cannot serve another:
+
+```
+04_dubbed/reference_blend_SPK_0.wav
+04_dubbed/reference_blend_SPK_1.wav
+```
+
+Each is built by the same measured search as the single-voice case, with its own
+`donor_ratio`, and `--blend-*` applies to all of them. A one-voice job keeps the
+original `reference_blend.wav` name, so existing scripts and
+`audit_timbre.py` are unaffected.
+
+**What is *not* attempted.** Speakers are attributed per segment, not per word, so
+a segment where two people overlap is given to one of them. The number of
+speakers comes out of the clustering rather than being declared, so
+`--speaker-threshold` is the knob to reach for when the count looks wrong.
+
 Measured on this repo's TED talk, same French lines and same donor, so the three
 rows are directly comparable:
 
@@ -474,6 +541,14 @@ numbers or names by hand.
 | `--blend-takes N` | `3` | How many times the one-off blend is rendered before keeping the take closest to the speaker. Only that clip is sampled this way, not the lines. |
 | `--blend-iters N` | `4` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](#choosing-the-blend-strength). |
 | `--blend-ratio T` | `0.5` | How far toward the speaker's own voice the blend should reach, from `0` (the accent clip's voice) to `1` (a French utterance in the speaker's voice). Iteration stops there. `0` disables the search. See [Choosing the blend strength](#choosing-the-blend-strength). |
+
+**Speakers** — see [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers).
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--diarizer BACKEND` | `auto` | `auto` finds the speakers with the embedding model; `none` dubs every line in one voice, which is the pre-P1 behaviour. Without `funasr` installed, `auto` warns and behaves as `none`. |
+| `--speaker-threshold D` | `0.40` | Cosine distance above which two embeddings count as different people. Raise it if one speaker is being split in two; lower it if two speakers are being merged. |
+| `--min-speaker-seconds S` | `3.0` | A speaker must have at least this much speech, otherwise their lines join the nearest other voice — below the 3 s donor window there is nothing to clone from. `0` keeps every cluster. |
 
 **Audio bed and loudness**
 
@@ -576,7 +651,8 @@ figures come from each run's `report.json`.
 | `--video talk.mp4 --target fr --accent-mode speaker-only` | timbre 0.9876, French fit −0.081 |
 | `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio slow.wav --accent-text "…"` | timbre 0.9854, French fit −0.057, 13.4 s trimmed |
 | `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…"` | **best overall**: 2.3 s trimmed, 0 drift, loudness matched, background preserved |
-| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…" --refine` (default) | **0.0 s trimmed**: 3 lines rewritten, worst-line deletion 59% → 0%, WER 1.5% → 1.2% |
+| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…" --refine` (default) | **best overall**: 0.0 s trimmed, 3 lines rewritten, worst-line deletion 59% → 0%, WER 1.5% → 1.2% |
+| `--video debate.mp4 --target fr --accent-mode reference-accent …` (two speakers, 60 s) | 2 voices found (7 and 8 lines), each with its own donor and its own blend clip; 0 of 15 lines closer to the accent voice on the per-speaker audit |
 
 The last row is the configuration to aim for: a fast-paced native clip as the
 accent source gives near-native pronunciation with almost no speech lost. Full
@@ -594,13 +670,15 @@ output/talk/
 ├── 01b_speech.wav       # separated speech stem (when background is preserved)
 ├── 01c_background.wav   # separated music/ambience stem
 ├── 02_transcript.json   # ASR result: segments, words, timings, language
+├── 02b_speakers.json    # segment id -> speaker, from diarization
 ├── 03_script.json       # source -> target text per segment
 ├── 03b_spoken.json      # lines the length repair re-wrote (only those)
 ├── 03c_refine.json      # what the length repair achieved
 ├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
-│   ├── donor.json       # which voice was cloned, and from what
+│   ├── donor.json       # which voice was cloned for each speaker, and from what
 │   ├── reference_blend.wav   # only in reference-accent: the clip every line is cloned from
-│   └── blend.json       # only in reference-accent: how that clip was chosen
+│   ├── reference_blend_SPK_1.wav   # ...one per speaker once there are several
+│   └── blend.json       # only in reference-accent: how each clip was chosen
 ├── 05_mix.wav           # assembled dub track, before normalisation
 ├── timing.json          # per-segment stretch ratio, placement and deficit
 ├── dub.wav              # final loudness-normalised dub audio
@@ -628,7 +706,11 @@ output/talk/
 | `background_preserved` | `true` when the original music/ambience was kept |
 | `duck_db` | Attenuation applied under dialogue (`null` when no background) |
 | `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
+| `speakers` | One entry per voice with its segment count and speech time, or `null` for a one-voice job — so single-voice reports read exactly as they did before diarization existed. The names (`SPK_0`, …) are the ones in `02b_speakers.json` |
 | `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
+| `donor.speaker_count` | How many voices the run found |
+| `donor.primary_speaker` | The speaker with the most speech. Its own fields are also copied to the top level of `donor`, so `donor.source` / `donor.accent` / `donor.blend` keep naming the voice a single-speaker job would have used |
+| `donor.speakers` | Per-voice detail: the donor segment chosen for each, how many segments they own, how long they speak, and the accent and blend records for that voice. This is the job's voice bible |
 | `donor.accent` | Present only in `reference-accent` mode: the accent clip's path and whether a transcript was supplied |
 | `donor.blend` | Present only in `reference-accent` mode: the strategy used, the passes and takes considered, and how the kept clip scored. `donor_ratio` places it between the accent voice (`0`) and the speaker's own voice (`1`) — the field to watch, and the one to raise `--blend-iters` for. `margin` only ranks takes against each other; a negative value is not by itself evidence of a problem |
 | `clamped_segments` | Lines that hit a stretch limit (either direction) |
@@ -696,9 +778,9 @@ rm -rf output/talk                                        # or just start clean
 ## How it works
 
 ```
-video/audio ──► 1. audio extract ──► 2. separate ──► 3. ASR + VAD ──► 4. translate (LLM)
-                                  (speech | bed)                        │
-            7. mux + SRT ◄── 6. mix + duck ◄── 5. clone + synthesise ◄───┘
+video/audio ─► 1. audio extract ─► 2. separate ─► 3. ASR + VAD ─► 4. diarize ─┐
+                               (speech | bed)                               │
+  8. mux + SRT ◄─ 7. mix + duck ◄─ 6. clone + synthesise ◄─ 5. translate (LLM) ◄┘
 ```
 
 | # | Stage | Module | What it does |
@@ -706,17 +788,21 @@ video/audio ──► 1. audio extract ──► 2. separate ──► 3. ASR + 
 | 1 | Audio | `pipeline/media.py` | ffmpeg extract (video) or direct read (audio), mono 48 kHz |
 | 2 | Separate | `pipeline/separation.py` | Demucs splits speech from music/ambience; ASR then reads the clean speech stem |
 | 3 | ASR | `pipeline/asr.py` | faster-whisper + Silero VAD, word timestamps, drops non-speech |
-| 4 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
-| 5 | Synthesise | `pipeline/tts.py` | donor selection + Qwen3-TTS voice cloning, per-line limiting |
-| 6 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked background |
-| 7 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
+| 4 | Diarize | `pipeline/diarize.py` | embeds each segment and clusters the embeddings into speakers |
+| 5 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
+| 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker |
+| 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked background |
+| 8 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
 
-Two design points worth knowing:
+Three design points worth knowing:
 
 - **Accent comes from the donor clip, timbre from cloning.** With no
   `--ref-audio`, the source speaker is the donor, so the accent is *preserved*.
   `--accent-mode speaker-only` drops the donor's phonetics altogether;
   `--accent-mode reference-accent` replaces them with a native clip's.
+- **One prompt per voice, not per line.** Diarization gives each speaker their own
+  donor and, in `reference-accent` mode, their own blended reference; synthesis is
+  then grouped by speaker so the prompt is rebuilt only when the voice changes.
 - **Timing errors never accumulate.** Each line is anchored to its own original
   start time; a line that does not fit spills into the pause after it and any
   residue beyond that is trimmed. Lines are never pushed late, so a long
@@ -728,7 +814,7 @@ Two design points worth knowing:
 
 All tests run **without** a GPU, downloaded models, or ffmpeg — heavy components
 are injected as fakes and binaries are mocked. The whole suite runs in about
-15 seconds.
+45 seconds.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -736,7 +822,7 @@ python -m pytest
 ```
 
 ```
-448 passed
+565 passed
 ```
 
 Run a single area while iterating:
@@ -744,6 +830,8 @@ Run a single area while iterating:
 ```bash
 python -m pytest tests/test_tts.py -q          # voice cloning, accent modes
 python -m pytest tests/test_pipeline.py -q     # end-to-end orchestration
+python -m pytest tests/test_multi_speaker.py -q  # per-speaker dubbing
+python -m pytest tests/test_diarize.py -q      # speaker clustering
 python -m pytest -k accent -q                  # everything accent-related
 ```
 
@@ -776,6 +864,13 @@ Read it as a smoke test rather than a controlled experiment: ASR re-segmented th
 two runs differently, so the text differs. Pass `--reference` and `--accent`
 explicitly to measure a single-stage job against another job's blend clip.
 
+A job with several speakers is audited **one speaker at a time**, each against
+their own `reference_blend_<speaker>.wav`, because a line cloned from one voice
+must not be judged against another's. Each group is its own scale — two voices
+have two different "pure accent" floors — so the anchors are printed per group.
+`--reference` overrides that and measures everyone against one clip, which is only
+useful for a deliberate A/B.
+
 ---
 
 ## Troubleshooting
@@ -807,13 +902,19 @@ explicitly to measure a single-stage job against another job's blend clip.
 | Music fights the voice | Raise `--duck-db` (default 6 dB) |
 | Dub still has the speaker's accent | Try `--accent-mode speaker-only`, which keeps the timbre but drops the donor's phonetics. If that is not enough, use `--accent-mode reference-accent` with a native clip |
 | Still sounds foreign in `reference-accent` mode | Check `--accent-text` matches the clip word for word — mismatched text misaligns the borrowed codes. A longer, more natural accent clip also helps |
-| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — every line is cloned from the one `reference_blend.wav` clip, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](#auditing-a-dubs-voice-line-by-line) |
+| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — each voice's lines are cloned from that voice's own `reference_blend[_<speaker>].wav`, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](#auditing-a-dubs-voice-line-by-line) |
+| A voice changes *between speakers* rather than mid-line | Expected, unless the two voices are the same person: each speaker is cloned from their own donor. If the count is wrong, see the speaker-threshold rows above |
 | The borrowed accent dominates — the speaker's own voice is barely there | The blend was built too close to the accent clip. Check `report.json` → `donor.blend.donor_ratio`: below `0.5` means it never got half-way to the speaker. Raise `--blend-iters`, or lower `--blend-ratio` if you want more of the accent |
 | The blend reached a donor ratio of only … | Informational: the target was not met within `--blend-iters` passes, and the best pass was used anyway. Raise `--blend-iters` or lower `--blend-ratio` |
 | `--accent-blend only applies to --accent-mode reference-accent` | Add that flag, or drop `--accent-blend` |
 | `--blend-takes only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-takes` |
 | `--blend-iters only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-iters` |
 | `--blend-ratio only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-ratio` |
+| Every line is dubbed in one voice, but the video has several speakers | Diarization is off or unavailable. Check the log for `Diarization (none)` — it means `--diarizer none` was set, or `funasr` is not installed. Install it (`pip install -r requirements-dev.txt`), then re-run. The detection happens before synthesis, so a cached job needs `--force` to pick up a newly installed backend |
+| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled |
+| Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
+| A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
+| `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
 | The dub is rushed, or words are missing | The reference clip's pacing is being imitated, and a slow reference lengthens every line. Use a faster-paced reference — see [Reference pacing](#reference-pacing) |
 
 Logs are written to stderr and include a job id. Set `LOG_JSON=1` for
@@ -833,11 +934,12 @@ pipeline/
 ├── media.py               ffmpeg/ffprobe wrappers, loudness, audio I/O
 ├── subtitles.py           SRT rendering
 ├── asr.py                 transcription + segmentation
+├── diarize.py             speaker embeddings + clustering (multi-speaker)
 ├── translate.py           OpenAI-compatible translation
-├── tts.py                 donor selection + voice cloning
+├── tts.py                 per-speaker donor selection + voice cloning
 ├── timing.py              stretching backends + timeline assembly
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (400 tests)
+tests/                     pytest suite (565 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
@@ -854,10 +956,14 @@ PLAN.md                    roadmap: MVP + P1–P6
   increasingly required by platforms. A consent gate is planned for P6.
 - **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
   Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
-- **Known MVP gaps**, all tracked in `PLAN.md`: multi-speaker diarization, lip
-  sync, multi-language source videos, and iterative length control in the
-  translation loop. Background preservation and native-accent borrowing are
-  implemented (see [Accent modes](#accent-modes)).
+- **Multi-speaker dubbing attributes speakers per segment**, not per word, so
+  overlapping speech is given to one speaker; the speaker count comes from
+  clustering rather than being declared. Both are tracked in `PLAN.md`.
+- **Known MVP gaps**, all tracked in `PLAN.md`: lip sync, multi-language source
+  videos, and iterative length control in the translation loop. Background
+  preservation, native-accent borrowing and multi-speaker dubbing are
+  implemented (see [Accent modes](#accent-modes) and
+  [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers)).
 - **Accent borrowing needs a supplied clip.** `reference-accent` takes
   pronunciation from `--accent-audio`; it does not yet choose or generate a
   native voice by itself. Fully unattended native accent is roadmap P2.

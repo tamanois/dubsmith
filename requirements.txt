@@ -27,6 +27,17 @@ faster-whisper          # ASR (ships its own Silero VAD, no extra dependency)
 pyloudnorm              # EBU R128 loudness measurement + normalisation
 openai                  # OpenAI-compatible client used for translation
 
+# Optional: multi-speaker dubbing. Provides the speaker-verification model
+# (ERes2NetV2, ~30 MB, cached under ~/.cache/modelscope) used to tell voices
+# apart, so each speaker can be cloned from their own voice. Without it every
+# line is dubbed in a single voice, which is the behaviour of --diarizer none.
+#
+# Heavy but self-contained: the many extras funasr declares are all guarded by
+# `extra ==` markers, so only its actual runtime dependencies are installed.
+# If pip tries to change numpy/librosa/transformers, pin the ones you already
+# have first: pip install -c <(pip freeze) funasr
+#funasr
+
 # Optional: faster TTS inference. Needs a C++ toolchain and a compatible GPU;
 # the pipeline falls back to PyTorch SDPA without it.
 #flash-attn

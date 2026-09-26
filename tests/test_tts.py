@@ -17,6 +17,7 @@ from pipeline.tts import (
     DonorClip,
     TTSEngine,
     _donor_ratio,
+    _drop_truncated,
     resolve_dtype,
     score_candidate,
     select_donor,
@@ -421,11 +422,19 @@ class ScoringQwenModel(FakeQwenModel):
     which one collapsed onto the accent clip.
     '''
 
-    def __init__(self, take_embeddings: list[list[float]], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        take_embeddings: list[list[float]],
+        take_lengths: list[int] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.take_embeddings = [
             np.asarray(vector, dtype=np.float64) for vector in take_embeddings
         ]
+        #: Sample counts per take, cycled. ``None`` renders every take the same
+        #: length; a shorter entry is how a truncated render is simulated.
+        self.take_lengths = take_lengths
         self._next_take = 0
         self._produced = 0
         #: Indices of the takes the encoder was asked about, in order.
@@ -463,8 +472,12 @@ class ScoringQwenModel(FakeQwenModel):
         for _ in kwargs['text']:
             # The first sample records which take this is, which makes the take
             # that was finally kept identifiable in the result.
-            block = np.zeros(16, dtype=np.float32)
-            block[0] = float(self._produced)
+            index = self._produced
+            length = 16
+            if self.take_lengths:
+                length = self.take_lengths[index % len(self.take_lengths)]
+            block = np.zeros(length, dtype=np.float32)
+            block[0] = float(index)
             self._produced += 1
             wavs.append(block)
         return wavs, self.sample_rate
@@ -582,6 +595,50 @@ class TestBlendedReference:
         engine = engine_with(SilentModel())  # type: ignore[arg-type]
         with pytest.raises(TTSError, match='no audio for the blended reference'):
             build_blend(engine, takes=2)
+
+
+class TestTruncatedRenders:
+    '''A render that stopped early is a failed render, not a candidate voice.
+
+    Observed on a real run: a 1.4 s clip came back for a 14 s transcript and, being
+    a fragment, scored well enough on the ratio search to be chosen as the voice the
+    whole video would be cloned from.
+    '''
+
+    #: Mostly the donor's direction - the blend that is wanted.
+    KEPT = [0.1, 0.9]
+
+    def test_a_fragment_cannot_win_the_take_search(self) -> None:
+        # Take 0 is a fragment that scores like the donor; take 1 is the full render.
+        model = ScoringQwenModel(
+            take_embeddings=[self.KEPT, self.KEPT], take_lengths=[16, 400]
+        )
+        engine = engine_with(model)  # type: ignore[arg-type]
+
+        reference = build_blend(engine, takes=2)
+
+        # The fragment was dropped before scoring, so the full render is kept.
+        assert reference.samples.size == 400
+
+    def test_takes_of_comparable_length_are_all_kept(self) -> None:
+        kept = _drop_truncated([np.zeros(100), np.zeros(98), np.zeros(51)])
+
+        # A genuinely terser take is still a take.
+        assert [item.size for item in kept] == [100, 98, 51]
+
+    def test_a_fragment_is_dropped(self) -> None:
+        # The real case: a 1.4 s render beside a 14 s transcript.
+        kept = _drop_truncated([np.zeros(140), np.zeros(49), np.zeros(14)])
+
+        assert [item.size for item in kept] == [140]
+
+    def test_no_renders_is_no_candidates(self) -> None:
+        assert _drop_truncated([]) == []
+
+    def test_a_single_render_is_always_usable(self) -> None:
+        # However short, the only render there is must survive: something has to be
+        # chosen, and the alternative is failing the job.
+        assert [item.size for item in _drop_truncated([np.zeros(5)])] == [5]
 
 
 class BlendModel(FakeQwenModel):

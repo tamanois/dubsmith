@@ -51,6 +51,11 @@ class Segment(BaseModel):
     text: str
     no_speech_prob: float = 0.0
     words: list[Word] = Field(default_factory=list)
+    #: Which speaker this utterance belongs to, filled in by the diarization
+    #: stage. ``None`` means "not assigned" - transcripts written before
+    #: diarization existed, and every run with ``--diarizer none``, which the rest
+    #: of the pipeline treats as a single voice.
+    speaker: str | None = None
 
     @property
     def duration(self) -> float:

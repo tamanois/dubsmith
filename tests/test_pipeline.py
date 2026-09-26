@@ -71,6 +71,30 @@ class FakeSeparator:
         return data, background
 
 
+class FakeDiarizer:
+    """Assigns scripted speakers, so per-speaker voices are assertable."""
+
+    name = "fake"
+
+    def __init__(self, labels: Sequence[str]) -> None:
+        self.labels = list(labels)
+        self.calls = 0
+
+    def label(
+        self,
+        segment_ids: Sequence[int],
+        regions: Sequence[tuple[float, float]],
+        samples: np.ndarray,
+        sample_rate: int,
+    ) -> dict[int, str]:
+        self.calls += 1
+        # Cycled rather than zipped, so a test only has to state the pattern.
+        return {
+            segment_id: self.labels[index % len(self.labels)]
+            for index, segment_id in enumerate(segment_ids)
+        }
+
+
 class FakeTranslator:
     """Deterministic 'translation' with optional blank lines."""
 
@@ -104,6 +128,8 @@ class FakeTTSEngine:
         #: Every prompt built, in order, so the two-stage sequence is assertable.
         self.prompt_history: list[str] = []
         self.file_prompt: tuple[Any, str] | None = None
+        #: Every file prompt built, in order, so per-speaker voices are assertable.
+        self.file_prompts: list[tuple[Any, str]] = []
         self.blend_calls = 0
         self.blend_takes: int | None = None
         self.blend_iters: int | None = None
@@ -119,6 +145,7 @@ class FakeTTSEngine:
         self.prompt_calls += 1
         self.prompt_history.append("file")
         self.file_prompt = (ref_audio, ref_text)
+        self.file_prompts.append((ref_audio, ref_text))
 
     def prepare_hybrid_prompt(
         self,
@@ -194,6 +221,7 @@ def make_pipeline(
     translator: FakeTranslator | None = None,
     tts: FakeTTSEngine | None = None,
     separator: Any | None = None,
+    labeler: Any | None = None,
     **job_kwargs: Any,
 ) -> tuple[Pipeline, FakeTranscriber, FakeTranslator, FakeTTSEngine]:
     audio = job_kwargs.pop("input_path", None) or write_input(tmp_path)
@@ -210,6 +238,8 @@ def make_pipeline(
         tts_engine=tts,
         stretcher=IdentityStretcher(),
         separator=separator,
+        # Named apart from JobConfig.diarizer, which is the *preference* string.
+        diarizer=labeler,
     )
     return pipeline, transcriber, translator, tts
 

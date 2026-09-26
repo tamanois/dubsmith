@@ -131,6 +131,33 @@ class TestPersistence:
         restored = load_transcript(path)
         assert restored == simple_transcript
 
+    def test_a_speaker_survives_the_round_trip(self, tmp_path: Path) -> None:
+        # Diarization annotates the transcript and the label has to persist with
+        # it, or a rerun would lose track of who says what.
+        transcript = Transcript(
+            language="en",
+            segments=[
+                Segment(id=0, start=0.0, end=1.0, text="a", speaker="SPK_1"),
+                Segment(id=1, start=1.0, end=2.0, text="b"),
+            ],
+        )
+        restored = load_transcript(save_transcript(transcript, tmp_path / "t.json"))
+
+        assert restored.segments[0].speaker == "SPK_1"
+        # Unassigned stays unassigned: old transcripts must load unchanged.
+        assert restored.segments[1].speaker is None
+
+    def test_an_old_transcript_without_speakers_still_loads(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "old.json"
+        path.write_text(
+            '{"language": "en", "segments": [{"id": 0, "start": 0.0, "end": 1.0, '
+            '"text": "hi"}]}',
+            encoding="utf-8",
+        )
+        assert load_transcript(path).segments[0].speaker is None
+
     def test_creates_parent_directories(self, tmp_path: Path) -> None:
         transcript = Transcript(language="en", segments=[Segment(start=0, end=1, text="x")])
         path = save_transcript(transcript, tmp_path / "a" / "b" / "t.json")

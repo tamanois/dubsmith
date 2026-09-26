@@ -234,6 +234,39 @@ def build_dub_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--diarizer",
+        dest="diarizer",
+        default="auto",
+        choices=["auto", "none"],
+        help=(
+            "'auto' separates the speakers and clones each voice from its own "
+            "donor; 'none' treats the video as a single speaker, as before. "
+            "Separating needs the optional funasr dependency."
+        ),
+    )
+    parser.add_argument(
+        "--speaker-threshold",
+        dest="speaker_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Cosine distance at which two voices count as different speakers "
+            "(default: 0.4). Raise it if one speaker is split in two; lower it if "
+            "two speakers are merged into one."
+        ),
+    )
+    parser.add_argument(
+        "--min-speaker-seconds",
+        dest="min_speaker_seconds",
+        type=float,
+        default=3.0,
+        help=(
+            "Clusters with less speech than this are folded into the nearest "
+            "speaker, since a voice needs a few seconds before it can be cloned. "
+            "(default: 3.0)"
+        ),
+    )
+    parser.add_argument(
         "--refine",
         dest="refine",
         action="store_true",
@@ -364,6 +397,9 @@ def cmd_dub(argv: Sequence[str]) -> int:
         blend_takes=args.blend_takes,
         blend_iters=args.blend_iters,
         blend_ratio=args.blend_ratio,
+        diarizer=args.diarizer,
+        speaker_threshold=args.speaker_threshold,
+        min_speaker_seconds=args.min_speaker_seconds,
         refine=args.refine,
         refine_max_passes=args.refine_max_passes,
         refine_threshold=args.refine_threshold,

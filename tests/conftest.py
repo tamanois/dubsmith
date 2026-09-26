@@ -56,3 +56,19 @@ def _never_load_demucs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "pipeline.orchestrate.detect_separator", lambda *args, **kwargs: NullSeparator()
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_load_diarizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite fast and isolated by disabling real diarization.
+
+    ``funasr`` is an optional dependency, so without this the orchestrator would
+    load a speaker-embedding model on every pipeline test. Tests that need several
+    speakers inject their own diarizer, keeping the real path covered without
+    downloading or loading weights here.
+    """
+    from pipeline.diarize import NullDiarizer
+
+    monkeypatch.setattr(
+        "pipeline.orchestrate.detect_diarizer", lambda *args, **kwargs: NullDiarizer()
+    )
