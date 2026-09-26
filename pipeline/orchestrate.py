@@ -42,7 +42,7 @@ from .translate import (
     TranslationRequest,
     Translator,
 )
-from .tts import TTSEngine, select_donor
+from .tts import DonorClip, TTSEngine, select_donor
 
 __all__ = ["Pipeline", "JobResult", "Manifest"]
 
@@ -59,6 +59,11 @@ _REFINE_NAME = "03c_refine.json"
 _DUBBED_DIR = "04_dubbed"
 _DONE_MARKER = ".done"
 _DONOR_NAME = "04_dubbed/donor.json"
+#: The one-off clip the two-stage ``reference-accent`` path clones every line
+#: from, and how it was chosen. Both live together because the JSON describes
+#: this exact WAV; a stale pair would misreport the voice being cloned.
+_BLEND_NAME = "04_dubbed/reference_blend.wav"
+_BLEND_INFO_NAME = "04_dubbed/blend.json"
 _TIMING_NAME = "timing.json"
 _MIX_NAME = "05_mix.wav"
 _DUB_TRACK_NAME = "dub.wav"
@@ -70,6 +75,19 @@ _TMP_DIR = "tmp"
 #: they are mixed keeps their relative levels consistent and stops a few isolated
 #: transient peaks from forcing the whole program several dB too quiet.
 _LINE_CEILING = 10.0 ** (-3.0 / 20.0)
+
+
+def _json_similarity(value: Any) -> float | None:
+    """A similarity as a JSON-safe number, or ``None`` when it was not scored.
+
+    JSON has no NaN or Infinity, and writing them makes the report unreadable to
+    strict parsers such as ``jq``, so an unscored take becomes ``null``.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 4) if np.isfinite(number) else None
 
 
 def _load_placements(path: Path) -> list[Placement]:
@@ -197,6 +215,9 @@ class Pipeline:
         self._stage_seconds: dict[str, float] = {}
         #: Segments of the run currently being refined (set by the length repair).
         self._segments_for_refine: list[Any] = []
+        #: Donor and its report record, resolved once and shared by the blend and
+        #: synthesis stages. ``None`` until either of them needs it.
+        self._donor_resolved: tuple[DonorClip | None, dict[str, Any]] | None = None
 
         self.manifest = Manifest(self.job_dir / _MANIFEST_NAME, job.fingerprint())
 
@@ -223,7 +244,12 @@ class Pipeline:
             # otherwise the two multi-GB models contend for the same GPU.
             release_gpu_memory()
             script = self._stage_translate(transcript)
-            dubbed = self._stage_synthesize(source_audio, transcript, script, tmp_dir)
+            # Rendered before synthesis so every line is cloned from one clip
+            # whose speech codes and speaker embedding agree.
+            blend = self._stage_blend(source_audio, transcript)
+            dubbed = self._stage_synthesize(
+                source_audio, transcript, script, tmp_dir, blend
+            )
             release_gpu_memory()
             timeline = self._stage_mix(audio_path, transcript, dubbed, tmp_dir)
             return self._stage_deliver(timeline, transcript, script)
@@ -357,9 +383,16 @@ class Pipeline:
         path = self.job_dir / _DONOR_NAME
         if path.is_file():
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                stored = json.loads(path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
-                pass
+                stored = None
+            if isinstance(stored, dict):
+                # The blend record travels with the donor one; a directory written
+                # before it existed re-derives the strategy from the config.
+                blend_stats = self._blend_stats()
+                if blend_stats is not None:
+                    stored.setdefault("blend", blend_stats)
+                return stored
 
         if self.job.ref_audio is not None:
             info: dict[str, Any] = {
@@ -381,6 +414,9 @@ class Pipeline:
                 "path": str(self.job.accent_audio),
                 "transcript_provided": bool((self.job.accent_text or "").strip()),
             }
+        blend_stats = self._blend_stats()
+        if blend_stats is not None:
+            info["blend"] = blend_stats
         return info
 
     def _spoken_overrides(self) -> dict[int, str]:
@@ -536,33 +572,47 @@ class Pipeline:
         payload = json.loads(out.read_text(encoding="utf-8"))
         return {line["id"]: line["target"] for line in payload["lines"]}
 
-    def _stage_synthesize(
-        self,
-        audio_path: Path,
-        transcript: Transcript,
-        script: dict[int, str],
-        tmp_dir: Path,
-    ) -> dict[int, Path]:
-        """Clone the donor voice and synthesise one file per segment."""
-        out_dir = self.job_dir / _DUBBED_DIR
-        out_dir.mkdir(parents=True, exist_ok=True)
-        marker = out_dir / _DONE_MARKER
-        expected = {segment.id: out_dir / f"seg_{segment.id:04d}.wav" for segment in transcript.segments}
+    def _blend_stats(self) -> dict[str, Any] | None:
+        """How the blended reference was chosen, or ``None`` when it was not used.
 
-        def build() -> dict[int, Path]:
-            engine = self._resolve_tts()
+        Re-derived from ``blend.json`` rather than held in memory, so a run served
+        from cache still reports the strategy behind the voice it is reusing.
+        """
+        if self.job.accent_mode != "reference-accent":
+            return None
+        if self.job.accent_blend_mode != "two-stage":
+            return {"strategy": "single-stage"}
+        strategy: dict[str, Any] = {"strategy": "two-stage"}
+        path = self.job_dir / _BLEND_INFO_NAME
+        if not path.is_file():
+            return strategy
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return strategy
+        return payload if isinstance(payload, dict) else strategy
 
-            # Resolve the timbre source once: an explicit reference file, else the
-            # best segment of the source speech. The accent mode decides how the
-            # prompt is then built, not where the voice comes from.
-            donor = None
+    def _resolve_donor(
+        self, audio_path: Path, transcript: Transcript
+    ) -> tuple[DonorClip | None, dict[str, Any]]:
+        """Resolve the timbre source once: an explicit reference file, else a segment.
+
+        Shared by the blend and synthesis stages so the speech stem is loaded once
+        per run and both stages necessarily agree about whose voice is being
+        cloned. The record comes back as a copy, leaving the caller free to enrich
+        it for the report without leaking into the next stage.
+        """
+        if self._donor_resolved is None:
             if self.job.ref_audio is not None:
                 self.log.info("Using reference voice %s", self.job.ref_audio)
-                donor_info: dict[str, Any] = {
-                    "source": "reference-audio",
-                    "path": str(self.job.ref_audio),
-                    "transcript_provided": bool((self.job.ref_text or "").strip()),
-                }
+                self._donor_resolved = (
+                    None,
+                    {
+                        "source": "reference-audio",
+                        "path": str(self.job.ref_audio),
+                        "transcript_provided": bool((self.job.ref_text or "").strip()),
+                    },
+                )
             else:
                 samples, sample_rate = media.load_audio(audio_path)
                 donor = select_donor(samples, sample_rate, transcript.segments)
@@ -571,28 +621,135 @@ class Pipeline:
                     donor.segment_id,
                     donor.duration,
                 )
-                donor_info = {
-                    "source": "auto",
-                    "segment_id": donor.segment_id,
-                    "start": round(donor.start, 2),
-                    "end": round(donor.end, 2),
-                    "duration": round(donor.duration, 2),
-                    "transcript": donor.text,
-                }
+                self._donor_resolved = (
+                    donor,
+                    {
+                        "source": "auto",
+                        "segment_id": donor.segment_id,
+                        "start": round(donor.start, 2),
+                        "end": round(donor.end, 2),
+                        "duration": round(donor.duration, 2),
+                        "transcript": donor.text,
+                    },
+                )
+        donor, info = self._donor_resolved
+        return donor, dict(info)
+
+    def _stage_blend(self, audio_path: Path, transcript: Transcript) -> Path | None:
+        """Render the blended reference once, for the two-stage accent path.
+
+        Returns the clip's path, or ``None`` when the configured mode needs no
+        such clip. Cached like every other stage - and more importantly so,
+        because this one clip fixes the voice of the entire video: regenerating it
+        would make an otherwise identical rerun sound like a different speaker.
+        """
+        if self.job.accent_mode != "reference-accent":
+            return None
+        if self.job.accent_blend_mode != "two-stage":
+            return None
+
+        out = self.job_dir / _BLEND_NAME
+        info_path = self.job_dir / _BLEND_INFO_NAME
+
+        def build() -> Path:
+            assert self.job.accent_audio is not None  # guaranteed by JobConfig
+            engine = self._resolve_tts()
+            donor, _donor_info = self._resolve_donor(audio_path, transcript)
+            target_ratio = self.job.resolved_blend_ratio
+            blended = engine.build_blended_reference(
+                accent_audio=self.job.accent_audio,
+                accent_text=self.job.accent_text or "",
+                language=self.job.target_language,
+                timbre=donor,
+                timbre_audio=self.job.ref_audio,
+                takes=self.job.resolved_blend_takes,
+                iters=self.job.resolved_blend_iters,
+                ratio=target_ratio,
+            )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            media.write_audio(out, blended.samples, blended.sample_rate)
+            # Written beside the WAV it describes, so the pair can never drift.
+            info_path.write_text(
+                json.dumps(
+                    {
+                        "strategy": "two-stage",
+                        "takes": blended.takes,
+                        "iters": blended.iters,
+                        "target_ratio": target_ratio,
+                        "duration": round(blended.duration, 2),
+                        "timbre_similarity": _json_similarity(blended.timbre_similarity),
+                        "accent_similarity": _json_similarity(blended.accent_similarity),
+                        "donor_ratio": _json_similarity(blended.donor_ratio),
+                        "margin": _json_similarity(blended.margin),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            self.log.info(
+                "Blended reference: %s (%.1fs, %d take(s), %d pass(es), donor "
+                "ratio %.2f)",
+                out.name,
+                blended.duration,
+                blended.takes,
+                blended.iters,
+                blended.donor_ratio,
+            )
+            return out
+
+        result = self._stage("blend", [out, info_path], build)
+        if result is not None:
+            return result
+        return out if out.is_file() else None
+
+    def _stage_synthesize(
+        self,
+        audio_path: Path,
+        transcript: Transcript,
+        script: dict[int, str],
+        tmp_dir: Path,
+        blend: Path | None = None,
+    ) -> dict[int, Path]:
+        """Clone the donor voice and synthesise one file per segment.
+
+        ``blend`` is the stage-1 clip from :meth:`_stage_blend`. When it is given,
+        every line is cloned from that single reference instead of being
+        conditioned on the accent codes and the donor embedding separately.
+        """
+        out_dir = self.job_dir / _DUBBED_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        marker = out_dir / _DONE_MARKER
+        expected = {segment.id: out_dir / f"seg_{segment.id:04d}.wav" for segment in transcript.segments}
+
+        def build() -> dict[int, Path]:
+            engine = self._resolve_tts()
+
+            # The accent mode decides how the prompt is built, not where the voice
+            # comes from: that resolution is shared with the blend stage, so both
+            # necessarily agree about whose voice is being cloned.
+            donor, donor_info = self._resolve_donor(audio_path, transcript)
 
             if self.job.accent_mode == "reference-accent":
                 assert self.job.accent_audio is not None  # guaranteed by JobConfig
-                self.log.info(
-                    "Hybrid voice: timbre from %s, accent from %s",
-                    donor_info.get("path") or f"segment {donor_info['segment_id']}",
-                    self.job.accent_audio,
-                )
-                engine.prepare_hybrid_prompt(
-                    accent_audio=self.job.accent_audio,
-                    accent_text=self.job.accent_text or "",
-                    timbre=donor,
-                    timbre_audio=self.job.ref_audio,
-                )
+                if blend is not None:
+                    self.log.info(
+                        "Hybrid voice: cloning every line from %s, whose codes and "
+                        "speaker embedding both describe the source speaker.",
+                        blend.name,
+                    )
+                    engine.prepare_prompt_from_file(blend, self.job.accent_text or "")
+                else:
+                    self.log.info(
+                        "Hybrid voice: timbre from %s, accent from %s",
+                        donor_info.get("path") or f"segment {donor_info['segment_id']}",
+                        self.job.accent_audio,
+                    )
+                    engine.prepare_hybrid_prompt(
+                        accent_audio=self.job.accent_audio,
+                        accent_text=self.job.accent_text or "",
+                        timbre=donor,
+                        timbre_audio=self.job.ref_audio,
+                    )
                 donor_info["accent"] = {
                     "source": "reference-audio",
                     "path": str(self.job.accent_audio),
@@ -601,10 +758,13 @@ class Pipeline:
             elif self.job.ref_audio is not None:
                 engine.prepare_prompt_from_file(self.job.ref_audio, self.job.ref_text or "")
             else:
-                assert donor is not None  # set in the branch above
+                assert donor is not None  # guaranteed by _resolve_donor
                 engine.prepare_prompt(donor)
 
             donor_info["accent_mode"] = self.job.accent_mode
+            blend_stats = self._blend_stats()
+            if blend_stats is not None:
+                donor_info["blend"] = blend_stats
             # Persisted so the report can state the donor even when the stage is
             # served from cache on a later run.
             (self.job_dir / _DONOR_NAME).write_text(
@@ -632,6 +792,13 @@ class Pipeline:
                     engine.sample_rate,
                 )
                 written[segment.id] = path
+            # An earlier run of this input may have produced more lines, since ASR
+            # re-segmentation changes the count, and nothing removed the clips it
+            # left behind. Those orphans get picked up by anything walking the
+            # folder, so drop whatever this run did not write.
+            for stale in out_dir.glob("seg_*.wav"):
+                if stale not in expected.values():
+                    stale.unlink()
             # A marker keeps the cache independent of how many lines were blank.
             marker.write_text(str(len(written)), encoding="utf-8")
             return written

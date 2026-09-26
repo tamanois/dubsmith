@@ -248,6 +248,106 @@ class TestReferenceAccentMode:
         assert "~" not in str(job.input_path)
 
 
+class TestAccentBlendOptions:
+    """How `reference-accent` builds the voice it clones."""
+
+    @staticmethod
+    def build(**overrides: object) -> JobConfig:
+        payload: dict[str, object] = {
+            "audio": Path("a.wav"),
+            "accent_mode": "reference-accent",
+            "accent_audio": Path("accent.wav"),
+            "accent_text": "Bonjour",
+        }
+        payload.update(overrides)
+        return JobConfig(**payload)  # type: ignore[arg-type]
+
+    def test_defaults_to_two_stage_with_three_takes(self) -> None:
+        job = self.build()
+        assert job.accent_blend_mode == "two-stage"
+        assert job.resolved_blend_takes == 3
+        assert job.resolved_blend_iters == 4
+        assert job.resolved_blend_ratio == 0.5
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("two-stage", "two-stage"),
+            ("two", "two-stage"),
+            ("blend", "two-stage"),
+            ("Two_Stage", "two-stage"),
+            ("single-stage", "single-stage"),
+            ("single", "single-stage"),
+            ("direct", "single-stage"),
+        ],
+    )
+    def test_blend_aliases(self, raw: str, expected: str) -> None:
+        assert self.build(accent_blend=raw).accent_blend_mode == expected
+
+    def test_unknown_blend_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown accent blend"):
+            self.build(accent_blend="telepathy")
+
+    def test_takes_are_honoured(self) -> None:
+        assert self.build(blend_takes=7).resolved_blend_takes == 7
+
+    def test_takes_below_one_are_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="at least 1"):
+            self.build(blend_takes=0)
+
+    def test_iteration_is_honoured(self) -> None:
+        assert self.build(blend_iters=2).resolved_blend_iters == 2
+
+    def test_iters_below_one_are_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="--blend-iters must be at least 1"):
+            self.build(blend_iters=0)
+
+    def test_ratio_is_honoured(self) -> None:
+        assert self.build(blend_ratio=0.8).resolved_blend_ratio == 0.8
+        # 0 is meaningful: it disables the search rather than falling back.
+        assert self.build(blend_ratio=0).resolved_blend_ratio == 0.0
+
+    def test_ratio_outside_zero_to_one_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="between 0 and 1"):
+            self.build(blend_ratio=1.5)
+        with pytest.raises(ConfigError, match="between 0 and 1"):
+            self.build(blend_ratio=-0.1)
+
+    def test_blend_without_the_mode_is_rejected(self) -> None:
+        """A silently ignored knob is worse than a rejected one."""
+        with pytest.raises(ConfigError, match="--accent-blend only applies"):
+            JobConfig(audio=Path("a.wav"), accent_blend="single-stage")
+
+    def test_takes_without_the_mode_are_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="--blend-takes only applies"):
+            JobConfig(audio=Path("a.wav"), blend_takes=4)
+
+    def test_iters_without_the_mode_are_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="--blend-iters only applies"):
+            JobConfig(audio=Path("a.wav"), blend_iters=2)
+
+    def test_ratio_without_the_mode_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="--blend-ratio only applies"):
+            JobConfig(audio=Path("a.wav"), blend_ratio=0.5)
+
+    def test_other_modes_keep_the_defaults(self) -> None:
+        for mode in ("preserve", "speaker-only"):
+            job = JobConfig(audio=Path("a.wav"), accent_mode=mode)
+            assert job.accent_blend_mode == "two-stage"
+            assert job.resolved_blend_takes == 3
+            assert job.resolved_blend_iters == 4
+            assert job.resolved_blend_ratio == 0.5
+
+    def test_fingerprint_changes_with_the_blend_strategy(self) -> None:
+        """Different strategies must not reuse each other's cached audio."""
+        assert self.build().fingerprint() != self.build(
+            accent_blend="single-stage"
+        ).fingerprint()
+        assert self.build().fingerprint() != self.build(blend_takes=5).fingerprint()
+        assert self.build().fingerprint() != self.build(blend_iters=2).fingerprint()
+        assert self.build().fingerprint() != self.build(blend_ratio=0.9).fingerprint()
+
+
 class TestFingerprint:
     def test_stable_for_equal_settings(self) -> None:
         a = JobConfig(audio=Path("a.wav"), target_language="fr")

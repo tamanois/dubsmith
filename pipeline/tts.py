@@ -7,6 +7,9 @@ Two responsibilities:
    it can be tested without a model.
 2. :class:`TTSEngine` wraps the Base checkpoint, builds the clone prompt once, and
    synthesises all lines in batches.
+3. For ``reference-accent``, :meth:`TTSEngine.build_blended_reference` renders the
+   accent transcript once in the donor's voice, so every line can then be cloned
+   from a single clip whose codes and speaker embedding agree.
 
 The Base checkpoint is required: only ``tts_model_type == "base"`` implements
 ``generate_voice_clone``. Pointing this at CustomVoice or VoiceDesign raises a
@@ -29,7 +32,9 @@ from .errors import DependencyError, TTSError
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "BlendedReference",
     "DonorClip",
+    "ReferenceAudio",
     "select_donor",
     "score_candidate",
     "TTSEngine",
@@ -41,6 +46,15 @@ __all__ = [
 MIN_DONOR_S = 3.0
 MAX_DONOR_S = 15.0
 IDEAL_DONOR_S = 8.0
+
+#: Rate the checkpoint's speaker encoder expects. ``extract_speaker_embedding``
+#: asserts on it, so any clip scored against a prompt embedding must be resampled.
+SPEAKER_ENCODER_RATE = 24_000
+
+#: A reference clip as the checkpoint accepts it: a path, or raw samples and rate.
+#: Iteration needs the second form, because the previous blend exists only in
+#: memory until the run finishes.
+ReferenceAudio = Path | str | tuple[np.ndarray, int]
 
 
 @dataclass(frozen=True)
@@ -65,6 +79,56 @@ class DonorClip:
         if self.samples.size == 0:
             return 0.0
         return float(np.sqrt(np.mean(np.square(self.samples, dtype=np.float64))))
+
+
+@dataclass(frozen=True)
+class BlendedReference:
+    """A one-off clip of the donor's voice speaking the accent clip's transcript.
+
+    The checkpoint conditions a line on two independent signals: ``ref_code``
+    (pronunciation and prosody) and ``ref_spk_embedding`` (vocal identity). When
+    they come from different clips they can disagree, and a sampled line may
+    follow either one - which is heard as the speaker changing mid-video. This
+    clip removes that choice, because both signals are derived from it.
+
+    The similarity fields record how the winning take was chosen. ``margin`` is
+    the difference between the two, so a negative value means the take that best
+    kept the donor's timbre was still closer to the accent clip.
+    """
+
+    samples: np.ndarray
+    sample_rate: int
+    text: str
+    #: Takes considered in the first pass (1 when scoring was unavailable).
+    takes: int
+    #: Passes run. ``1`` means the first pass already met the target, or no target
+    #: was set; higher means the blend had to be pulled further toward the speaker.
+    iters: int
+    #: Where the kept clip sits on the scale from the accent voice (``0.0``) to a
+    #: French utterance in the speaker's own voice (``1.0``). ``NaN`` when no donor
+    #: anchor could be built. Roughly ``0.5`` is an even blend.
+    donor_ratio: float
+    #: ``timbre_similarity - accent_similarity`` of the winning take.
+    #:
+    #: This ranks takes against *each other*, and the ranking is sound because
+    #: every take reads the same text, so any language penalty applies equally to
+    #: all of them. The *absolute* value is not: a French take compared against an
+    #: English donor is penalised for the language difference rather than the
+    #: voice, so a negative margin does not by itself mean the voice collapsed.
+    #: Measured on this repo's TED talk, the two reference voices sat 0.035 apart on
+    #: the encoder's scale while a perfectly good take scored -0.011. Judging a
+    #: clip in absolute terms needs a language-matched reference, which is what
+    #: ``audit_timbre.py`` builds - not a threshold here.
+    margin: float
+    #: Cosine similarity of the winning take to the donor's speaker embedding.
+    timbre_similarity: float
+    #: Cosine similarity of the winning take to the accent clip's embedding.
+    accent_similarity: float
+
+    @property
+    def duration(self) -> float:
+        """Clip length in seconds."""
+        return len(self.samples) / float(self.sample_rate)
 
 
 def score_candidate(segment: Segment, samples: np.ndarray, sample_rate: int) -> float:
@@ -165,6 +229,113 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return "out of memory" in str(exc).lower()
 
 
+def _embedding_vector(value: Any) -> np.ndarray | None:
+    """Flatten a tensor/array embedding into a finite float vector.
+
+    Returns ``None`` for anything that cannot be compared - an unavailable
+    embedding, a placeholder, or one carrying NaN - so callers can treat
+    "unscorable" differently from "scored zero". Tensors are detached and moved
+    to the CPU first, which is why a duck-typed ``detach`` check is enough here.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().float().cpu().numpy()
+    try:
+        vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return None
+    return vector
+
+
+def _cosine(left: np.ndarray, right: np.ndarray) -> float:
+    """Cosine similarity between two embedding vectors.
+
+    Returns ``NaN`` when the vectors cannot be compared (different widths, or a
+    zero-norm vector), which keeps "no opinion" distinct from "zero similarity".
+    """
+    if left.shape != right.shape:
+        return float("nan")
+    left_norm = float(np.linalg.norm(left))
+    right_norm = float(np.linalg.norm(right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return float("nan")
+    return float(np.dot(left, right) / (left_norm * right_norm))
+
+
+def _format_similarity(value: float) -> str:
+    """Readable similarity, or ``"n/a"`` when a take could not be scored."""
+    return "n/a" if not np.isfinite(value) else f"{value:.3f}"
+
+
+def _reference_audio(value: ReferenceAudio) -> Any:
+    """A reference clip in the form the checkpoint expects.
+
+    Paths become strings while ``(samples, rate)`` pairs pass through, which is
+    what lets a blend be fed back in as the next pass's reference.
+    """
+    if isinstance(value, tuple):
+        samples, rate = value
+        return (np.asarray(samples, dtype=np.float32), int(rate))
+    return str(value)
+
+
+def _donor_ratio(
+    candidate: np.ndarray,
+    accent_embedding: np.ndarray | None,
+    donor_embedding: np.ndarray | None,
+) -> float:
+    """Where ``candidate`` sits between the accent voice and the donor's own voice.
+
+    Projects the candidate onto the line joining the two anchors, so ``0.0`` is
+    the accent clip and ``1.0`` is a French utterance in the donor's voice. Both
+    anchors are in the target language, which is the whole point: a raw similarity
+    against an English donor measures the language gap as much as the voice, and
+    its absolute value was therefore never safe to threshold.
+
+    Returns ``NaN`` when either anchor is missing or the two coincide.
+    """
+    if accent_embedding is None or donor_embedding is None:
+        return float("nan")
+    if accent_embedding.shape != candidate.shape or donor_embedding.shape != candidate.shape:
+        return float("nan")
+    axis = donor_embedding - accent_embedding
+    span = float(np.dot(axis, axis))
+    if not np.isfinite(span) or span <= 0.0:
+        return float("nan")
+    position = float(np.dot(candidate - accent_embedding, axis) / span)
+    if not np.isfinite(position):
+        return float("nan")
+    return float(np.clip(position, 0.0, 1.0))
+
+
+@dataclass(frozen=True)
+class _BlendPass:
+    """One rendered blend and how it scored on the language-matched scale."""
+
+    samples: np.ndarray
+    timbre_similarity: float
+    accent_similarity: float
+    donor_ratio: float
+
+    @property
+    def margin(self) -> float:
+        """``timbre - accent``, used to rank *takes* within a pass.
+
+        Only meaningful for ranking: every take reads the same text, so the
+        language penalty in the timbre term cancels. It is not an absolute score -
+        see :attr:`BlendedReference.margin`. Falls back to the timbre similarity
+        when there is no accent side to move away from.
+        """
+        if not np.isfinite(self.timbre_similarity):
+            return float("nan")
+        if np.isfinite(self.accent_similarity):
+            return self.timbre_similarity - self.accent_similarity
+        return self.timbre_similarity
+
+
 class TTSEngine:
     """Voice-cloning synthesiser backed by a local Qwen3-TTS Base checkpoint."""
 
@@ -192,6 +363,11 @@ class TTSEngine:
         self._model: Any | None = None
         self._prompt: Any | None = None
         self._sample_rate: int | None = None
+        #: Speaker embeddings of the hybrid prompt's two sources, recorded when it
+        #: is built so candidate blends can be scored against both without
+        #: re-encoding either clip. ``None`` until ``prepare_hybrid_prompt`` runs.
+        self._accent_spk_embedding: Any | None = None
+        self._timbre_spk_embedding: Any | None = None
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -267,7 +443,7 @@ class TTSEngine:
     def prepare_hybrid_prompt(
         self,
         *,
-        accent_audio: Path | str,
+        accent_audio: ReferenceAudio,
         accent_text: str,
         timbre: DonorClip | None = None,
         timbre_audio: Path | str | None = None,
@@ -282,7 +458,9 @@ class TTSEngine:
         single reference.
 
         Args:
-            accent_audio: Native target-language clip supplying the phonetics.
+            accent_audio: Native target-language clip supplying the phonetics. Also
+                accepts ``(samples, rate)``, which is how iteration feeds the
+                previous blend back in as the next pass's code source.
             accent_text: Its exact transcript; mandatory, because ICL mode aligns
                 the speech codes against the reference text.
             timbre: Speaker to keep, taken from the source video.
@@ -301,7 +479,7 @@ class TTSEngine:
             raise TTSError("prepare_hybrid_prompt needs a timbre source.")
 
         accent_items = self.model.create_voice_clone_prompt(
-            ref_audio=str(accent_audio),
+            ref_audio=_reference_audio(accent_audio),
             ref_text=accent_text,
             x_vector_only_mode=False,
         )
@@ -336,6 +514,292 @@ class TTSEngine:
                 "version may have changed VoiceClonePromptItem."
             ) from exc
         self._prompt = [combined]
+        # Recorded from the items already in hand, so scoring candidate blends
+        # against both sources costs no extra encoder pass. The accent item is
+        # read after ``replace`` only because the two live in different items -
+        # ``replace`` returns a copy and leaves the original untouched.
+        self._accent_spk_embedding = getattr(accent_items[0], "ref_spk_embedding", None)
+        self._timbre_spk_embedding = getattr(timbre_items[0], "ref_spk_embedding", None)
+
+    # -- blended reference (two-stage) ------------------------------------- #
+
+    def speaker_embedding(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Speaker embedding of a clip, resampled to the encoder's 24 kHz.
+
+        This is the one objective handle on "whose voice is this", so it serves
+        both the take selection below and an offline audit of a finished dub.
+
+        Raises:
+            TTSError: If the checkpoint returns nothing usable.
+        """
+        audio_in = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if int(sample_rate) != SPEAKER_ENCODER_RATE:
+            import librosa
+
+            audio_in = librosa.resample(
+                audio_in, orig_sr=int(sample_rate), target_sr=SPEAKER_ENCODER_RATE
+            )
+        vector = _embedding_vector(
+            self.model.model.extract_speaker_embedding(
+                audio=audio_in, sr=SPEAKER_ENCODER_RATE
+            )
+        )
+        if vector is None:
+            raise TTSError("The checkpoint returned no usable speaker embedding.")
+        return vector
+
+    def _donor_anchor(
+        self,
+        *,
+        accent_text: str,
+        language: str,
+        timbre: DonorClip | None,
+        timbre_audio: Path | str | None,
+    ) -> np.ndarray | None:
+        """A target-language utterance in the donor's own voice, embedding only.
+
+        Built in x-vector mode, so no accent codes take part: it is what the speaker
+        sounds like without the borrowed pronunciation. That makes it the far end of
+        a *language-matched* scale, and therefore something absolute measurements
+        can finally be taken against - a raw similarity to an English donor only
+        ever measured the language gap.
+
+        Best-effort: a checkpoint without the speaker encoder yields ``None`` and the
+        ratio is simply left unmeasured.
+
+        Note:
+            Replaces the current clone prompt, like every other ``prepare_*`` call.
+        """
+        if timbre is not None:
+            ref_audio: Any = (
+                np.asarray(timbre.samples, dtype=np.float32),
+                int(timbre.sample_rate),
+            )
+        elif timbre_audio is not None:
+            ref_audio = str(timbre_audio)
+        else:
+            return None
+
+        try:
+            self._prompt = self.model.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+            wavs = self.synthesize([accent_text], language=language)
+            anchor = wavs[0] if wavs else None
+            if anchor is None or not np.asarray(anchor).size:
+                return None
+            return self.speaker_embedding(anchor, self.sample_rate)
+        except Exception as exc:  # noqa: BLE001 - a missing anchor is not fatal
+            _LOGGER.warning("Could not build a donor anchor clip: %s", exc)
+            return None
+
+    def _render(self, text: str, language: str, count: int) -> list[np.ndarray]:
+        """Synthesise ``count`` takes of ``text``, dropping anything unusable."""
+        wavs = self.synthesize([text] * count, language=language)
+        return [
+            np.ascontiguousarray(np.asarray(wav, dtype=np.float32).reshape(-1))
+            for wav in wavs
+            if wav is not None and np.asarray(wav).size
+        ]
+
+    def _measure_pass(
+        self,
+        samples: np.ndarray,
+        timbre_embedding: np.ndarray | None,
+        accent_embedding: np.ndarray | None,
+        donor_anchor: np.ndarray | None,
+    ) -> _BlendPass:
+        """Score one rendered pass; anything unmeasurable stays ``NaN``."""
+        try:
+            candidate = self.speaker_embedding(samples, self.sample_rate)
+        except Exception as exc:  # noqa: BLE001 - scoring must never break a run
+            _LOGGER.warning("Could not score a blend pass: %s", exc)
+            return _BlendPass(samples, float("nan"), float("nan"), float("nan"))
+        return _BlendPass(
+            samples=samples,
+            timbre_similarity=(
+                _cosine(candidate, timbre_embedding)
+                if timbre_embedding is not None
+                else float("nan")
+            ),
+            accent_similarity=(
+                _cosine(candidate, accent_embedding)
+                if accent_embedding is not None
+                else float("nan")
+            ),
+            donor_ratio=_donor_ratio(candidate, accent_embedding, donor_anchor),
+        )
+
+    @staticmethod
+    def _best_pass(passes: Sequence[_BlendPass]) -> int:
+        """Index of the pass that moved furthest toward the speaker's own voice.
+
+        Prefers the measured donor ratio, which is language-matched by construction.
+        The accent similarity is the fallback when no anchor could be built - still
+        comparable, because both of *its* sides are in the target language. Ties keep
+        the earliest pass, so a rerun is reproducible.
+        """
+        ratios = [item.donor_ratio for item in passes]
+        if any(np.isfinite(value) for value in ratios):
+            return int(np.nanargmax(ratios))
+        accents = [item.accent_similarity for item in passes]
+        if any(np.isfinite(value) for value in accents):
+            return int(np.nanargmin(accents))
+        return 0
+
+    def build_blended_reference(
+        self,
+        *,
+        accent_audio: Path | str,
+        accent_text: str,
+        language: str,
+        timbre: DonorClip | None = None,
+        timbre_audio: Path | str | None = None,
+        takes: int = 1,
+        iters: int = 1,
+        ratio: float = 0.0,
+    ) -> BlendedReference:
+        """Render the accent transcript in the donor's voice, iterating toward it.
+
+        Stage 1 of the two-stage ``reference-accent`` path. The accent clip supplies
+        the speech codes and the donor the speaker embedding, so the model reconciles
+        the two sources *once* here - instead of once per line, where each line is
+        free to pick a different winner.
+
+        One pass is not neutral between them. The accent clip arrives as a full
+        in-context example - its speech codes and its transcript - while the donor is
+        a single embedding token, so the model reproduces the accent voice far more
+        faithfully than the speaker's own. ``iters > 1`` re-encodes the previous
+        blend and re-injects the donor's embedding, walking the voice back toward the
+        speaker while the accent transcript keeps pronunciation anchored. Iteration
+        stops as soon as the donor ``ratio`` is reached, and the *best* pass is kept
+        rather than the last, because passes are stochastic and need not improve
+        monotonically.
+
+        Args:
+            takes: Candidates rendered in the first pass; the best one is kept.
+            iters: Maximum passes.
+            ratio: Donor ratio to stop at; ``0`` runs every pass without measuring.
+
+        Raises:
+            TTSError: If a prompt cannot be built, or the model returns no audio.
+        """
+        count = max(1, int(takes))
+        planned = max(1, int(iters))
+        target = float(ratio)
+
+        # Where the speaker's own voice sits on the scale. Skipped when nothing
+        # would read it, since it costs a synthesis of its own.
+        donor_anchor: np.ndarray | None = None
+        if target > 0.0 or planned > 1:
+            donor_anchor = self._donor_anchor(
+                accent_text=accent_text,
+                language=language,
+                timbre=timbre,
+                timbre_audio=timbre_audio,
+            )
+
+        # Pass 0 reconciles the two sources for the first time. Its accent embedding
+        # is what every later pass is measured against, so it is captured now: each
+        # later pass overwrites it with the blend it is handed.
+        self.prepare_hybrid_prompt(
+            accent_audio=accent_audio,
+            accent_text=accent_text,
+            timbre=timbre,
+            timbre_audio=timbre_audio,
+        )
+        accent_embedding = _embedding_vector(self._accent_spk_embedding)
+        timbre_embedding = _embedding_vector(self._timbre_spk_embedding)
+
+        candidates = self._render(accent_text, language, count)
+        if not candidates:
+            raise TTSError("The model returned no audio for the blended reference.")
+
+        # Scoring is only paid for when it decides something: which take to keep, or
+        # how far along the scale the blend ended up.
+        measuring = count > 1 or target > 0.0 or planned > 1
+        pool = [
+            (
+                self._measure_pass(wav, timbre_embedding, accent_embedding, donor_anchor)
+                if measuring
+                else _BlendPass(wav, float("nan"), float("nan"), float("nan"))
+            )
+            for wav in candidates
+        ]
+        margins = [item.margin for item in pool]
+        first = 0
+        if any(np.isfinite(value) for value in margins):
+            # Ties keep the earliest take, so a rerun is reproducible.
+            first = int(np.nanargmax(margins))
+        made = [pool[first]]
+        for _pass in range(1, planned):
+            if (
+                target > 0.0
+                and np.isfinite(made[-1].donor_ratio)
+                and made[-1].donor_ratio >= target
+            ):
+                break
+            # Codes come from the previous blend, the embedding from the donor: the
+            # pull back toward the speaker, applied once more.
+            self.prepare_hybrid_prompt(
+                accent_audio=(made[-1].samples, self.sample_rate),
+                accent_text=accent_text,
+                timbre=timbre,
+                timbre_audio=timbre_audio,
+            )
+            rendered = self._render(accent_text, language, 1)
+            if not rendered:
+                break
+            made.append(
+                self._measure_pass(
+                    rendered[0], timbre_embedding, accent_embedding, donor_anchor
+                )
+            )
+
+        for number, item in enumerate(made):
+            _LOGGER.debug(
+                "Blend pass %d/%d: accent %s, timbre %s, donor ratio %s",
+                number + 1,
+                len(made),
+                _format_similarity(item.accent_similarity),
+                _format_similarity(item.timbre_similarity),
+                _format_similarity(item.donor_ratio),
+            )
+
+        best = self._best_pass(made)
+        kept = made[best]
+        margin = kept.margin
+        if target > 0.0 and np.isfinite(kept.donor_ratio) and kept.donor_ratio < target:
+            _LOGGER.warning(
+                "The blend reached a donor ratio of only %s after %d pass(es), short "
+                "of the %.2f target. The dub is still built from it; raise "
+                "--blend-iters to pull further toward the speaker's voice.",
+                _format_similarity(kept.donor_ratio),
+                len(made),
+                target,
+            )
+        _LOGGER.info(
+            "Blended reference: kept pass %d of %d (accent %s, donor ratio %s, "
+            "margin %s)",
+            best + 1,
+            len(made),
+            _format_similarity(kept.accent_similarity),
+            _format_similarity(kept.donor_ratio),
+            _format_similarity(margin),
+        )
+        return BlendedReference(
+            samples=kept.samples,
+            sample_rate=int(self.sample_rate),
+            text=accent_text,
+            takes=len(candidates),
+            iters=len(made),
+            donor_ratio=kept.donor_ratio,
+            margin=margin,
+            timbre_similarity=kept.timbre_similarity,
+            accent_similarity=kept.accent_similarity,
+        )
 
     # -- synthesis --------------------------------------------------------- #
 

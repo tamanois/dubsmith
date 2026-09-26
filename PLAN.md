@@ -21,7 +21,7 @@
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 400 passing | `tests/` |
+| Tests | ✅ 429 passing | `tests/` |
 
 Verification performed:
 
@@ -290,6 +290,191 @@ Deviations from the original plan (deliberate, documented):
 - **Cache fingerprint is per-job, not per-stage.** Changing the target language
   re-runs ASR too. Acceptable for a CLI; refine before P6.
 
+### P3b — Two-stage blended reference for `reference-accent` (IMPLEMENTED)
+
+**The problem, as heard.** In `reference-accent` the voice changes part-way
+through a video: some lines ship the source timbre with the borrowed accent,
+others come out as the accent clip's own voice. To a listener the same speaker
+sounds like two different people.
+
+**The mechanism.** A `reference-accent` prompt item carries two signals sourced
+from *different clips*: the accent clip's `ref_code` + `ref_text`, which is a
+complete in-context example of that speaker talking (`generate_icl_prompt`,
+`modeling_qwen3_tts.py:1972`, injected at `:2188`), and the donor's
+`ref_spk_embedding`, which is a single token (`:2103`). ICL conditioning is the
+strong signal; the embedding is a competing hint. Which one a given line follows
+is decided by sampling, and the shipped generation config samples
+(`do_sample: true`, `temperature 0.9`, `top_k 50`) with no seeding anywhere in the
+pipeline. Measured on the TED talk: segments 0 and 6 collapsed while 1–5 did not,
+all five in the **same** `generate_voice_clone` call with an identical prompt and
+a `batch_size` of 8. Batching is not the cause — items are left-padded behind a
+proper `talker_attention_mask` (`:2241`), so they are independent decodes. The
+aggregate timbre figure (0.9854) hid this completely: a handful of collapsed lines
+is exactly what an average cannot show.
+
+**A second, independent source of flips.** `_refine_overlong` re-synthesises every
+overlong line with a fresh `engine.synthesize(...)` call — a new random draw — and
+adopts the result **only if it is shorter** (`if new_overflow >= overflow - 1e-3:
+continue`). Nothing checked that the re-roll kept the timbre, so a good first take
+could be silently replaced by a collapsed one. In the reference job, ids 30, 36,
+37 and 38 were re-rolled this way.
+
+**The fix: reconcile the two signals once, as audio.** Stage 1 renders the accent
+clip's transcript through the hybrid prompt (accent codes + donor embedding) and
+writes the result to `reference_blend.wav`. Stage 2 clones every line from that
+clip, so `ref_code` and `ref_spk_embedding` are both derived from it — they cannot
+disagree, and there is nothing left for a line to decide. This is structurally
+different from policing the output: it removes the conflict rather than
+re-rolling until the conflict resolves favourably.
+
+Because this single clip fixes the voice of the whole video, a collapse here would
+be *global* rather than local, so stage 1 is sampled several times
+(`--blend-takes`, default 3) and the take kept is the one with the best margin —
+`cos(take, donor) − cos(take, accent)` — using the checkpoint's own speaker encoder
+(`extract_speaker_embedding`, 24 kHz). A margin that is still negative after
+scoring is recorded in the report. That margin is a **ranking** score only: it
+orders takes against each other, and every take reads the same text, so any
+language penalty cancels. Its absolute value is not comparable across clip pairs
+and is deliberately not warned on — see the measurement below, where a good take
+scored −0.011. `--accent-blend single-stage` reproduces the previous behaviour
+exactly, which is what makes an A/B listen on one video possible without a branch
+checkout.
+
+**Costs and properties.** One extra generation (~15 s of audio, a few seconds of
+wall clock against a ~68 s synthesis stage). The blend is a cached stage, so a
+rerun reuses the clip instead of quietly selecting a different voice — previously
+nothing pinned the voice between runs at all. Adding config fields changes the job
+fingerprint, so the first run after this re-does every stage once.
+
+**Touched:** `TTSEngine.build_blended_reference` / `speaker_embedding` /
+`_cosine` / `BlendedReference` (`pipeline/tts.py`), `Pipeline._stage_blend` and the
+extracted `_resolve_donor` (`pipeline/orchestrate.py`), `accent_blend` /
+`blend_takes` + `--accent-blend` / `--blend-takes` (`pipeline/config.py`,
+`dub.py`). Artifacts: `04_dubbed/reference_blend.wav`, `04_dubbed/blend.json`,
+`report.json → donor.blend`.
+
+**Status: implemented, unit-tested, and measured on a real run.** The suite (429
+tests) covers take selection (best margin, ties, degenerate embeddings, encoder
+absent), prompt construction, the cached-reuse path, the single-stage escape
+hatch, the config guards and the orphaned-clip cleanup.
+
+Measured on the 4:47 TED talk, English → French, `reference-accent`, using the
+repo's real accent clip. Stage 1 cost 16.4 s of a 168 s run and produced a 12.7 s
+clip; a rerun serves it from cache. The auto-selected donor came out as the same
+segment (19, 99.47–107.57 s) as the pre-existing baseline, so both runs could be
+compared against the same reference voice.
+
+The decisive measurement is **language-matched**: each dubbed line (French) scored
+against the blend clip R (French, donor timbre) and the accent clip (French,
+accent speaker). Comparing a French line to the *English* donor would fold a
+language penalty into a speaker measurement — see the lesson below. Two anchors
+bound the scale: a pure accent-speaker utterance scores −0.0230 and R itself
++0.0228.
+
+| Run | Lines | min | median | max | Lines closer to the accent speaker |
+|---|---|---|---|---|---|
+| single-stage (baseline) | 55 | −0.0049 | +0.0156 | +0.0301 | **5 (9.1%)** |
+| two-stage (default) | 59 | **+0.0176** | **+0.0257** | +0.0310 | **0** |
+
+The two-stage run has no line on the accent side of the scale, and its whole
+distribution sits in a tight band far from the collapse anchor, where the baseline
+had a tail crossing zero. Caveats: this is *not* a controlled A/B — ASR
+re-segmented 55 → 59 lines and the baseline folder came from a separate
+"transcript fix" run — and R is itself an intermediate voice (0.968 to the
+speaker's English utterances, 0.974 to the accent clip), so absolute margins are
+not "fraction of speaker A". The sign of the change and the absence of a tail are
+the evidence, not the exact figures.
+
+**Engineering lesson: an absolute threshold needs a language-matched reference.**
+The take-selection score is `cos(take, donor) − cos(take, accent)`. That is sound
+for *ranking* takes, because every take reads the same text and so carries the
+same language penalty. Its absolute value is not comparable across clip pairs. The
+first cut of this change warned whenever the winning margin was ≤ 0, and it duly
+fired on a perfectly good run (best margin −0.011). A control run on the real
+clips showed why: the encoder's same-speaker band is 0.9889 (different utterances)
+against a different-speaker floor of 0.9542, a separation of only 0.035 — so a
+−0.011 margin is measurement noise next to the language difference, not evidence
+of a collapsed voice. The warning was removed and the field documented as a ranking
+score. Any future threshold here should be self-calibrating (compare a take to the
+accent clip's own internal same-speaker similarity) rather than a constant.
+
+**Pre-existing bug found while auditing.** `04_dubbed/` was never cleaned up, so
+clips orphaned by an earlier, differently-split run stayed in the folder — the
+audit found 73 files where the run had produced 59. They were never mixed into the
+output (the mix walks the transcript, not the directory), but they mislead anything
+that inspects the folder, including a per-line audit. `_stage_synthesize` now
+deletes anything it did not write.
+
+**Shipped with this change:** `audit_timbre.py`, the language-matched per-line
+audit described above (plus the encoder control it was calibrated against, as a
+one-off). Nothing in the repo could previously answer "did the voice change?"
+except a listener.
+
+**Supersedes earlier work.** A best-of-K reranker over all 55 lines (engine
+parameter `voice_takes`) was written and then deleted. It spent its sampling
+budget re-rolling every line to find one that happened not to flip; the two-stage
+path spends it on the single line that decides the voice of the whole video, which
+is both cheaper and a fix rather than a filter. Its `_refine_overlong` timbre
+guard is likewise unnecessary now: with a single agreeing reference there is no
+timbre to lose on a re-roll.
+
+### P3c — Blend strength: iterating Stage 1 back toward the speaker (IMPLEMENTED)
+
+**What the two-stage fix left behind.** Removing the per-line flip exposed a
+simpler and more audible imbalance: the borrowed accent dominated. Measured on
+`dsuzu`, the stage-1 clip sat at 0.985 against the accent clip and 0.960 against
+the donor, while the accent speaker's own same-speaker band is 0.989 — so the clip
+the whole video was cloned from *was*, as far as the speaker encoder could tell,
+the accent speaker. Stage 2 then reproduced that faithfully on every line, which is
+the "the speaker's voice is barely there" the user reported.
+
+**Why a single pass is biased.** The hybrid prompt is asymmetric by construction:
+the accent clip contributes a full in-context example — its speech codes (~165
+steps for a 14 s clip) *plus* its transcript — while the donor contributes one
+embedding token. The model reproduces the voice it was shown and treats the
+embedding as a nudge. `--blend-takes` cannot compensate: every take leans the same
+way, because the bias is in the prompt rather than in the sampling.
+
+**The fix: iterate, and stop on a measured target.** Each pass re-reads the
+previous clip's codes and re-injects the donor's embedding, so the voice walks back
+toward the speaker while the unchanged accent transcript keeps pronunciation
+anchored. The stop condition needed the language-matched scale the earlier audit
+had already shown to be missing — the donor clip speaks the *source* language, so
+any similarity to it folds in a language penalty. The scale is therefore built from
+two target-language clips: the accent clip at 0, and at 1 the donor's own voice,
+rendered once in x-vector mode (no accent codes) from the accent transcript. The
+blend is projected onto that line to give `donor_ratio`.
+
+Defaults are `--blend-ratio 0.5` (at least half-way to the speaker) and
+`--blend-iters 4` (cap). The *best* pass is kept rather than the last, since passes
+are stochastic. `--blend-iters 1` restores single-pass behaviour, and the anchor
+probe is skipped entirely when nothing would read it.
+
+**Verified on `dsuzu`.** One extra pass — 2 of a possible 4, stopping as soon as
+the target was cleared — moved the blend off the accent speaker and onto the
+speaker's own voice:
+
+| | single pass | 2 passes |
+|---|---|---|
+| similarity to donor | 0.960 | **0.989** |
+| similarity to accent clip | 0.985 | 0.959 |
+| `donor_ratio` | ~0.0 | **0.95** |
+
+At 0.989 the French blend sits inside the donor's own same-speaker band (0.989,
+English, a different utterance) and outside the accent clip's. Per line, all three
+clips of that job scored 0.037–0.043 on the audit's ±0.041 scale — at the reference
+end, none closer to the accent voice. Confirmed by ear.
+
+**Cost.** On a 19 s clip the blend stage dominates (46 s against 5.5 s of
+synthesis); on a multi-minute video the reverse holds, and each extra pass is one
+more synthesis of the accent transcript (~5 s here).
+
+**Knobs, plainly.** `--blend-iters` bounds the work, `--blend-ratio` decides when
+to stop, and whichever binds first wins. `--blend-ratio 0` runs every pass blind
+and keeps the least accent-like one — the escape hatch for tuning by hand.
+`report.json` → `donor.blend` carries `iters`, `target_ratio` and `donor_ratio`,
+and a run that misses the target logs which way to turn the knob.
+
 ---
 
 ## 1. Vision (from AGENTS.md)
@@ -317,6 +502,7 @@ voice timbre**, ideally with the **target language's accent**.
 | D7 | Translation engine | OpenAI-compatible client → local `llama-server` or cloud | Satisfies D-AGENTS requirement, swappable by config |
 | D8 | TTS | Qwen3-TTS Base (`generate_voice_clone`) | Already proven working in this repo |
 | D9 | Accent default | `preserve` (clone source speaker directly) | Matches D1; `native` mode comes in P2 |
+| D10 | `reference-accent` prompt | **Two-stage** by default: reconcile accent + timbre into one clip, then clone from it | Conditioning each line on two disagreeing sources lets sampling pick the winner per line, which is heard as the speaker changing mid-video. Kept `--accent-blend single-stage` as a documented escape hatch for A/B |
 
 ---
 

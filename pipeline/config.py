@@ -326,6 +326,23 @@ class JobConfig(BaseModel):
     accent_audio: Path | None = None
     #: Exact transcript of ``accent_audio`` (required: it aligns the speech codes).
     accent_text: str | None = None
+    #: How ``reference-accent`` builds the voice it clones. ``None`` means the
+    #: default. See :attr:`accent_blend_mode`.
+    accent_blend: str | None = None
+    #: Takes rendered for the one-off blended reference (default 3). The blend
+    #: fixes the voice of *every* line, so it is worth sampling more than once and
+    #: keeping the take that kept the donor's timbre. Ignored unless
+    #: ``accent_mode`` is ``reference-accent``.
+    blend_takes: int | None = None
+    #: Passes used to build the blended reference (default 4). Each pass re-encodes
+    #: the previous blend and re-injects the speaker's embedding, walking the voice
+    #: back toward the source speaker while the accent transcript keeps
+    #: pronunciation anchored. ``1`` reproduces the single-pass behaviour.
+    blend_iters: int | None = None
+    #: How far toward the speaker's own voice the blend should reach, from ``0.0``
+    #: (the accent clip's voice) to ``1.0`` (a French utterance in the speaker's own
+    #: voice). Iteration stops as soon as it is met; ``0`` disables the search.
+    blend_ratio: float | None = None
 
     keep_subtitles: bool = True
     force: bool = False
@@ -358,6 +375,57 @@ class JobConfig(BaseModel):
                 f"Unknown accent mode {value!r}. Use: preserve, speaker-only or "
                 "reference-accent"
             ) from None
+
+    @field_validator("accent_blend")
+    @classmethod
+    def _check_accent_blend(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "two-stage": "two-stage",
+            "two": "two-stage",
+            "blend": "two-stage",
+            "single-stage": "single-stage",
+            "single": "single-stage",
+            "direct": "single-stage",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown accent blend {value!r}. Use: two-stage or single-stage"
+            ) from None
+
+    @field_validator("blend_takes")
+    @classmethod
+    def _check_blend_takes(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        count = int(value)
+        if count < 1:
+            raise ConfigError("--blend-takes must be at least 1")
+        return count
+
+    @field_validator("blend_iters")
+    @classmethod
+    def _check_blend_iters(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        count = int(value)
+        if count < 1:
+            raise ConfigError("--blend-iters must be at least 1")
+        return count
+
+    @field_validator("blend_ratio")
+    @classmethod
+    def _check_blend_ratio(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        ratio = float(value)
+        if not 0.0 <= ratio <= 1.0:
+            raise ConfigError("--blend-ratio must be between 0 and 1")
+        return ratio
 
     @field_validator("length_budget")
     @classmethod
@@ -434,7 +502,50 @@ class JobConfig(BaseModel):
                 "--accent-audio only applies to --accent-mode reference-accent; add "
                 "that flag or drop --accent-audio."
             )
+
+        # The blend knobs only mean anything in reference-accent mode, and a
+        # silently ignored knob is worse than a rejected one. `model_fields_set`
+        # distinguishes "left at its default" from "the user asked for this".
+        if self.accent_mode != "reference-accent":
+            for field_name, flag in (
+                ("accent_blend", "--accent-blend"),
+                ("blend_takes", "--blend-takes"),
+                ("blend_iters", "--blend-iters"),
+                ("blend_ratio", "--blend-ratio"),
+            ):
+                if field_name in self.model_fields_set:
+                    raise ConfigError(
+                        f"{flag} only applies to --accent-mode reference-accent; add "
+                        f"that flag or drop {flag}."
+                    )
         return self
+
+    @property
+    def accent_blend_mode(self) -> str:
+        """Resolved blend strategy: ``two-stage`` unless the user opted out.
+
+        ``two-stage`` renders the accent transcript once in the donor's voice and
+        clones every line from that clip, so the codes and the speaker embedding
+        always describe the same speaker. ``single-stage`` conditions each line on
+        the accent codes and the donor embedding simultaneously, which leaves a
+        line free to follow either signal.
+        """
+        return self.accent_blend or "two-stage"
+
+    @property
+    def resolved_blend_takes(self) -> int:
+        """Takes rendered for the one-off blend (default 3)."""
+        return self.blend_takes if self.blend_takes is not None else 3
+
+    @property
+    def resolved_blend_iters(self) -> int:
+        """Passes used to build the blend before giving up on the target (default 4)."""
+        return self.blend_iters if self.blend_iters is not None else 4
+
+    @property
+    def resolved_blend_ratio(self) -> float:
+        """Donor ratio that ends iteration early (default 0.5, ``0`` disables)."""
+        return self.blend_ratio if self.blend_ratio is not None else 0.5
 
     @property
     def input_path(self) -> Path:

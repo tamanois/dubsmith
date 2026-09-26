@@ -315,6 +315,16 @@ prosody ride in the reference *speech codes*, while vocal identity rides in the
 control over delivery, so pacing drifts with the model. `reference-accent` costs
 you one clip and its transcript, and buys a delivery you can actually choose.
 
+`reference-accent` asks the model to satisfy two signals at once: the accent
+clip's speech codes and the speaker's own embedding. Those describe different
+people, and any single line is free to follow either one — heard as the speaker
+changing mid-video. So by default the mode **builds the blend once**
+(`--accent-blend two-stage`): the accent transcript is rendered in the speaker's
+voice, the take that kept their timbre is kept, and every line is then cloned from
+that one clip. Its codes and its embedding come from the same audio, so there is
+nothing left to disagree. `--accent-blend single-stage` restores conditioning each
+line on both sources directly, which is useful for an A/B listen.
+
 ### Borrow a native accent without losing the voice
 
 Hand over a recording of a native speaker. A news or podcast segment works
@@ -334,6 +344,59 @@ transcript of `--accent-audio` — it is what aligns the codes being borrowed.
 `--ref-audio` is optional: leave it out and the timbre is auto-selected from the
 video, exactly as in the other modes. Keep the accent clip short; 10–20 seconds
 is plenty, and a longer clip mostly costs synthesis time.
+
+Before dubbing anything, the mode renders your accent transcript in the speaker's
+own voice and writes the result to `reference_blend.wav` inside the job folder.
+That clip is what every line is then cloned from.
+
+Building that clip is not neutral between the two voices. The accent clip arrives
+as a complete example — its speech codes *and* its transcript — while the speaker
+contributes a single embedding, so a single pass tends to come out closer to the
+accent clip than to the speaker. The mode therefore repeats it: each pass re-reads
+the previous clip and re-injects the speaker's embedding, walking the voice back
+toward the speaker while the accent transcript keeps pronunciation anchored. It
+stops as soon as `--blend-ratio` is reached (default `0.5`, meaning at least
+half-way from the accent voice to the speaker's own) or after `--blend-iters`
+passes (default 4), whichever comes first, and keeps the best pass rather than the
+last one. `--blend-takes` (default 3) additionally renders several candidates in
+the first pass and keeps the one closest to the speaker. The clip is cached with
+the rest of the job, so a rerun reuses it instead of quietly reselecting a
+different voice.
+
+How far the blend got is measured rather than guessed. `report.json` →
+`donor.blend` reports `donor_ratio`: `0` is the accent clip's voice, `1` is a
+French utterance in the speaker's own voice. Both ends of that scale are in the
+target language, which is what makes it meaningful — a raw similarity against the
+*source-language* donor would measure the language gap as much as the voice. If a
+run stops short of the target, the log says so: raise `--blend-iters`, or lower
+`--blend-ratio` if you would rather keep more of the accent. The `margin` field is
+a different thing — a ranking score for choosing between takes, not a verdict,
+since its absolute value is not comparable across clip pairs.
+
+The quickest check on a run is still to listen to `reference_blend.wav` on its own:
+twelve seconds of the speaker explaining something in the target language answers
+"whose voice is this?" directly.
+
+#### Choosing the blend strength
+
+`--blend-ratio` is the knob you will actually turn; `--blend-iters` is the safety
+limit. Start from the defaults (`0.5`, `4`) and move in one direction at a time,
+judging by the log's `donor ratio` line and the `reference_blend.wav` clip:
+
+| You want | Do |
+|---|---|
+| The default: a balance that keeps the speaker clearly | leave both as-is (`--blend-ratio 0.5 --blend-iters 4`) |
+| The speaker's voice stronger — the accent clip is leaking through | raise `--blend-ratio` (e.g. `0.8`) so it stops closer to the speaker |
+| The speaker to dominate, accent as a hint only | `--blend-ratio 0.9 --blend-iters 6` |
+| More of the borrowed accent, a bit of the speaker | lower `--blend-ratio` (e.g. `0.3`) |
+| The exact previous single-pass behaviour | `--blend-iters 1` |
+| Tune by hand rather than by the measured ratio | `--blend-ratio 0 --blend-iters N` — every pass runs and the least accent-like one is kept |
+
+If the log says the run *stopped short of the target* (the ratio line came in
+under `--blend-ratio`), raise `--blend-iters` or lower `--blend-ratio`. A ratio
+above the target means the search succeeded and stopped early; raising
+`--blend-ratio` would push further toward the speaker, at the cost of one extra
+synthesis of the accent transcript per pass.
 
 Measured on this repo's TED talk, same French lines and same donor, so the three
 rows are directly comparable:
@@ -407,6 +470,10 @@ numbers or names by hand.
 | `--accent-mode MODE` | `preserve` | Where pronunciation comes from: `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip). |
 | `--accent-audio PATH` | – | Native target-language clip to borrow pronunciation from. Requires `--accent-mode reference-accent`. |
 | `--accent-text TEXT` | – | Exact transcript of `--accent-audio`. Required with it. |
+| `--accent-blend MODE` | `two-stage` | `two-stage` renders the accent transcript once in the speaker's voice and clones every line from that clip, so its codes and its embedding cannot disagree. `single-stage` conditions each line on both sources directly. |
+| `--blend-takes N` | `3` | How many times the one-off blend is rendered before keeping the take closest to the speaker. Only that clip is sampled this way, not the lines. |
+| `--blend-iters N` | `4` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](#choosing-the-blend-strength). |
+| `--blend-ratio T` | `0.5` | How far toward the speaker's own voice the blend should reach, from `0` (the accent clip's voice) to `1` (a French utterance in the speaker's voice). Iteration stops there. `0` disables the search. See [Choosing the blend strength](#choosing-the-blend-strength). |
 
 **Audio bed and loudness**
 
@@ -531,6 +598,9 @@ output/talk/
 ├── 03b_spoken.json      # lines the length repair re-wrote (only those)
 ├── 03c_refine.json      # what the length repair achieved
 ├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
+│   ├── donor.json       # which voice was cloned, and from what
+│   ├── reference_blend.wav   # only in reference-accent: the clip every line is cloned from
+│   └── blend.json       # only in reference-accent: how that clip was chosen
 ├── 05_mix.wav           # assembled dub track, before normalisation
 ├── timing.json          # per-segment stretch ratio, placement and deficit
 ├── dub.wav              # final loudness-normalised dub audio
@@ -560,6 +630,7 @@ output/talk/
 | `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
 | `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
 | `donor.accent` | Present only in `reference-accent` mode: the accent clip's path and whether a transcript was supplied |
+| `donor.blend` | Present only in `reference-accent` mode: the strategy used, the passes and takes considered, and how the kept clip scored. `donor_ratio` places it between the accent voice (`0`) and the speaker's own voice (`1`) — the field to watch, and the one to raise `--blend-iters` for. `margin` only ranks takes against each other; a negative value is not by itself evidence of a problem |
 | `clamped_segments` | Lines that hit a stretch limit (either direction) |
 | `clamped_long_segments` | …of which were too long to compress into their slot |
 | `clamped_short_segments` | …of which were too short to slow down enough to fill it |
@@ -665,7 +736,7 @@ python -m pytest
 ```
 
 ```
-400 passed
+448 passed
 ```
 
 Run a single area while iterating:
@@ -675,6 +746,35 @@ python -m pytest tests/test_tts.py -q          # voice cloning, accent modes
 python -m pytest tests/test_pipeline.py -q     # end-to-end orchestration
 python -m pytest -k accent -q                  # everything accent-related
 ```
+
+### Auditing a dub's voice, line by line
+
+`audit_timbre.py` measures whether each synthesised line kept the speaker's
+timbre, using the checkpoint's own speaker encoder. It needs a GPU and the base
+checkpoint, because it loads the same model the pipeline does:
+
+```bash
+python audit_timbre.py "output/<input-stem>"
+```
+
+It reports, per line, `cos(line, reference) − cos(line, accent)` where both
+references are in the **target language** (the blend clip and the accent clip).
+Matching the language is the point: comparing a French line against an English
+donor mixes a language difference into a speaker measurement and makes every line
+look like a collapse. Two anchors give the number a scale — a pure accent-voice
+utterance scores about −0.023, and the reference against itself about +0.023 — so
+"closer to the accent voice" is a measured position, not a threshold.
+
+Measured on this repo's TED talk, with the same donor and accent clip:
+
+| Run | Lines | min margin | median | Closer to the accent voice |
+|---|---|---|---|---|
+| `--accent-blend single-stage` | 55 | −0.0049 | +0.0156 | 5 (9.1%) |
+| `two-stage` (default) | 59 | **+0.0176** | **+0.0257** | **0** |
+
+Read it as a smoke test rather than a controlled experiment: ASR re-segmented the
+two runs differently, so the text differs. Pass `--reference` and `--accent`
+explicitly to measure a single-stage job against another job's blend clip.
 
 ---
 
@@ -707,6 +807,13 @@ python -m pytest -k accent -q                  # everything accent-related
 | Music fights the voice | Raise `--duck-db` (default 6 dB) |
 | Dub still has the speaker's accent | Try `--accent-mode speaker-only`, which keeps the timbre but drops the donor's phonetics. If that is not enough, use `--accent-mode reference-accent` with a native clip |
 | Still sounds foreign in `reference-accent` mode | Check `--accent-text` matches the clip word for word — mismatched text misaligns the borrowed codes. A longer, more natural accent clip also helps |
+| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — every line is cloned from the one `reference_blend.wav` clip, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](#auditing-a-dubs-voice-line-by-line) |
+| The borrowed accent dominates — the speaker's own voice is barely there | The blend was built too close to the accent clip. Check `report.json` → `donor.blend.donor_ratio`: below `0.5` means it never got half-way to the speaker. Raise `--blend-iters`, or lower `--blend-ratio` if you want more of the accent |
+| The blend reached a donor ratio of only … | Informational: the target was not met within `--blend-iters` passes, and the best pass was used anyway. Raise `--blend-iters` or lower `--blend-ratio` |
+| `--accent-blend only applies to --accent-mode reference-accent` | Add that flag, or drop `--accent-blend` |
+| `--blend-takes only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-takes` |
+| `--blend-iters only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-iters` |
+| `--blend-ratio only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-ratio` |
 | The dub is rushed, or words are missing | The reference clip's pacing is being imitated, and a slow reference lengthens every line. Use a faster-paced reference — see [Reference pacing](#reference-pacing) |
 
 Logs are written to stderr and include a job id. Set `LOG_JSON=1` for

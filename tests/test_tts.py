@@ -13,8 +13,10 @@ import pytest
 from pipeline.asr import Segment
 from pipeline.errors import TTSError
 from pipeline.tts import (
+    BlendedReference,
     DonorClip,
     TTSEngine,
+    _donor_ratio,
     resolve_dtype,
     score_candidate,
     select_donor,
@@ -409,6 +411,382 @@ class TestHybridPrompt:
             DonorClip(samples=audio(3.0), sample_rate=SR, text='hi', start=0, end=3, segment_id=0)
         )
         assert from_donor._prompt == 'prompt-token'
+
+
+class ScoringQwenModel(FakeQwenModel):
+    '''Hybrid model with real embedding vectors and a scoreable speaker encoder.
+
+    ``take_embeddings`` supplies the embedding the encoder reports for each take,
+    in order, so a test can state exactly which take sounds like the donor and
+    which one collapsed onto the accent clip.
+    '''
+
+    def __init__(self, take_embeddings: list[list[float]], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.take_embeddings = [
+            np.asarray(vector, dtype=np.float64) for vector in take_embeddings
+        ]
+        self._next_take = 0
+        self._produced = 0
+        #: Indices of the takes the encoder was asked about, in order.
+        self.embedded: list[int] = []
+        self.model = SimpleNamespace(
+            tts_model_type='base',
+            extract_speaker_embedding=self._extract,
+        )
+
+    def _extract(self, audio: Any, sr: int) -> np.ndarray:
+        index = self._next_take % max(1, len(self.take_embeddings))
+        self._next_take += 1
+        self.embedded.append(index)
+        return self.take_embeddings[index]
+
+    def create_voice_clone_prompt(self, **kwargs: Any) -> list[FakePromptItem]:
+        self.prompts.append(kwargs)
+        # Orthogonal directions, so a take's margin against one source says
+        # nothing about the other and the score is unambiguous.
+        accent_side = not kwargs['x_vector_only_mode']
+        vector = np.asarray([1.0, 0.0]) if accent_side else np.asarray([0.0, 1.0])
+        return [
+            FakePromptItem(
+                ref_code=f'code:{kwargs["ref_audio"]}',
+                ref_spk_embedding=vector,
+                x_vector_only_mode=kwargs['x_vector_only_mode'],
+                icl_mode=not kwargs['x_vector_only_mode'],
+                ref_text=kwargs['ref_text'],
+            )
+        ]
+
+    def generate_voice_clone(self, **kwargs: Any) -> tuple[list[np.ndarray], int]:
+        self.calls.append(kwargs)
+        wavs = []
+        for _ in kwargs['text']:
+            # The first sample records which take this is, which makes the take
+            # that was finally kept identifiable in the result.
+            block = np.zeros(16, dtype=np.float32)
+            block[0] = float(self._produced)
+            self._produced += 1
+            wavs.append(block)
+        return wavs, self.sample_rate
+
+
+def build_blend(engine: TTSEngine, **kwargs: Any) -> Any:
+    '''Build a blended reference with the two sources wired up.'''
+    return engine.build_blended_reference(
+        accent_audio='accent.wav',
+        accent_text='bonjour',
+        language='French',
+        timbre_audio='donor.wav',
+        **kwargs,
+    )
+
+
+class TestBlendedReference:
+    '''Stage 1: one clip whose speech codes and speaker embedding agree.'''
+
+    #: Mostly the accent clip's direction - the collapse this stage guards against.
+    COLLAPSED = [0.9, 0.1]
+    #: Mostly the donor's direction - the blend that is wanted.
+    KEPT = [0.1, 0.9]
+    #: Exactly between the two, so the margin is zero.
+    MIDDLE = [0.5, 0.5]
+
+    def scorer(self, take_embeddings: list[list[float]]) -> tuple[TTSEngine, ScoringQwenModel]:
+        model = ScoringQwenModel(take_embeddings)
+        return engine_with(model), model  # type: ignore[arg-type]
+
+    def test_keeps_the_take_that_sounds_most_like_the_donor(self) -> None:
+        engine, model = self.scorer([self.COLLAPSED, self.KEPT, self.MIDDLE])
+        result = build_blend(engine, takes=3)
+
+        assert result.takes == 3
+        assert model.embedded == [0, 1, 2]  # every take was scored
+        assert result.samples[0] == pytest.approx(1.0)  # take 1 was kept
+        assert result.timbre_similarity == pytest.approx(0.9939, abs=0.001)
+        assert result.accent_similarity == pytest.approx(0.1104, abs=0.001)
+        assert result.margin == pytest.approx(0.8835, abs=0.001)
+
+    def test_a_single_take_is_not_scored(self) -> None:
+        '''One take is not a choice, so there is nothing to compare.'''
+        engine, model = self.scorer([self.KEPT])
+        result = build_blend(engine, takes=1)
+
+        assert result.takes == 1
+        assert model.embedded == []
+        assert np.isnan(result.margin)
+        assert result.samples[0] == pytest.approx(0.0)
+
+    def test_ties_keep_the_earliest_take(self) -> None:
+        engine, _ = self.scorer([self.MIDDLE, self.MIDDLE, self.MIDDLE])
+        result = build_blend(engine, takes=3)
+
+        assert result.samples[0] == pytest.approx(0.0)
+        assert result.margin == pytest.approx(0.0, abs=1e-9)
+
+    def test_degenerate_embeddings_fall_back_to_the_first_take(self) -> None:
+        '''A zero vector has no direction, so no take can be preferred.'''
+        engine, _ = self.scorer([[0.0, 0.0], [0.0, 0.0]])
+        result = build_blend(engine, takes=2)
+
+        assert result.samples[0] == pytest.approx(0.0)
+        assert np.isnan(result.margin)
+
+    def test_a_checkpoint_without_an_encoder_still_produces_a_blend(self) -> None:
+        '''Scoring is a preference; audio must still come out without it.'''
+        engine = engine_with(HybridQwenModel())  # type: ignore[arg-type]
+        result = build_blend(engine, takes=3)
+
+        assert result.takes == 3
+        assert np.isnan(result.margin)
+        assert result.samples.size > 0
+
+    def test_takes_below_one_render_a_single_candidate(self) -> None:
+        engine, model = self.scorer([self.KEPT])
+        result = build_blend(engine, takes=0)
+
+        assert result.takes == 1
+        assert model.calls[0]['text'] == ['bonjour']
+
+    def test_stage_one_uses_the_hybrid_prompt_in_the_target_language(self) -> None:
+        engine, model = self.scorer([self.KEPT, self.KEPT])
+        build_blend(engine, takes=2)
+
+        # Accent clip read in ICL mode, timbre clip in x-vector mode - the same
+        # hybrid prompt the single-stage path uses, just consumed once.
+        assert model.prompts[0]['ref_audio'] == 'accent.wav'
+        assert model.prompts[0]['x_vector_only_mode'] is False
+        assert model.prompts[1]['ref_audio'] == 'donor.wav'
+        assert model.prompts[1]['x_vector_only_mode'] is True
+        assert model.calls[0]['language'] == ['French', 'French']
+        assert model.calls[0]['text'] == ['bonjour', 'bonjour']
+
+    def test_requires_the_accent_transcript(self) -> None:
+        engine = engine_with(HybridQwenModel())  # type: ignore[arg-type]
+        with pytest.raises(TTSError, match='accent_text is required'):
+            engine.build_blended_reference(
+                accent_audio='accent.wav',
+                accent_text='   ',
+                language='French',
+                timbre_audio='donor.wav',
+            )
+
+    def test_silent_output_is_reported(self) -> None:
+        class SilentModel(HybridQwenModel):
+            def generate_voice_clone(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                return (
+                    [np.zeros(0, dtype=np.float32) for _ in kwargs['text']],
+                    self.sample_rate,
+                )
+
+        engine = engine_with(SilentModel())  # type: ignore[arg-type]
+        with pytest.raises(TTSError, match='no audio for the blended reference'):
+            build_blend(engine, takes=2)
+
+
+class BlendModel(FakeQwenModel):
+    '''Numeric embeddings, distinguishable audio, and a scripted speaker encoder.
+
+    The accent clip and the donor sit at opposite ends of the embedding space, so a
+    rendering's donor ratio is exactly its position between them. ``scripted`` gives
+    the encoder's answer for each call in order, which is how a test can state where
+    each rendering landed.
+    '''
+
+    ACCENT = np.asarray([1.0, 0.0])
+    DONOR = np.asarray([0.0, 1.0])
+    #: Handed to later passes' accent side, so scoring against the *current* clip
+    #: instead of the original accent clip would change the reported number.
+    DECOY = np.asarray([0.5, 0.5])
+
+    def __init__(self, scripted: list[list[float]]) -> None:
+        super().__init__()
+        self.scripted = [np.asarray(vector, dtype=np.float64) for vector in scripted]
+        #: Indices of ``scripted`` the encoder was asked for, in order.
+        self.embedded: list[int] = []
+        self.accent_prompts = 0
+        self._produced = 0
+        self._next = 0
+        self.model = SimpleNamespace(
+            tts_model_type='base', extract_speaker_embedding=self._extract
+        )
+
+    def _extract(self, audio: Any, sr: int) -> np.ndarray:
+        index = min(self._next, len(self.scripted) - 1)
+        self._next += 1
+        self.embedded.append(index)
+        return self.scripted[index]
+
+    def create_voice_clone_prompt(self, **kwargs: Any) -> list[FakePromptItem]:
+        self.prompts.append(kwargs)
+        if kwargs['x_vector_only_mode']:
+            vector = self.DONOR
+        else:
+            self.accent_prompts += 1
+            vector = self.ACCENT if self.accent_prompts == 1 else self.DECOY
+        return [
+            FakePromptItem(
+                ref_code=f'code:{kwargs["ref_audio"]}',
+                ref_spk_embedding=vector.copy(),
+                x_vector_only_mode=kwargs['x_vector_only_mode'],
+                icl_mode=not kwargs['x_vector_only_mode'],
+                ref_text=kwargs['ref_text'],
+            )
+        ]
+
+    def generate_voice_clone(self, **kwargs: Any) -> tuple[list[np.ndarray], int]:
+        self.calls.append(kwargs)
+        wavs = []
+        for _ in kwargs['text']:
+            # The first sample records which rendering this is, so the one that was
+            # kept can be identified in the result.
+            block = np.zeros(16, dtype=np.float32)
+            block[0] = float(self._produced)
+            self._produced += 1
+            wavs.append(block)
+        return wavs, self.sample_rate
+
+
+class TestDonorRatio:
+    '''The language-matched scale: 0 is the accent voice, 1 is the speaker's own.'''
+
+    ACCENT = np.asarray([1.0, 0.0])
+    DONOR = np.asarray([0.0, 1.0])
+
+    def ratio(self, candidate: list[float]) -> float:
+        return _donor_ratio(np.asarray(candidate, dtype=np.float64), self.ACCENT, self.DONOR)
+
+    def test_ends_and_middle(self) -> None:
+        assert self.ratio([1.0, 0.0]) == pytest.approx(0.0)
+        assert self.ratio([0.0, 1.0]) == pytest.approx(1.0)
+        assert self.ratio([0.5, 0.5]) == pytest.approx(0.5)
+
+    def test_linear_along_the_axis(self) -> None:
+        assert self.ratio([0.9, 0.1]) == pytest.approx(0.1)
+        assert self.ratio([0.4, 0.6]) == pytest.approx(0.6)
+
+    def test_positions_outside_the_ends_are_clamped(self) -> None:
+        assert self.ratio([2.0, -1.0]) == pytest.approx(0.0)
+        assert self.ratio([-1.0, 2.0]) == pytest.approx(1.0)
+
+    def test_missing_or_degenerate_anchors_are_unmeasurable(self) -> None:
+        candidate = np.asarray([0.5, 0.5], dtype=np.float64)
+        assert np.isnan(_donor_ratio(candidate, None, self.DONOR))
+        assert np.isnan(_donor_ratio(candidate, self.ACCENT, None))
+        # Both anchors the same voice leaves no direction to measure along.
+        assert np.isnan(_donor_ratio(candidate, self.ACCENT, self.ACCENT))
+        assert np.isnan(_donor_ratio(np.asarray([1.0, 0.0, 0.0]), self.ACCENT, self.DONOR))
+
+
+class TestBlendIteration:
+    '''One pass favours the accent clip, so later passes pull toward the speaker.'''
+
+    #: Ratio 0.1 - still practically the accent clip's voice.
+    ACCENTISH = [0.9, 0.1]
+    #: Ratio 0.6 - past the default 0.5 target.
+    SPEAKERISH = [0.4, 0.6]
+
+    def scorer(self, scripted: list[list[float]]) -> tuple[TTSEngine, BlendModel]:
+        model = BlendModel(scripted)
+        return engine_with(model), model  # type: ignore[arg-type]
+
+    def test_a_clean_pass_needs_no_further_iteration(self) -> None:
+        engine, model = self.scorer([BlendModel.DONOR.tolist(), self.SPEAKERISH])
+        result = build_blend(engine, iters=4, ratio=0.5)
+
+        assert result.iters == 1
+        assert result.donor_ratio == pytest.approx(0.6)
+        # One synthesis for the donor anchor, one for the single blend pass.
+        assert len(model.calls) == 2
+
+    def test_iteration_walks_toward_the_speaker_and_stops_at_the_target(self) -> None:
+        engine, model = self.scorer(
+            [BlendModel.DONOR.tolist(), self.ACCENTISH, self.SPEAKERISH]
+        )
+        result = build_blend(engine, iters=4, ratio=0.5)
+
+        # Pass 0 was still accent-like, pass 1 cleared the target, so pass 2 never ran.
+        assert result.iters == 2
+        assert result.donor_ratio == pytest.approx(0.6)
+        assert len(model.calls) == 3
+        # The kept clip is pass 1's rendering, whose first sample records its index.
+        assert result.samples[0] == pytest.approx(2.0)
+
+    def test_iteration_re_encodes_the_previous_pass(self) -> None:
+        engine, model = self.scorer(
+            [BlendModel.DONOR.tolist(), self.ACCENTISH, self.SPEAKERISH]
+        )
+        build_blend(engine, iters=2, ratio=0.5)
+
+        # The second pass reads its codes from the first clip, handed over as
+        # samples rather than a path: it never exists as a file.
+        from_samples = [p for p in model.prompts if isinstance(p['ref_audio'], tuple)]
+        assert len(from_samples) == 1
+        assert from_samples[0]['x_vector_only_mode'] is False  # the accent side
+        samples, rate = from_samples[0]['ref_audio']
+        assert samples[0] == pytest.approx(1.0)
+        assert rate == SR
+
+    def test_the_best_pass_wins_even_when_it_is_not_the_last(self) -> None:
+        '''Passes are stochastic, so running longer must not mean getting worse.'''
+        engine, model = self.scorer(
+            [
+                BlendModel.DONOR.tolist(),
+                [1.0, 0.0],   # pass 0: ratio 0.0
+                [0.1, 0.9],   # pass 1: ratio 0.9  <- the best
+                [0.6, 0.4],   # pass 2: ratio 0.4
+            ]
+        )
+        result = build_blend(engine, iters=3, ratio=0.0)
+
+        assert result.iters == 3  # nothing to stop at, so every pass ran
+        assert result.donor_ratio == pytest.approx(0.9)
+        assert result.samples[0] == pytest.approx(2.0)
+
+    def test_scoring_uses_the_original_accent_clip(self) -> None:
+        '''Later passes hand over a blend as the accent; it must not become the yardstick.'''
+        engine, _ = self.scorer(
+            [BlendModel.DONOR.tolist(), self.ACCENTISH, self.SPEAKERISH]
+        )
+        result = build_blend(engine, iters=2, ratio=0.5)
+
+        # Scoring is against the *original* accent embedding, so the accent
+        # similarity is the normalised cosine to it - not the ~0.98 the decoy that
+        # later passes carry would produce.
+        expected = float(np.dot([0.4, 0.6], [1.0, 0.0]) / np.linalg.norm([0.4, 0.6]))
+        assert result.accent_similarity == pytest.approx(expected)
+        assert result.accent_similarity < 0.7
+        assert result.donor_ratio == pytest.approx(0.6)
+
+    def test_the_anchor_probe_is_skipped_when_nothing_reads_it(self) -> None:
+        engine, model = self.scorer([BlendModel.DONOR.tolist()])
+        result = build_blend(engine, takes=1, iters=1, ratio=0.0)
+
+        # No anchor synthesis and no scoring: just the one blend rendering.
+        assert len(model.calls) == 1
+        assert model.embedded == []
+        assert np.isnan(result.donor_ratio)
+        assert result.iters == 1
+
+    def test_an_unmeasurable_ratio_still_produces_a_blend(self) -> None:
+        '''No speaker encoder means no ratio, not a failed job.'''
+        async_model = HybridQwenModel()  # string embeddings, no encoder at all
+        engine = engine_with(async_model)  # type: ignore[arg-type]
+        result = build_blend(engine, iters=2, ratio=0.5)
+
+        assert result.iters == 2
+        assert np.isnan(result.donor_ratio)
+        assert result.samples.size > 0
+
+    def test_iters_below_one_is_clamped(self) -> None:
+        engine, model = self.scorer([BlendModel.DONOR.tolist(), self.ACCENTISH])
+        result = build_blend(engine, iters=0, ratio=0.5)
+
+        # At most one pass - but the anchor is still measured, so a shortfall is
+        # reported instead of silently ignored.
+        assert result.iters == 1
+        assert len(model.calls) == 2
+        assert result.donor_ratio == pytest.approx(0.1)
 
 
 class TestResolveDtype:

@@ -22,6 +22,7 @@ from pipeline.errors import MediaError, TranslationError
 from pipeline.orchestrate import Pipeline
 from pipeline.timing import IdentityStretcher
 from pipeline.translate import ShortenRequest, TranslationRequest
+from pipeline.tts import BlendedReference
 
 SR = 48_000
 
@@ -100,14 +101,24 @@ class FakeTTSEngine:
         self.prompt_calls = 0
         self.synth_calls = 0
         self.hybrid: dict[str, Any] | None = None
+        #: Every prompt built, in order, so the two-stage sequence is assertable.
+        self.prompt_history: list[str] = []
+        self.file_prompt: tuple[Any, str] | None = None
+        self.blend_calls = 0
+        self.blend_takes: int | None = None
+        self.blend_iters: int | None = None
+        self.blend_target_ratio: float | None = None
 
     def prepare_prompt(self, donor: Any) -> None:
         self.prompt_kind = "donor"
         self.prompt_calls += 1
+        self.prompt_history.append("donor")
 
     def prepare_prompt_from_file(self, ref_audio: Path | str, ref_text: str) -> None:
         self.prompt_kind = "file"
         self.prompt_calls += 1
+        self.prompt_history.append("file")
+        self.file_prompt = (ref_audio, ref_text)
 
     def prepare_hybrid_prompt(
         self,
@@ -119,12 +130,48 @@ class FakeTTSEngine:
     ) -> None:
         self.prompt_kind = "hybrid"
         self.prompt_calls += 1
+        self.prompt_history.append("hybrid")
         self.hybrid = {
             "accent_audio": accent_audio,
             "accent_text": accent_text,
             "timbre": timbre,
             "timbre_audio": timbre_audio,
         }
+
+    def build_blended_reference(
+        self,
+        *,
+        accent_audio: Path | str,
+        accent_text: str,
+        language: str,
+        timbre: Any = None,
+        timbre_audio: Path | str | None = None,
+        takes: int = 1,
+        iters: int = 1,
+        ratio: float = 0.0,
+    ) -> BlendedReference:
+        """Stage 1: goes through the hybrid prompt, then returns one far-too-short clip."""
+        self.prepare_hybrid_prompt(
+            accent_audio=accent_audio,
+            accent_text=accent_text,
+            timbre=timbre,
+            timbre_audio=timbre_audio,
+        )
+        self.blend_calls += 1
+        self.blend_takes = takes
+        self.blend_iters = iters
+        self.blend_target_ratio = ratio
+        return BlendedReference(
+            samples=np.zeros(int(0.5 * self.sample_rate), dtype=np.float32),
+            sample_rate=self.sample_rate,
+            text=accent_text,
+            takes=takes,
+            iters=iters,
+            donor_ratio=0.8,
+            margin=0.25,
+            timbre_similarity=0.95,
+            accent_similarity=0.70,
+        )
 
     def synthesize(self, texts: Sequence[str], *, language: str) -> list[np.ndarray | None]:
         self.synth_calls += 1
@@ -326,19 +373,28 @@ class TestReferenceAccentMode:
         )
         return pipeline, tts, accent
 
-    def test_selects_the_hybrid_prompt_path(
+    def test_hybrid_prompt_is_stage_one_and_the_blend_is_the_final_reference(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
         pipeline, tts, accent = self.build(tmp_path, simple_transcript)
         pipeline.run()
 
-        assert tts.prompt_kind == "hybrid"
+        # Stage 1 builds the hybrid prompt; stage 2 clones from the clip it produced.
+        assert tts.prompt_history == ["hybrid", "file"]
         assert tts.hybrid is not None
         assert tts.hybrid["accent_audio"] == accent
         assert tts.hybrid["accent_text"] == "Bonjour, je suis Joel."
         # Timbre fell back to an auto-selected donor from the source speech.
         assert tts.hybrid["timbre"] is not None
         assert tts.hybrid["timbre_audio"] is None
+
+        assert tts.file_prompt is not None
+        blend_path, blend_text = tts.file_prompt
+        assert Path(blend_path).name == "reference_blend.wav"
+        assert Path(blend_path).is_file()
+        # The blend's transcript is the accent transcript, so codes and embedding
+        # are derived from the same audio.
+        assert blend_text == "Bonjour, je suis Joel."
 
     def test_explicit_reference_audio_becomes_the_timbre_source(
         self, tmp_path: Path, simple_transcript: Transcript
@@ -347,7 +403,7 @@ class TestReferenceAccentMode:
         pipeline, tts, _ = self.build(tmp_path, simple_transcript, ref_audio=ref)
         pipeline.run()
 
-        assert tts.prompt_kind == "hybrid"
+        assert tts.prompt_history == ["hybrid", "file"]
         assert tts.hybrid is not None
         # No donor selection happened, so no clip object, just the file path.
         assert tts.hybrid["timbre"] is None
@@ -384,6 +440,72 @@ class TestReferenceAccentMode:
         rerun_report = pipeline.run().report
 
         assert rerun_report["donor"]["accent"]["path"] == str(accent)
+        # The blend record is cached with the audio it describes, so it survives too.
+        assert rerun_report["donor"]["blend"]["takes"] == 3
+
+    def test_blend_is_rendered_once_and_reused_from_cache(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, tts, _ = self.build(tmp_path, simple_transcript)
+        pipeline.run()
+        blend = pipeline.job_dir / "04_dubbed" / "reference_blend.wav"
+        first = blend.read_bytes()
+
+        pipeline.run()  # every stage should now be served from the manifest
+
+        assert tts.blend_calls == 1
+        assert blend.read_bytes() == first
+
+    def test_blend_takes_are_forwarded_to_stage_one(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, tts, _ = self.build(tmp_path, simple_transcript, blend_takes=5)
+        pipeline.run()
+
+        assert tts.blend_takes == 5
+
+    def test_blend_metadata_is_recorded(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _ = self.build(tmp_path, simple_transcript)
+        report = pipeline.run().report
+
+        blend = report["donor"]["blend"]
+        assert blend["strategy"] == "two-stage"
+        assert blend["takes"] == 3  # the default
+        assert blend["iters"] == 4
+        assert blend["target_ratio"] == 0.5
+        assert blend["donor_ratio"] == 0.8
+        assert blend["timbre_similarity"] == 0.95
+        assert blend["accent_similarity"] == 0.70
+        assert blend["margin"] == 0.25
+
+    def test_iteration_knobs_reach_the_engine(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, tts, _ = self.build(
+            tmp_path, simple_transcript, blend_iters=2, blend_ratio=0.7
+        )
+        report = pipeline.run().report
+
+        assert tts.blend_iters == 2
+        assert tts.blend_target_ratio == 0.7
+        assert report["donor"]["blend"]["iters"] == 2
+        assert report["donor"]["blend"]["target_ratio"] == 0.7
+
+    def test_single_stage_conditions_every_line_on_both_sources(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, tts, _ = self.build(
+            tmp_path, simple_transcript, accent_blend="single-stage"
+        )
+        report = pipeline.run().report
+
+        # No blend clip at all: the hybrid prompt is the only prompt built.
+        assert tts.prompt_history == ["hybrid"]
+        assert tts.blend_calls == 0
+        assert not (pipeline.job_dir / "04_dubbed" / "reference_blend.wav").exists()
+        assert report["donor"]["blend"] == {"strategy": "single-stage"}
 
     def test_other_modes_keep_a_flat_donor_record(
         self, tmp_path: Path, simple_transcript: Transcript
@@ -432,6 +554,25 @@ class TestEdgeCases:
         )
         pipeline, _, _, _ = make_pipeline(tmp_path, transcript)
         assert pipeline.run().report["segment_count"] == 1
+
+
+class TestStaleSegmentClips:
+    """A rerun must not leave clips from an earlier, differently-split run."""
+
+    def test_orphaned_clips_are_removed(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        dub_dir = pipeline.job_dir / "04_dubbed"
+        dub_dir.mkdir(parents=True, exist_ok=True)
+        # As if a previous run had segmented the input into more lines.
+        orphan = dub_dir / "seg_0099.wav"
+        orphan.write_bytes(b"stale")
+
+        pipeline.run()
+
+        assert not orphan.exists()
+        assert (dub_dir / "seg_0000.wav").is_file()
 
 
 class TestCaching:

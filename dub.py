@@ -187,6 +187,53 @@ def build_dub_parser() -> argparse.ArgumentParser:
         help="Exact transcript of --accent-audio (required with it).",
     )
     parser.add_argument(
+        "--accent-blend",
+        dest="accent_blend",
+        default=None,
+        choices=["two-stage", "single-stage"],
+        help=(
+            "'two-stage' (default) renders the accent transcript once in the "
+            "speaker's own voice and clones every line from that clip, so the "
+            "speech codes and the speaker embedding always agree; 'single-stage' "
+            "conditions each line on both sources at once."
+        ),
+    )
+    parser.add_argument(
+        "--blend-takes",
+        dest="blend_takes",
+        type=int,
+        default=None,
+        help=(
+            "Takes rendered for the one-off blended reference, keeping the take "
+            "closest to the speaker's timbre and furthest from the accent clip. "
+            "Only the blend is sampled this way. (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--blend-iters",
+        dest="blend_iters",
+        type=int,
+        default=None,
+        help=(
+            "Passes used to build the one-off blended reference. Each pass "
+            "re-encodes the previous blend and re-injects the speaker's embedding, "
+            "pulling the voice back toward the speaker; it stops early once "
+            "--blend-ratio is reached. Raise it if the speaker still sounds too "
+            "faint. 1 keeps the single-pass behaviour. (default: 4)"
+        ),
+    )
+    parser.add_argument(
+        "--blend-ratio",
+        dest="blend_ratio",
+        type=float,
+        default=None,
+        help=(
+            "How far toward the speaker's own voice the blend should reach, from 0 "
+            "(the accent clip's voice) to 1 (a French utterance in the speaker's own "
+            "voice). Iteration stops there. 0 disables the search. (default: 0.5)"
+        ),
+    )
+    parser.add_argument(
         "--refine",
         dest="refine",
         action="store_true",
@@ -313,6 +360,10 @@ def cmd_dub(argv: Sequence[str]) -> int:
         accent_mode=args.accent_mode,
         accent_audio=args.accent_audio,
         accent_text=args.accent_text,
+        accent_blend=args.accent_blend,
+        blend_takes=args.blend_takes,
+        blend_iters=args.blend_iters,
+        blend_ratio=args.blend_ratio,
         refine=args.refine,
         refine_max_passes=args.refine_max_passes,
         refine_threshold=args.refine_threshold,
