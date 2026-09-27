@@ -28,6 +28,11 @@ from typing import Sequence
 from pipeline.config import SUPPORTED_LANGUAGES, JobConfig, Settings
 from pipeline.errors import DubbingError, ModelNotFoundError
 from pipeline.logging_utils import setup_logging
+from pipeline.mixing import (
+    DEFAULT_ROOM_DUCK_DB,
+    DEFAULT_ROOM_TONE_GAIN_DB,
+    DEFAULT_ROOM_WET_DB,
+)
 from pipeline.models import MVP_REQUIRED, REGISTRY, download_many, registry_status
 from pipeline.orchestrate import Pipeline
 
@@ -159,6 +164,60 @@ def build_dub_parser() -> argparse.ArgumentParser:
         type=float,
         default=6.0,
         help="How far to pull the background down while dialogue plays, in dB.",
+    )
+    parser.add_argument(
+        "--room",
+        default="off",
+        choices=["off", "match"],
+        help=(
+            "'match' places the dub in the source's own acoustic space: a reverb "
+            "tail, a continuous room-tone floor and a shallower duck, all derived "
+            "from the separated speech stem. 'off' (default) keeps the dry "
+            "voice-over, which is the right choice for narrated content. Needs the "
+            "background to be kept (the default)."
+        ),
+    )
+    parser.add_argument(
+        "--room-rt60",
+        dest="room_rt60",
+        type=float,
+        default=None,
+        help=(
+            "Reverberation time in seconds, instead of measuring it from the "
+            "speech stem. Useful when the source's decay cannot be estimated."
+        ),
+    )
+    parser.add_argument(
+        "--room-wet-db",
+        dest="room_wet_db",
+        type=float,
+        default=DEFAULT_ROOM_WET_DB,
+        help=(
+            "Reverb level relative to the dry voice. 0 (the default) adds NO "
+            "reverb, which is what the ear test called for; a negative value such "
+            "as -20 enables the tail. (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--room-duck-db",
+        dest="room_duck_db",
+        type=float,
+        default=DEFAULT_ROOM_DUCK_DB,
+        help=(
+            "How far to pull the bed down under dialogue when --room match. "
+            "Shallower than --duck-db, because the room is part of the voice. "
+            f"(default: {DEFAULT_ROOM_DUCK_DB:g})"
+        ),
+    )
+    parser.add_argument(
+        "--room-tone-db",
+        dest="room_tone_gain_db",
+        type=float,
+        default=DEFAULT_ROOM_TONE_GAIN_DB,
+        help=(
+            "Level of the room-tone floor taken from the speech stem's non-speech "
+            f"parts. (default: {DEFAULT_ROOM_TONE_GAIN_DB:g})"
+        ),
     )
     parser.add_argument(
         "--accent-mode",
@@ -366,13 +425,15 @@ def cmd_models(argv: Sequence[str]) -> int:
     return _STOP
 
 
-def cmd_dub(argv: Sequence[str]) -> int:
-    """Handle the default dubbing command."""
-    args = build_dub_parser().parse_args(list(argv))
-    settings = Settings.from_env()
-    setup_logging("DEBUG" if args.verbose else settings.log_level, settings.log_json)
+def job_config_from_args(args: argparse.Namespace) -> JobConfig:
+    """Build the :class:`JobConfig` for a parsed set of dub options.
 
-    job = JobConfig(
+    Extracted from :func:`cmd_dub` so the flag-to-config mapping can be tested
+    without running the pipeline. That matters: this function passes *every* flag
+    explicitly, including its defaults, so a validator that keys off
+    ``model_fields_set`` instead of the value will reject an ordinary run.
+    """
+    return JobConfig(
         video=args.video,
         audio=args.audio,
         target_language=args.target_language,
@@ -390,6 +451,11 @@ def cmd_dub(argv: Sequence[str]) -> int:
         keep_background=args.keep_background,
         separator=args.separator,
         duck_db=args.duck_db,
+        room=args.room,
+        room_rt60=args.room_rt60,
+        room_wet_db=args.room_wet_db,
+        room_duck_db=args.room_duck_db,
+        room_tone_gain_db=args.room_tone_gain_db,
         accent_mode=args.accent_mode,
         accent_audio=args.accent_audio,
         accent_text=args.accent_text,
@@ -407,6 +473,15 @@ def cmd_dub(argv: Sequence[str]) -> int:
         keep_subtitles=not args.no_subtitles,
         force=args.force,
     )
+
+
+def cmd_dub(argv: Sequence[str]) -> int:
+    """Handle the default dubbing command."""
+    args = build_dub_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    setup_logging("DEBUG" if args.verbose else settings.log_level, settings.log_json)
+
+    job = job_config_from_args(args)
 
     result = Pipeline(job, settings, stretcher_preference=args.stretcher).run()
     print()

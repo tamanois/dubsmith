@@ -17,6 +17,7 @@ __all__ = [
     "TranslationError",
     "TTSError",
     "TimingError",
+    "AuditError",
 ]
 
 
@@ -62,3 +63,7 @@ class TTSError(DubbingError):
 
 class TimingError(DubbingError):
     """Duration fitting or timeline assembly failed."""
+
+
+class AuditError(DubbingError):
+    """A quality audit could not be performed (missing report or reference clip)."""

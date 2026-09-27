@@ -20,9 +20,12 @@
 | Translation (OpenAI-compatible) | ✅ | `pipeline/translate.py` |
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Speaker diarization (P1) | ✅ | `pipeline/diarize.py` |
+| Overlap flagging (P1) | ✅ | `pipeline/diarize.py`, `pipeline/orchestrate.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
+| Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
+| Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 565 passing | `tests/` |
+| Tests | ✅ 674 passing | `tests/` |
 
 Verification performed:
 
@@ -578,7 +581,9 @@ it is an explicit request to dub every line in one voice.
 **Not attempted, deliberately.** Speaker attribution is per segment, so
 overlapping speech goes to one speaker; the speaker *count* comes from the
 clustering rather than being declared, with `--speaker-threshold` as the knob.
-Both are noted in the README's limitations rather than papered over.
+Both are noted in the README's limitations rather than papered over. Overlap is
+now *detected* rather than assumed away — see P1b below — but it is still dubbed
+in one voice.
 
 **Supersedes an earlier hypothesis.** The first attempt was to reuse the Qwen3-TTS
 cloning encoder for diarization; it was refuted by measurement (see the table
@@ -604,6 +609,288 @@ above) before any code was written on top of it. The lesson is recorded in D12.
 
 Both were found only by running the real clip: the unit tests passed throughout,
 because they inject a fake embedder and a scripted model.
+
+### P1b — Overlap detection and reporting (IMPLEMENTED)
+
+**The gap.** `_stage_diarize` assigns **one** speaker per ASR segment, so a segment
+that contains two voices is given to whoever dominates it: the second voice is
+cloned in the wrong timbre, or lost entirely. Nothing recorded that this had
+happened, so the failure was invisible — an aggregate timbre score cannot show a
+handful of mis-attributed lines, exactly as it could not show the per-line accent
+flips that P3b fixed.
+
+**First attempt, refuted by measurement.** The obvious design — re-embed each
+segment in short windows and cluster them the way the labels are clustered —
+failed on the real clip: it flagged **14 of 16** segments. The reason is worth
+recording. On the two-person clip a 1 s window splits one speaker's *own* voice by
+up to **1.08** cosine distance, more than three times the 0.34 that separates the
+two speakers, so a short-window “split” reports embedding noise rather than a
+second voice. Same-speaker window spread falls monotonically with window length
+(0.88 at 1.5 s, 0.85 at 2 s, 0.63 at 2.5 s), and so does the share of clean
+segments whose decision flips (6/13, 3/13, 1/13). The lesson is the same shape as
+D12's: measure the embedder before building a rule on it.
+
+**Detection: long windows compared against speaker centroids.** Two changes, both
+forced by that measurement. The window is **2.5 s** with a 1.25 s hop
+(`OVERLAP_WINDOW_S` / `OVERLAP_HOP_S`) — the shortest window at which noise stops
+driving the answer — and the comparison is *supervised*: the labels already say
+who the speakers are, so each window is compared against a **centroid** (the
+average of a speaker's own windows) rather than against other windows. Averaging
+is the whole point; it cancels the per-window noise that makes window-to-window
+comparison meaningless. A segment is flagged when a `MIN_OVERLAP_S` (0.6 s)
+**consecutive run** of its windows fits another speaker's centroid better than its
+own, *and* its own speaker still owns the majority of it — a segment whose windows
+all match another voice is a mislabelled segment, which is the diarization stage's
+problem, not an overlap. A one-voice job is `False` by construction: with no second
+centroid, no window can match one, so a noisy solo recording can never be flagged.
+No new dependency and no new model: the same ERes2NetV2 embedder, called once with
+every window of every segment.
+
+**v1 behaviour: report, don't repair.** A flagged line keeps the dominant-speaker
+treatment it would have had anyway, so this stage cannot make anything worse — the
+only change is that the limitation is measured. Flags are persisted to
+`02c_overlap.json` (its own cached stage, so the labels' cache entry is never
+coupled to it), annotated on `Segment.overlapped`, logged at warning level naming
+the ids, and summarised in `report.json → overlap` (`segments`, `seconds`,
+`speech_ratio`, `mode: "dominant"`). The field is absent — not `null` — for a
+one-voice job, and the stage is skipped entirely when there is no real labeler
+(`--diarizer none`, or `funasr` missing), so single-voice reports stay exactly as
+they were.
+
+**Cost.** One extra embedding pass over the speech stem: ~3 windows per 5 s
+segment, batched into a single `embed` call — 4.5 s on the real 60 s clip. Cheap
+next to ASR or TTS, and cached like every other stage.
+
+**Sensitivity is the price, and it is the honest limit of this embedder.** An
+interruption shorter than about a window is missed, because a shorter window
+cannot be trusted with ERes2NetV2. On the real two-person clip the detector flags
+1 of 16 segments — conservative on purpose, since a false “overlap” would send a
+listener hunting a defect that is not there. Frame-level accuracy would need a
+dedicated overlap model (pyannote's `OverlappedSpeechDetection`), rejected here for
+the same reason D12 rejected pyannote for diarization.
+
+**Separating the speech remains P1's open item.** The planned route is
+MossFormer2/SepFormer, gated on these flags so separation only runs on the
+segments that need it, with each separated stream re-transcribed (the second
+voice's words are not in Whisper's one-utterance output) and re-synthesised in its
+own voice. The flags are the seam that makes that stage affordable, which is why
+it landed first.
+
+### P3d — Room matching: the dub sounds laid over the picture (IMPLEMENTED)
+
+**The complaint.** "The voice is just over the video and not part of it" — reported
+by ear, and present since the beginning rather than introduced by the
+diarization work. The speaker *identity* is right; the sense of *place* is missing.
+
+**Why, in the code.** Three causes compound, and all three are structural rather
+than bugs:
+
+| # | Cause | Where |
+|---|---|---|
+| 1 | The synthetic voice is dry — nothing anywhere adds reverb | `pipeline/tts.py` output is close-mic'd and anechoic; no reverb code exists in the repo |
+| 2 | The original's room was discarded together with its voice | `separation.py`: speech = `("vocals",)`, background = `drums\|bass\|other`. The `vocals` stem is the voice *plus its reverb tail and the room tone it was masking* — the only material that says "this room" — and the dub never uses it. So "background preserved" means **music** preserved |
+| 3 | Ducking pulls the bed down exactly where the voice is | `mixing.py`: 6 dB with 150 ms ramps under every utterance. Right for a documentary narrator, backwards for someone standing in the room |
+
+Secondary, same direction: no microphone-perspective matching (distance, off-axis
+colouration, codec bandwidth), a line level that never varies against a speaker who
+moves and emotes, and no breaths — the gaps behind the voice are digitally silent
+*and* ducked.
+
+**Confirm before building.** This cannot be settled by argument, only by ear.
+Listen to the three stems: `01b_speech.wav` (voice + room, discarded),
+`01c_background.wav` (music only, what actually plays under the dub) and `dub.wav`.
+Then A/B the one cause that is already a flag — `--duck-db 0` keeps the bed at full
+level under the voice. If that alone fixes the feel, cause 3 dominates and the fix
+is a default, not a stage.
+
+**The fix ladder, cheapest first:**
+
+1. **Soften the duck** — lower the default depth, or use a shallower curve. One line.
+2. **Room tone as a floor** — reuse the speech stem's non-speech parts as a
+   continuous ambience bed under the dub. Nearly free, needs no reverb algorithm,
+   and it glues a dry voice into a space surprisingly well.
+3. **Convolutive reverb matching** — estimate RT60 from the source speech, build one
+   impulse response, convolve each dubbed line at a fixed wet/dry. Post-processing by
+   necessity: the checkpoint cannot synthesise reverberant speech.
+
+All three belong in `pipeline/mixing.py`, as a post-synthesis stage, so they cannot
+disturb the voice cloning already tuned in P3b/P3c. Steps 1–2 are worth doing
+regardless of whether step 3 follows.
+
+**Worth a knob, not a default:** per-video `--room {off, match, none}` — a dry,
+close voice-over is the *correct* choice for narrated content, so it should stay
+reachable rather than being silently replaced.
+
+**Status: IMPLEMENTED.** All three ladder steps ship together behind
+`--room {off, match}`, defaulting to `off`. The plan's third value (`none`) was
+folded into `off`: two names for the same behaviour is a trap, not a feature.
+
+Decisions taken during implementation, each to keep the change small and safe:
+
+- **Graceful degradation, not a hard requirement.** `--room match` needs the
+  separated speech stem; without one (usually `--no-background`) it logs a warning
+  and delivers a dry dub with `report.json → room.applied: false`. That matches the
+  project's established pattern for optional features (Demucs, `funasr`,
+  `flash-attn`) and never fails a run that would otherwise have succeeded.
+- **One convolution over the assembled track, not per line.** The reverb is an FFT
+  convolution of the finished speech timeline, so the tail decays across the pauses
+  between utterances exactly as it would in the room. Output length is unchanged, so
+  the timeline geometry — and the dub's duration — is untouched; only the final tail
+  is cut.
+- **The RT60 is measured, and overridable.** The estimator was rewritten after the
+  first version failed on real audio. The classic Schroeder backward integral —
+  the textbook method — integrates *speech activity* rather than reverberation when
+  applied to a whole speech stem, because energy keeps arriving as long as the
+  speaker talks. Measured on this repo's own stems (`output/louisavy`, 60 s, and
+  `output/change-the-world`, 22 s of Demucs `vocals`) it **saturated at the upper
+  clamp both times**, i.e. a cathedral for every video. The shipped estimator
+  instead measures the short-time energy envelope over a 0.5 s window and takes the
+  **median** decay rate: the room's decay, not the fastest transient and not the
+  slow drift of a pause. Recovering 0.2 / 0.5 / 0.8 / 1.2 / 2.0 / 3.0 s exactly on
+  synthetic decays of known RT60, and returning 2.40 s and 1.83 s on the two real
+  stems above. A decay too slow for one window to see falls back to the upper clamp
+  (long), never to the lower one — reading "very reverberant" as "no reverb" would
+  be a silent, wrong-direction failure. `--room-rt60` pins it.
+- **The wet level is the tuning knob.** Because the deliver stage re-normalises
+  loudness to the source, the reverb only has to be *present and stable*: the
+  synthetic impulse response is normalised to unit energy, which makes
+  `--room-wet-db` an input-independent level rather than one that depends on the
+  tail length.
+- **`room` is absent from the report on a dry run** — not `null` — the same
+  convention as `speakers` and `overlap`, so reports written before this feature
+  existed read unchanged.
+
+**Measured on real audio**, not only in unit tests. The mix stage was run twice
+over a copy of the real `change-the-world` job — same stems, same dub clips, same
+rubberband stretcher, only `--room` differing:
+
+| Region | `--room off` | `--room match` | Ratio |
+|---|---|---|---|
+| Dialogue (10.0–11.0 s) | 0.08115 | 0.08115 | **1.00×** — the voice is untouched |
+| Pause (17.5–18.1 s) | 0.00045 | 0.00564 | **12.5×** — room tone + tail + shallower duck |
+| Tail after the last line (21.95–22.0 s) | 0.00046 | 0.00126 | **2.7×** — a real reverb tail |
+| Dub length | 22.01 s | 22.01 s | unchanged |
+
+Sync is unaffected (`shifted_segments: 0`, `trimmed: 0.00 s`). The measured RT60 on
+that job is 1.83 s.
+
+**Verified end to end** on `input/louisavy.mp4` (60 s, English → French, default
+`preserve` accent mode): a full `python dub.py --video input/louisavy.mp4 --target
+fr --room match` run completed in ~70 s with every artifact written, 13 segments,
+2 speakers, per-speaker donors, `--refine` recovering 2.02 s, and
+`Room matching: RT60 2.41s` in the log. `05_room.json` and `report.json → room`
+both carry the measured decay.
+
+| Run | Segments | Dub | Speech trimmed | Worst line | Lines > 10% | Shifted | Duck |
+|---|---|---|---|---|---|---|---|
+| `--room off` | 14 | 60.37 s | 1.57 s | 23.3% | 1 | 0 | 6.0 dB |
+| `--room match` | 13 | 60.01 s | 1.19 s | 50.0% | 2 | 0 | 3.0 dB |
+
+Read that as *evidence of independence*, not as a controlled A/B: the two runs
+re-segmented differently (14 vs 13 lines, and different translations), which is
+the documented non-determinism of re-running ASR. What it establishes is that
+**truncation is not introduced by room matching** — the dry baseline fails the
+gate too (`audit_qc.py` exits 1 on both, on `truncation`). Room matching is
+applied after `fit_line`, so it cannot influence trimming at all; the numbers
+agree.
+
+**Two pre-existing problems surfaced by running it for real**, both outside this
+feature and neither caused by it:
+
+1. **The Definition of Done's own command was broken.** `dub.py` passes every flag
+explicitly, including its `None` defaults, and Pydantic counts an explicitly-passed
+`None` as "set" in `model_fields_set` — so the accent-blend guard fired and
+`python dub.py --video in.mp4 --target fr` raised `ConfigError` for **every accent
+mode except `reference-accent`**. Recent real runs all used `reference-accent`,
+which is why it went unnoticed. The guard now keys off the value, and the
+flag→config mapping is extracted into `job_config_from_args()` so the CLI shape is
+tested directly.
+2. **Synthesis can still OOM on a single line**, and the batch-halving fallback
+bottomed out twice (8 → 4 → 2 → 1) while the second GPU sat idle. Re-running the
+same job with its transcript and translation cached then succeeded with **zero**
+OOM retries, so this is transient allocator state rather than a text or model
+limit — the same ⚠️ DoD item ("≤ 10-minute video on one RTX 3060 without OOM") that
+remains unverified, now with a reproduction.
+
+Deliberately not done: microphone-perspective matching (distance, off-axis
+colouration, codec bandwidth), per-line level variation against a speaker who
+emotes, and breaths. Each refines the same "sense of place" problem rather than
+adding a missing capability.
+
+### P3e — Automated quality gate (IMPLEMENTED)
+
+**The gap.** The signals existed — SECS per line, round-trip WER, timing drift,
+loudness compliance in `report.json` — but nothing thresholded them, so "the run was
+fine" was a feeling rather than a checked claim, and `audit_timbre.py` was a
+hand-run script.
+
+**What was built.** The measurement core moved out of `audit_timbre.py` into
+`pipeline/audit.py`, so both CLIs share one implementation of the language-matched
+measurement instead of drifting apart. `audit_qc.py` was added on top: it reads a
+finished job's `report.json`, applies the gates below, prints a pass/fail table, and
+exits non-zero when one fails.
+
+| Gate | Checks | Default |
+|---|---|---|
+| `sync` | No line pushed later than its slot | `shifted_segments == 0` |
+| `truncation` | No line loses a meaningful share of its words | worst ≤ 10%, none over 10% |
+| `loudness` | The dub sits at the source's level | within 1.5 dB |
+| `timbre` | No line followed the accent voice | 0% of lines (needs `--timbre`) |
+
+Three decisions worth recording:
+
+- **It never blocks the pipeline.** The dub is written before the gate runs, so a
+  failure is a verdict on the delivery rather than a reason to discard the work —
+  which is also what makes it usable in CI and by hand on any completed job.
+- **Overrun is not gated.** A line spilling into the pause before the next utterance
+  costs nothing and is *how* sync is preserved, so a threshold there would fail
+  legitimate lines that filled a long silence. Only `shifted_segments` means desync;
+  overrun is reported as context.
+- **A gate that cannot run is `skip`, never `pass`.** Missing timbre data or an
+  unmeasurable source level must not read as a clean bill of health.
+
+**A latent bug fixed on the way.** `collapse_anchor` averaged two 7 s windows of the
+accent clip, so any accent clip shorter than 14 s produced a `NaN` anchor — and the
+README's own advice is to use a short, brisk clip. It now measures the clip whole
+when it is shorter than one window.
+
+**Still open in P3:** the model bake-off harness, and room matching's own listening
+verification (the A/B procedure is in P3d above).
+
+### P3f — First listen: the reverb was rejected (FIXED)
+
+**Feedback from the user, on a real dubbed video:** "voices have echo and speech is
+distorted". This is the by-ear gate P3d asked for, and it failed the first cut.
+
+**What was wrong.** The ladder's third rung was enabled by default with settings that
+had never been heard:
+
+| Problem | Evidence | Fix |
+|---|---|---|
+| 2.4 s of **undamped** reverb, flat to 12 kHz | `synthetic_ir` was raw noise; a flat burst reads as a metallic hiss, not a room | Low-pass the response at 4 kHz (−8.7 dB of tilt measured between the 0.2–1 kHz and 9–11 kHz bands, against −0.3 dB before) |
+| **RT60 estimated far too long** | 2.41 s for ordinary talking-head footage — the median over all decay windows folds in the shallow dips *between words*, where the voice continues, so the estimator was measuring speech envelope dynamics rather than the room | Take the 75th percentile: the fast, sustained decays that follow speech offsets. Same stem now reads 1.65 s; still a *starting point*, not a measurement to trust |
+| **The room-tone floor could carry the original voice** | It was the stem's complement-of-dialogue regions, so speech the transcript never covered (breaths, dropped utterances, overlaps) and the speaker's own decay came along at −30 dB — a ghost of the English voice under the French one | Gate on **level**: only frames far below the stem's peak survive, which is what genuine room tone is. Plus renormalise to the requested level so the gate and the gain cannot compound into inaudibility, with a cap so a stem with no quiet frames yields silence instead of amplified residue |
+| A reverb level nobody had calibrated | −12 dB was a guess | **Opt-in, default `0` = no reverb** |
+
+**Measured after the fix**, on the real `louisavy` job (a controlled speech-only
+render, so the same lines are compared):
+
+| Run | Post-offset energy | Overall |
+|---|---|---|
+| `--room off` | −31.1 dBFS | −27.7 dBFS |
+| `--room match` (default, no reverb) | −31.1 dBFS | −27.5 dBFS |
+| `--room match --room-wet-db -20` | −30.7 dBFS | −27.4 dBFS |
+| `--room match --room-wet-db -12` (the old default) | −30.0 dBFS | −26.6 dBFS |
+
+**The honest reading:** the reverb's contribution to a 0.4 s post-offset window is
+smaller than those RMS figures suggest (+1.1 dB even at −12 dB), so part of what was
+heard was probably the *floor* carrying the original voice — the other thing this
+change removes. Both mechanisms are now gone from the default path, but only an ear
+can confirm it, which is why the tail is opt-in rather than re-tuned by guesswork.
+
+**Status: fixed, 681 tests pass, re-verified end to end** (`RT60 1.65s measured,
+room tone -30.0 dB, duck 3.0 dB, reverb off`). `--room match` now means the two
+steps the plan always said were "worth doing regardless of whether step 3 follows".
 
 ---
 
@@ -637,6 +924,9 @@ voice timbre**, ideally with the **target language's accent**.
 | D12 | Diarization | **Embed and cluster ASR segments** with `funasr` + ERes2NetV2 (`iic/speech_eres2netv2_sv_zh-cn_16k-common`), `--speaker-threshold 0.40` | Measured against the repo's two-person clip rather than assumed: reusing the Qwen3-TTS cloning encoder was **refuted** (all pairs 0.963–0.991, no merge gap) and `wespeaker` is not on PyPI. ERes2NetV2 separates the same clip at 0.341–0.874 with a merge plateau (flat to 0.379, then 0.468), so a constant threshold is defensible. Embedding the existing segments avoids a second segmentation pass, which is what keeps the labels aligned with the text instead of re-cutting lines |
 | D13 | Multi-speaker voices | **Per-speaker donor, and one blend clip per voice** in `reference-accent` mode; `donor.json` is the voice bible, with the dominant speaker also mirrored flat | A shared blend clip cannot serve two voices — its codes and embedding describe one speaker, which is exactly what makes it stable, and exactly what makes it wrong for the second voice. Keeping the dominant speaker's fields at the top level of `donor` means single-speaker jobs, `audit_timbre.py` and the existing docs are unchanged; `report.json → speakers` stays `null` for one voice rather than becoming a one-entry map |
 | D14 | Diarization dependency | **Optional**, degrading to one voice with a warning | `funasr` pulls ~30 transitive packages; a user who wants a single-voice dub should not need them. Same pattern as Demucs and `flash-attn`: the feature is available, its absence is survivable and loud. `--diarizer none` is authoritative so an explicit request to keep one voice is never second-guessed |
+| D15 | Overlap detection | **Compare long (2.5 s) windows against speaker centroids, supervised by the labels**; report and keep the dominant speaker (v1) | The first design — re-cluster short windows — was **refuted by measurement**: 1 s windows split one speaker's own voice by up to 1.08 cosine distance versus 0.34 between speakers, and it flagged 14 of 16 real segments. Same-speaker spread falls with window length (0.88 at 1.5 s → 0.63 at 2.5 s) and so does the flip rate, so 2.5 s is the shortest trustworthy window. Comparing against a centroid rather than another window is what cancels the remaining noise, and being supervised by the labels makes a one-voice job structurally unflaggable. The cost is sensitivity — sub-window interruptions are missed — which is documented rather than hidden; pyannote's overlap model is the upgrade path if frame-level accuracy is ever needed |
+| D16 | Room matching | **Post-synthesis, derived from the speech stem, off by default** — `--room match` applies a measured RT60 convolution plus a room-tone floor and a shallower duck; without a stem it degrades to dry with `room.applied: false` | The room lives in the *speech* stem (voice + reverb tail + the room tone it masked), which the pipeline previously discarded, so recovering it needs no extra model and no new dependency. Adding it after synthesis keeps it clear of the voice-cloning tuning in P3b/P3c. A dry voice-over is correct for narrated content, so it stays the default rather than being silently replaced |
+| D17 | Quality gate | **A separate, non-blocking executable** (`audit_qc.py`) reading `report.json`, exiting non-zero on failure, and reporting `skip` (never `pass`) when a gate cannot run; the measurement core is shared with `audit_timbre.py` in `pipeline/audit.py` | A gate is only useful if it can fail without destroying work, and if "not measured" cannot be mistaken for "healthy". Sharing one implementation of the language-matched measurement is what stops the two CLIs from disagreeing about the same job |
 
 ---
 
@@ -656,13 +946,15 @@ voice timbre**, ideally with the **target language's accent**.
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
-- Overlapping-speech separation: speakers are attributed per segment, so overlap
-  goes to the dominant speaker (P1 sub-item, see §4).
+- Overlapping-speech separation: overlapping speech is *detected and reported*
+  (P1b), but the second voice is still not dubbed — the line is attributed to its
+  dominant speaker (P1 sub-item, see §4).
 - Fully automatic native accent: `reference-accent` needs a supplied clip, so an
   unattended native-accent path via voice conversion is still P2.
 - Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
-  The length-repair half is now implemented (see the P3 section above) and
-  loudness matching is done; reverb matching and an automated QC gate remain.
+  The length-repair half is now implemented (see the P3 section above), and both
+  loudness matching and room matching ship (`--room match`, P3d). The automated QC
+  gate is implemented too (P3e); only the model bake-off harness remains.
 - Lip sync (P4), multi-source-language videos (P5), service-ification (P6).
 
 ### 3.2 Pipeline
@@ -683,6 +975,10 @@ video.mp4
    │     embeddings into speakers; folds away clusters too short to clone
    ▼
 02b_speakers.json            # {segment_id: SPK_n}; segments carry their speaker
+   │  ④b flag overlap — re-embed each segment in 2.5 s windows and compare them
+   │     against the speaker centroids; a long run fitting another voice is marked
+   ▼
+02c_overlap.json             # {overlapped_ids, segments, seconds, speech_ratio}
    │  ⑤ LLM translation (OpenAI-compatible), chunked; optional word budget
    ▼
 03_script.json               # [{id, start, end, source, target}]
@@ -698,8 +994,10 @@ video.mp4
 04_dubbed/seg_*.wav
    │  ⑧ fit each line to its slot (rubberband → sox → librosa), place on the
    │     timeline, duck the bed under dialogue, match EBU R128 loudness
+   │     (`--room match` also convolves the source's measured decay and adds a
+   │     room-tone floor, before the bed is ducked more gently)
    ▼
-timing.json, 05_mix.wav, dub.wav
+timing.json, 05_mix.wav, 05_room.json (with --room match), dub.wav
    │  ⑨ ffmpeg: mux the dub back onto the video (stream copied); write SRTs
    ▼
 output/
@@ -740,6 +1038,8 @@ people (D13).
 | Timing | `rubberband` → `sox` → `librosa` | three interchangeable backends, auto-detected; stretches clamped to ±15–18% |
 | Loudness | `pyloudnorm` (EBU R128) + a numpy limiter | `match-source` by default |
 | Mix | numpy ducking | 6 dB under dialogue, 150 ms ramps |
+| Room matching | numpy FFT convolution + a synthetic impulse response | `--room match`: RT60 measured from the speech stem, clamped to 0.2–3.0 s, 3 dB duck. No new dependency |
+| Quality gate | `audit_qc.py` over `pipeline/audit.py` | sync / truncation / loudness / timbre thresholds; exit 0/1, never blocks the dub |
 | Mux / subs | `ffmpeg`, `pipeline/subtitles.py` | video stream copied, not re-encoded |
 
 ### 3.4 Job config
@@ -792,6 +1092,13 @@ separator: auto                  # auto | demucs | none
 duck_db: 6.0
 background_gain_db: 0.0
 
+# Room matching (off = dry voice-over; match = the source's acoustic space)
+room: off                        # off | match
+room_rt60: null                  # null = measure it from the speech stem
+room_wet_db: -12.0               # reverb level relative to the dry voice
+room_duck_db: 3.0                # shallower than duck_db, by design
+room_tone_gain_db: -30.0         # level of the room-tone floor
+
 # Loudness
 loudness_target: null            # match-source when null | lufs
 target_lufs: null
@@ -811,6 +1118,7 @@ force: false                     # ignore the stage cache
 qwen-tts/
 ├── dub.py                    # CLI entrypoint (argparse) + model downloads
 ├── audit_timbre.py           # per-line speaker-timbre audit (needs the GPU)
+├── audit_qc.py               # automated quality gate for a finished job
 ├── main.py, clone.py         # scratch experiments, not part of the pipeline
 ├── pipeline/
 │   ├── config.py             # Pydantic job schema, env settings, languages
@@ -821,11 +1129,12 @@ qwen-tts/
 │   ├── asr.py                # faster-whisper + VAD gating
 │   ├── diarize.py            # speaker embeddings + clustering (multi-speaker)
 │   ├── separation.py         # Demucs speech/background split
-│   ├── mixing.py             # ducking and bed mix (pure numpy)
+│   ├── mixing.py             # ducking, bed mix and room matching (pure numpy)
 │   ├── translate.py          # OpenAI-compatible client, chunking, shorten()
 │   ├── tts.py                # Qwen3-TTS wrapper, donor selection, blend
 │   ├── timing.py             # stretching backends, timeline assembly
 │   ├── subtitles.py          # SRT writer
+│   ├── audit.py              # timbre measurement + quality gates
 │   └── orchestrate.py        # stages, artifacts, caching, report
 ├── tests/                    # pytest suite (no GPU, models or ffmpeg)
 ├── models/                   # local checkpoints (gitignored)
@@ -848,6 +1157,9 @@ enforced; that gap sits outside this roadmap and is tracked separately.
   (`audit_timbre.py`, run by hand).
 - Audio synchronized to the source timeline within ~100 ms at segment anchors ✅
   (measured drift 0.000 s; lines are never shifted late).
+- Quality signals thresholded into a gate rather than inspected by hand ✅
+  (`audit_qc.py`, P3e). The gate reports; it does not block delivery, so a
+  failure is a verdict on the finished job rather than a lost run.
 - Handles a ≤ 10-minute video on one RTX 3060 without OOM — ⚠️ **unverified**.
   The longest real run is 4:47, and it still hit `CUDACachingAllocator` OOM
   retries during synthesis, which the batch-halving fallback absorbed.
@@ -871,9 +1183,9 @@ python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
 | Phase | Focus | Key additions | Complexity |
 |-------|-------|---------------|------------|
 | **P0** | MVP (this doc §3) | Single-speaker dub, French, no lip sync | — |
-| **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**; remaining: overlapping-speech separation | M |
+| **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**, overlap **flagged**; remaining: overlapping-speech separation | M |
 | **P2** | Native accent | Supplied-clip accent **done**; remaining: VoiceDesign anchor + voice conversion, per-speaker knob | M |
-| **P3** | Quality & timing | Isochrony loop **done**; remaining: reverb matching, automated QC gate + bake-off harness | M |
+| **P3** | Quality & timing | Isochrony loop, room matching (P3d) and the automated QC gate (P3e) **done**; remaining: the model bake-off harness | M |
 | **P4** | Lip sync | LatentSync/MuseTalk, gated on face visibility | L |
 | **P5** | Multi-source-language | Per-utterance LID, per-segment source language | S–M |
 | **P6** | Service-ification | FastAPI + Celery/Redis, model residency, consent gate | L |
@@ -890,16 +1202,21 @@ python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
   was unnecessary: `donor.json` already answers "which voice, and why".
 - **Per-speaker cloning**: ✅ **done** — one prompt per speaker, lines batched
   within a speaker, and one blend clip per voice in `reference-accent` mode.
-- **Overlap**: flag overlapping speech; pick the dominant speaker in v1, separate
-  later (MossFormer2/SepFormer). **Remaining** — v1 behaviour is the current one:
-  a segment with overlap is attributed to a single speaker.
+- **Overlap**: ✅ **flagging done** (P1b) — each segment is re-embedded in 2.5 s
+  windows and compared against the speakers the labels establish, so a segment
+  carrying two voices is recorded in `02c_overlap.json` and `report.json →
+  overlap` instead of being silently attributed to one person. **Remaining**:
+  separate the speech and dub both voices — MossFormer2/SepFormer, gated on these
+  flags (MossFormer2 is already reachable through the optional `funasr`
+  dependency, so this adds no new package).
 - **Background bed**: ✅ **done** — `pipeline/separation.py` splits dialogue from
   music/SFX with Demucs, and `pipeline/mixing.py` mixes the dub back over the bed,
   ducked 6 dB under dialogue with 150 ms ramps (`--keep-background`, default on).
 - **Output**: multi-voice dub with preserved background.
 
-**Remaining work in P1 is overlap handling**, which is a quality refinement rather
-than a missing capability: the dub is multi-voice today.
+**The remaining P1 work is separating overlapping speech**, which is a capability
+gap rather than a missing measurement: overlap is now detected and reported (P1b),
+but a flagged line is still dubbed in the voice of its dominant speaker.
 
 ### P2 — Native target accent (nice-to-have per D1)
 
@@ -917,12 +1234,16 @@ than a missing capability: the dub is multi-voice today.
   cutting them, and `--length-budget words` gives the translator a ceiling it can
   act on. See the P3 section in §0 for the measurements.
 - **Acoustics**: EBU R128 loudness ✅ (`match-source` by default, with a peak
-  limiter). **Remaining: RT60 estimate + convolutive reverb matching.**
-- **QC stage + eval harness**: the signals exist — SECS per line
-  (`audit_timbre.py`), round-trip WER, timing drift and loudness compliance in
-  `report.json`. **Remaining: threshold them into a gate and run it automatically
-  rather than by hand, plus a model bake-off harness.**
-- **Output**: measurable quality gates and a model bake-off harness.
+  limiter) and **room matching ✅ done** — `--room match` measures the decay from
+  the speech stem and applies it as a convolution, adds a room-tone floor and
+  ducks more gently, all post-synthesis. Off by default, because a dry voice-over
+  is correct for narrated content. See P3d in §0.
+- **QC stage + eval harness**: **the gate is ✅ done** — `audit_qc.py` thresholds
+  SECS per line, timing drift, deleted-speech share and loudness compliance into
+  pass/fail, sharing its measurement core with `audit_timbre.py` via
+  `pipeline/audit.py`. **Remaining: the model bake-off harness**, which the gate's
+  `--json` output and exit code are designed to be called from.
+- **Output**: a measurable quality gate ✅; the bake-off harness remains.
 
 ### P4 — Lip sync
 

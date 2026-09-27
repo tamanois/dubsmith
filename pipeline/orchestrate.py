@@ -34,7 +34,7 @@ from .diarize import NullDiarizer, detect_diarizer, single_speaker_labels
 from .errors import ASRError, DubbingError, MediaError, TimingError
 from .logging_utils import job_logger
 from .models import resolve_model
-from .mixing import duck_and_mix
+from .mixing import apply_room, duck_and_mix, room_tone_floor
 from .separation import NullSeparator, detect_separator
 from .timing import Placement, Timeline, build_timeline, detect_stretcher, fit_line
 from .translate import (
@@ -69,6 +69,10 @@ _BLEND_INFO_NAME = "04_dubbed/blend.json"
 #: transcript, so ASR output stays pure recognition and changing the speaker
 #: threshold does not force a re-transcribe.
 _SPEAKERS_NAME = "02b_speakers.json"
+#: Which segments carry a second voice, and how the run handled them. A sidecar
+#: for the same reason as the labels: it depends on the audio and the threshold,
+#: not on the translation or the chosen voice.
+_OVERLAP_NAME = "02c_overlap.json"
 #: Re-synthesises a chosen subset of lines, each in its own speaker's voice, and
 #: returns one waveform per line in the order given (``None`` for a blank line).
 Resynthesize = Callable[[Sequence[Segment], Sequence[str]], list[np.ndarray | None]]
@@ -81,6 +85,9 @@ _SINGLE_SPEAKER = "SPK_0"
 _SPEAKER_ONLY_KEYS = frozenset({"segments", "speech_seconds"})
 _TIMING_NAME = "timing.json"
 _MIX_NAME = "05_mix.wav"
+#: What the room-matching pass did, beside the mix it describes. A sidecar so a
+#: cached mix still reports it, exactly as ``blend.json`` does for the blend.
+_ROOM_NAME = "05_room.json"
 _DUB_TRACK_NAME = "dub.wav"
 _REPORT_NAME = "report.json"
 _MANIFEST_NAME = "manifest.json"
@@ -278,6 +285,10 @@ class Pipeline:
             # Who speaks each line. Annotates the segments in place, and is a no-op
             # beyond one speaker when diarization is off or unavailable.
             self._stage_diarize(source_audio, transcript)
+            # Which lines carry a second voice. Its own cached stage: it re-embeds
+            # short windows rather than whole segments, so sharing the diarization
+            # stage would couple two independent answers to one cache entry.
+            self._stage_overlap(source_audio, transcript)
             # Free the ASR model's cache before TTS loads its own weights;
             # otherwise the two multi-GB models contend for the same GPU.
             release_gpu_memory()
@@ -431,6 +442,118 @@ class Pipeline:
         candidate = self.job_dir / _BACKGROUND_NAME
         return candidate if candidate.is_file() else None
 
+    def _speech_path(self) -> Path | None:
+        """Path to the speech stem, when one was produced.
+
+        Room matching reads this stem rather than the mix: it is the only material
+        that carries the room (the voice, its reverb tail, and the room tone the
+        voice was masking).
+        """
+        candidate = self.job_dir / _SPEECH_NAME
+        return candidate if candidate.is_file() else None
+
+    def _load_bed(
+        self, sample_rate: int, tone: np.ndarray | None
+    ) -> np.ndarray | None:
+        """The bed the dub is laid over: music/ambience, plus room tone if any.
+
+        The static background offset is applied here rather than inside
+        :func:`duck_and_mix`, because ``tone`` already carries the gain it was
+        built with and a shared offset would lift it too.
+        """
+        bed: np.ndarray | None = None
+        background = self._background_path()
+        if background is not None:
+            bed, bed_rate = media.load_audio(background)
+            if bed_rate != sample_rate:
+                bed = media.resample(bed, bed_rate, sample_rate)
+            gain = 10.0 ** (self.job.background_gain_db / 20.0)
+            bed = (np.asarray(bed, dtype=np.float32) * gain).astype(np.float32)
+
+        if tone is None:
+            return bed
+        tone = np.asarray(tone, dtype=np.float32).reshape(-1)
+        if bed is None:
+            return tone
+
+        combined = np.zeros(max(bed.size, tone.size), dtype=np.float32)
+        combined[: bed.size] += bed
+        combined[: tone.size] += tone
+        return combined
+
+    def _match_room(
+        self,
+        speech: np.ndarray,
+        regions: Sequence[tuple[float, float]],
+        sample_rate: int,
+    ) -> tuple[dict[str, Any], np.ndarray, np.ndarray | None]:
+        """Place the dry dub in the source's room, when room matching is enabled.
+
+        Returns ``(stats, speech, tone)``: the record written to ``05_room.json``,
+        the speech (possibly convolved with a reverb tail), and the room-tone floor
+        to fold into the bed (``None`` when there is none).
+
+        Room matching needs the separated speech stem, so with the background
+        disabled the dub is delivered dry and the report says ``applied: false``
+        rather than inventing a space.
+        """
+        stats: dict[str, Any] = {
+            "mode": self.job.room,
+            "applied": False,
+            "rt60_s": None,
+            #: ``wet_db`` is 0 when the reverb tail is off, which is the default.
+            "wet_db": None,
+            "reverb": self.job.room_wet_db < 0.0,
+            "tone_gain_db": None,
+            "duck_db": self.job.duck_db,
+        }
+        if not self.job.room_matching:
+            return stats, speech, None
+
+        reference_path = self._speech_path()
+        if reference_path is None:
+            self.log.warning(
+                "Room matching needs the separated speech stem, which only exists "
+                "when the background is kept. Delivering a dry dub instead: drop "
+                "--room match, or keep the background (the default)."
+            )
+            return stats, speech, None
+
+        reference, reference_rate = media.load_audio(reference_path)
+        if reference_rate != sample_rate:
+            reference = media.resample(reference, reference_rate, sample_rate)
+
+        wet, rt60 = apply_room(
+            speech,
+            reference,
+            sample_rate,
+            wet_db=self.job.room_wet_db,
+            rt60=self.job.room_rt60,
+        )
+        tone = room_tone_floor(
+            reference, sample_rate, regions, gain_db=self.job.room_tone_gain_db
+        )
+        stats.update(
+            {
+                "applied": True,
+                "rt60_s": round(rt60, 3),
+                "wet_db": round(self.job.room_wet_db, 2),
+                "reverb": self.job.room_wet_db < 0.0,
+                "tone_gain_db": round(self.job.room_tone_gain_db, 2),
+                # Reported because it is the depth actually used, not --duck-db.
+                "duck_db": round(self.job.room_duck_db, 2),
+            }
+        )
+        self.log.info(
+            "Room matching: RT60 %.2fs measured, room tone %.1f dB, duck %.1f dB, "
+            "reverb %s",
+            rt60,
+            self.job.room_tone_gain_db,
+            self.job.room_duck_db,
+            "off" if self.job.room_wet_db >= 0.0 else f"{self.job.room_wet_db:.1f} dB",
+        )
+        return stats, wet, tone
+
     def _donor_info(self) -> dict[str, Any] | None:
         """Which reference voice was used: an explicit file, or an auto segment.
 
@@ -495,6 +618,52 @@ class Pipeline:
             }
             for name, record in speakers.items()
         }
+
+    def _overlap_stats(self) -> dict[str, Any] | None:
+        """What the overlap stage found, or ``None`` when it did not run.
+
+        Read from disk rather than held in memory, so a run served from cache still
+        reports it; ``None`` keeps the field out of one-voice reports entirely,
+        exactly as ``speakers`` stays ``null`` for them.
+        """
+        path = self.job_dir / _OVERLAP_NAME
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _room_stats(self) -> dict[str, Any] | None:
+        """What room matching did, or ``None`` when it was not enabled.
+
+        Read from disk rather than held in memory, so a run served from cache still
+        reports it. ``None`` rather than a null field keeps reports from dry runs —
+        and from runs made before this feature existed — byte-for-byte unchanged.
+        """
+        if not self.job.room_matching:
+            return None
+        fallback: dict[str, Any] = {"mode": self.job.room, "applied": False}
+        path = self.job_dir / _ROOM_NAME
+        if not path.is_file():
+            return fallback
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return fallback
+        return payload if isinstance(payload, dict) else fallback
+
+    def _overlapped_ids(self) -> list[int]:
+        """Segment ids the overlap stage flagged, tolerant of a malformed file."""
+        stats = self._overlap_stats() or {}
+        ids: list[int] = []
+        for value in stats.get("overlapped_ids") or []:
+            try:
+                ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     def _spoken_overrides(self) -> dict[int, str]:
         """Lines the length repair rewrote, so subtitles match what is heard."""
@@ -625,6 +794,89 @@ class Pipeline:
         for segment in transcript.segments:
             segment.speaker = labels.get(segment.id, _SINGLE_SPEAKER)
         return labels
+
+    def _stage_overlap(
+        self, audio_path: Path, transcript: Transcript
+    ) -> dict[int, bool]:
+        """Flag the segments that carry more than one voice.
+
+        Only meaningful with a real labeler: with diarization off - or unavailable,
+        which also collapses every line to one voice - there is no second voice to
+        find, and the stage is skipped rather than writing an empty file that would
+        make single-voice reports look different.
+
+        Best-effort by construction. A segment whose windows cannot be embedded is
+        left unflagged, and a flagged one keeps the dominant-speaker treatment it
+        would have had anyway, so a miss costs nothing that was not already lost.
+        """
+        labeler = self._resolve_diarizer()
+        if labeler is None or isinstance(labeler, NullDiarizer):
+            return {}
+        detect = getattr(labeler, "overlaps", None)
+        if detect is None:
+            # A labeler that cannot detect overlap leaves the segments unflagged.
+            return {}
+
+        out = self.job_dir / _OVERLAP_NAME
+
+        def build() -> dict[int, bool]:
+            samples, sample_rate = media.load_audio(audio_path)
+            flags = detect(
+                [segment.id for segment in transcript.segments],
+                [(segment.start, segment.end) for segment in transcript.segments],
+                # The labels decide who the speakers are; overlap only asks
+                # whether a window fits a different one of them better.
+                {
+                    segment.id: self._speaker_of(segment)
+                    for segment in transcript.segments
+                },
+                samples,
+                sample_rate,
+            )
+            overlapped = [
+                segment.id for segment in transcript.segments if flags.get(segment.id)
+            ]
+            seconds = sum(
+                segment.duration
+                for segment in transcript.segments
+                if flags.get(segment.id)
+            )
+            total = sum(segment.duration for segment in transcript.segments)
+            if overlapped:
+                self.log.warning(
+                    "Overlapping speech detected in %d of %d segment(s): %s. Each is "
+                    "dubbed in the voice of its dominant speaker, so the second voice "
+                    "is not separately dubbed (see report.json -> overlap).",
+                    len(overlapped),
+                    len(transcript.segments),
+                    ", ".join(f"#{segment_id}" for segment_id in overlapped),
+                )
+            out.write_text(
+                json.dumps(
+                    {
+                        "overlapped_ids": overlapped,
+                        "segments": len(overlapped),
+                        "seconds": round(seconds, 2),
+                        "speech_ratio": round(seconds / total, 4) if total > 0 else 0.0,
+                        "mode": "dominant",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return flags
+
+        result = self._stage("overlap", [out], build)
+        if result is not None:
+            flags = result
+        else:
+            flags = {segment_id: True for segment_id in self._overlapped_ids()}
+
+        # Annotated here so both the fresh and the cached path leave the transcript
+        # in the same state, exactly as the diarization stage does for speakers.
+        for segment in transcript.segments:
+            segment.overlapped = bool(flags.get(segment.id, False))
+        return flags
 
     def _reference_speech_rate(self) -> float | None:
         """Words per second of the target language, measured from a reference clip.
@@ -1367,27 +1619,40 @@ class Pipeline:
                     sum(trimmed.values()),
                 )
 
-            # Lay the dub over the background so music and ambience survive. The
-            # bed is ducked exactly where dialogue plays, which is what keeps the
-            # voice intelligible without muting the soundtrack.
-            background = self._background_path()
-            if background is not None:
-                regions = [(p.start, p.end) for p in timeline.placements]
-                bed, bed_rate = media.load_audio(background)
-                if bed_rate != sample_rate:
-                    bed = media.resample(bed, bed_rate, sample_rate)
-                timeline = Timeline(
-                    samples=duck_and_mix(
-                        timeline.samples,
-                        bed,
-                        regions,
-                        sample_rate,
-                        duck_db=self.job.duck_db,
-                        background_gain_db=self.job.background_gain_db,
-                    ),
-                    sample_rate=sample_rate,
-                    placements=timeline.placements,
+            regions = [(p.start, p.end) for p in timeline.placements]
+
+            # Room matching: put the dub *in* the source's space instead of on top
+            # of it. Both the reverb and the room-tone floor come from the separated
+            # speech stem, the only material that carries the room.
+            room_stats, speech, tone = self._match_room(
+                timeline.samples, regions, sample_rate
+            )
+            if self.job.room_matching:
+                # Only written when the feature was asked for, so a dry job leaves
+                # no artifact that would make it look like something happened.
+                (self.job_dir / _ROOM_NAME).write_text(
+                    json.dumps(room_stats, indent=2), encoding="utf-8"
                 )
+
+            # Lay the dub over the bed so music and ambience survive. The bed is
+            # ducked exactly where dialogue plays, which is what keeps the voice
+            # intelligible without muting the soundtrack - but shallower once the
+            # dub has been placed in the room, because the room is part of the voice.
+            timeline = Timeline(
+                samples=duck_and_mix(
+                    speech,
+                    self._load_bed(sample_rate, tone),
+                    regions,
+                    sample_rate,
+                    duck_db=(
+                        self.job.room_duck_db
+                        if room_stats["applied"]
+                        else self.job.duck_db
+                    ),
+                ),
+                sample_rate=sample_rate,
+                placements=timeline.placements,
+            )
 
             media.write_audio(out, timeline.samples, sample_rate)
             (self.job_dir / _TIMING_NAME).write_text(
@@ -1533,6 +1798,16 @@ class Pipeline:
     ) -> dict[str, Any]:
         """Collect cheap quality signals so a run can be judged without listening."""
         source_lufs = self._source_loudness()
+        room = self._room_stats()
+        has_background = self._background_path() is not None
+        # Room matching ducks the bed more gently, so report the depth actually
+        # used (``room_duck_db``) rather than the flag the user passed.
+        if has_background and room and room.get("applied"):
+            effective_duck: float | None = room.get("duck_db", self.job.duck_db)
+        elif has_background:
+            effective_duck = self.job.duck_db
+        else:
+            effective_duck = None
         ratios = [p.ratio for p in timeline.placements]
         shifted = sum(1 for p in timeline.placements if p.shifted)
         overruns = [p.overrun for p in timeline.placements]
@@ -1557,7 +1832,7 @@ class Pipeline:
             for p in timeline.placements
         )
         spoken_total = sum(p.synth_seconds for p in timeline.placements)
-        return {
+        report = {
             "job_id": self.job_id,
             "input": str(self.input_path),
             "is_video": self.job.is_video,
@@ -1583,8 +1858,8 @@ class Pipeline:
             # True when the limiter engaged: peaks were reduced so the target
             # loudness could be reached without clipping.
             "loudness_peak_limited": loudness.peak_limited,
-            "background_preserved": self._background_path() is not None,
-            "duck_db": self.job.duck_db if self._background_path() is not None else None,
+            "background_preserved": has_background,
+            "duck_db": effective_duck,
             "accent_mode": self.job.accent_mode,
             "donor": self._donor_info(),
             #: Which voices were found and how much each of them said. ``None``
@@ -1643,3 +1918,15 @@ class Pipeline:
             },
             "stage_seconds": self._stage_seconds,
         }
+        # Present only when overlap detection actually ran, so a one-voice job
+        # reports exactly what it did before this stage existed. A line carrying a
+        # second voice is dubbed in the dominant speaker's voice and counted here
+        # rather than silently attributed to one person.
+        overlap = self._overlap_stats()
+        if overlap is not None:
+            report["overlap"] = overlap
+        # Present only when room matching was requested, so a dry run's report
+        # stays byte-for-byte what it was before this feature existed.
+        if room is not None:
+            report["room"] = room
+        return report

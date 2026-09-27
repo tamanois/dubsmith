@@ -49,201 +49,15 @@ everyone against one clip, which is only useful for a deliberate A/B.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-import numpy as np
-
-from pipeline import media
+from pipeline.audit import audit_job
+from pipeline.errors import AuditError
 from pipeline.tts import TTSEngine
 
 #: Where the base checkpoint lives in this repo.
 DEFAULT_MODEL_DIR = Path("models/Qwen3-TTS-12Hz-1.7B-Base")
-BLEND_NAME = "04_dubbed/reference_blend.wav"
-BLEND_PATTERN = "04_dubbed/reference_blend_{speaker}.wav"
-DONOR_NAME = "04_dubbed/donor.json"
-SPEAKERS_NAME = "02b_speakers.json"
-ANCHOR_WINDOW_S = 7.0
-
-
-def cosine(left: np.ndarray, right: np.ndarray) -> float:
-    """Cosine similarity between two embedding vectors."""
-    return float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right)))
-
-
-def segment_ids(job_dir: Path) -> set[int]:
-    """Ids this job actually produced, so stale clips from older runs are ignored.
-
-    Nothing used to clean ``04_dubbed/``, so a job re-run with a different
-    segmentation can still hold orphaned clips from the previous one.
-    """
-    for name in ("timing.json", "02_transcript.json"):
-        path = job_dir / name
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, list):
-            return {int(item["id"]) for item in payload}
-        if isinstance(payload, dict) and "segments" in payload:
-            return {int(item["id"]) for item in payload["segments"]}
-    return set()
-
-
-def embed(engine: TTSEngine, samples: np.ndarray, rate: int) -> np.ndarray:
-    return engine.speaker_embedding(np.asarray(samples, dtype=np.float32), rate)
-
-
-def speaker_labels(job_dir: Path) -> dict[int, str]:
-    """Segment id to speaker, for a job that recorded a diarization.
-
-    Empty for a single-voice job, which is what makes the audit fall back to
-    measuring every line against one clip.
-    """
-    path = job_dir / SPEAKERS_NAME
-    if not path.is_file():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    try:
-        return {int(key): str(value) for key, value in payload.items()}
-    except (TypeError, ValueError):
-        return {}
-
-
-def speaker_order(labels: dict[int, str]) -> list[str]:
-    """Speakers in order of first appearance, as the pipeline numbers them."""
-    order: list[str] = []
-    for speaker in labels.values():
-        if speaker not in order:
-            order.append(speaker)
-    return order
-
-
-def reference_for(job_dir: Path, speaker: str, override: Path | None) -> Path:
-    """The clip a speaker's lines were supposed to be cloned from.
-
-    With several voices each speaker has their own blend clip, and a line must be
-    measured against the voice *it* was cloned from: comparing it to another
-    speaker's clip would report a voice change that never happened.
-    """
-    if override is not None:
-        return override
-    per_speaker = job_dir / BLEND_PATTERN.format(speaker=speaker)
-    return per_speaker if per_speaker.is_file() else job_dir / BLEND_NAME
-
-
-def margin_for(
-    engine: TTSEngine,
-    samples: np.ndarray,
-    rate: int,
-    reference: np.ndarray,
-    accent: np.ndarray,
-) -> tuple[float, float, float]:
-    """Score one clip: ``(margin, similarity to reference, similarity to accent)``."""
-    line = embed(engine, samples, rate)
-    to_reference = cosine(line, reference)
-    to_accent = cosine(line, accent)
-    return (to_reference - to_accent, to_reference, to_accent)
-
-
-def collapse_anchor(
-    engine: TTSEngine,
-    accent_samples: np.ndarray,
-    accent_rate: int,
-    reference: np.ndarray,
-    accent: np.ndarray,
-) -> float:
-    """Where the accent speaker's *own* speech scores on this scale.
-
-    A line at or below this followed the accent voice, so it bounds the useful
-    range of the measurement rather than being an arbitrary threshold.
-    """
-    windows = [
-        accent_samples[int(start * accent_rate) : int((start + ANCHOR_WINDOW_S) * accent_rate)]
-        for start in (0.0, ANCHOR_WINDOW_S)
-    ]
-    return float(
-        np.mean(
-            [margin_for(engine, window, accent_rate, reference, accent)[0] for window in windows]
-        )
-    )
-
-
-def audit(
-    job_dir: Path,
-    engine: TTSEngine,
-    reference: Path,
-    accent: Path,
-    *,
-    speaker: str | None = None,
-    only_ids: set[int] | None = None,
-) -> dict:
-    """Measure one group of lines against one reference clip.
-
-    Args:
-        speaker: Speaker this group belongs to, for the report; ``None`` when the
-            job has a single voice.
-        only_ids: Restrict the clips to these segment ids. ``None`` audits all of
-            the job's own lines.
-    """
-    ref_samples, ref_rate = media.load_audio(reference)
-    accent_samples, accent_rate = media.load_audio(accent)
-    ref_embed = embed(engine, ref_samples, ref_rate)
-    accent_embed = embed(engine, accent_samples, accent_rate)
-
-    known = segment_ids(job_dir)
-    dub_dir = job_dir / "04_dubbed"
-    rows: list[tuple[str, float, float, float]] = []
-    skipped = 0
-    for path in sorted(dub_dir.glob("seg_*.wav")):
-        number = int(path.stem.split("_")[1])
-        # Orphans from an older, differently segmented run: not this job's lines.
-        if known and number not in known:
-            skipped += 1
-            continue
-        if only_ids is not None and number not in only_ids:
-            continue
-        samples, rate = media.load_audio(path)
-        if samples.size == 0:
-            continue
-        margin, to_reference, to_accent = margin_for(
-            engine, samples, rate, ref_embed, accent_embed
-        )
-        rows.append((path.stem, to_reference, to_accent, margin))
-
-    margins = np.asarray([row[3] for row in rows], dtype=np.float64)
-    return {
-        "job_dir": job_dir,
-        "speaker": speaker,
-        "reference": reference,
-        "rows": rows,
-        "skipped": skipped,
-        "min": float(margins.min()) if margins.size else float("nan"),
-        "median": float(np.median(margins)) if margins.size else float("nan"),
-        "max": float(margins.max()) if margins.size else float("nan"),
-        "collapsed": [row[0] for row in rows if row[3] < 0.0],
-        "target_anchor": 1.0 - cosine(ref_embed, accent_embed),
-        "collapsed_anchor": collapse_anchor(
-            engine, accent_samples, accent_rate, ref_embed, accent_embed
-        ),
-    }
-
-
-def accent_path_for(job_dir: Path) -> Path | None:
-    """The accent clip this job borrowed pronunciation from."""
-    path = job_dir / DONOR_NAME
-    if not path.is_file():
-        return None
-    accent = json.loads(path.read_text(encoding="utf-8")).get("accent", {})
-    return Path(accent["path"]) if accent.get("path") else None
 
 
 def report(result: dict) -> None:
@@ -307,43 +121,15 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     for job in args.jobs:
-        job_dir = Path(job)
-        accent = args.accent or accent_path_for(job_dir)
-        if accent is None or not Path(accent).is_file():
-            print(f"{job_dir}: no accent clip found; pass --accent.", file=sys.stderr)
-            return 2
-
-        labels = speaker_labels(job_dir)
-        voices = speaker_order(labels)
-        if args.reference is not None or len(voices) < 2:
-            # One voice (or a measuring stick chosen by hand): every line is
-            # measured against the same clip, as before.
-            reference = args.reference or (job_dir / BLEND_NAME)
-            if not reference.is_file():
-                print(
-                    f"{job_dir}: no reference clip at {reference}.\n"
-                    "  A single-stage job produces none - pass --reference pointing at "
-                    "another job's reference_blend.wav.",
-                    file=sys.stderr,
+        try:
+            results.extend(
+                audit_job(
+                    Path(job), engine, accent=args.accent, reference=args.reference
                 )
-                return 2
-            results.append(audit(job_dir, engine, reference, accent))
-            continue
-
-        # Several voices: each speaker is measured against their own blend clip,
-        # so a line is never judged against another voice.
-        for name in voices:
-            reference = reference_for(job_dir, name, None)
-            if not reference.is_file():
-                print(
-                    f"{job_dir}: no blend clip for {name} at {reference}.",
-                    file=sys.stderr,
-                )
-                return 2
-            owned = {sid for sid, who in labels.items() if who == name}
-            results.append(
-                audit(job_dir, engine, reference, accent, speaker=name, only_ids=owned)
             )
+        except AuditError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     for result in results:
         report(result)

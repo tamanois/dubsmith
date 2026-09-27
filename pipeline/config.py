@@ -10,6 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .diarize import DEFAULT_THRESHOLD, MIN_SPEAKER_S
 from .errors import ConfigError
+from .mixing import (
+    DEFAULT_ROOM_DUCK_DB,
+    DEFAULT_ROOM_TONE_GAIN_DB,
+    DEFAULT_ROOM_WET_DB,
+)
 
 __all__ = [
     "LANGUAGE_ALIASES",
@@ -316,6 +321,28 @@ class JobConfig(BaseModel):
     #: Static offset applied to the background stem (lift or lower the bed).
     background_gain_db: float = Field(default=0.0, ge=-30.0, le=30.0)
 
+    # Room matching. A dry, close voice-over is the *correct* choice for narrated
+    # content, so it stays the default; "match" places the dub in the source's own
+    # acoustic space instead of laying it on top of the picture.
+    #   "off"   -> dry dub over the ducked bed (the long-standing behaviour)
+    #   "match" -> reverb, a continuous room-tone floor and a softer duck, all
+    #              derived from the separated speech stem
+    room: str = "off"
+    #: RT60 in seconds to use instead of measuring it from the speech stem. An
+    #: escape hatch for a source whose decay cannot be estimated (or for A/B tests).
+    room_rt60: float | None = Field(default=None, ge=0.05, le=5.0)
+    #: Level of the reverb tail relative to the dry voice. ``0`` (the default) means
+    #: **no reverb**: the convolutive stage is opt-in, because it can only be judged
+    #: by ear and the first default was rejected on a real listen as an audible echo.
+    room_wet_db: float = Field(default=DEFAULT_ROOM_WET_DB, ge=-60.0, le=0.0)
+    #: How far the bed is pulled down under dialogue when matching a room. Shallower
+    #: than ``duck_db``: the room is part of the voice, so a deep duck fights it.
+    room_duck_db: float = Field(default=DEFAULT_ROOM_DUCK_DB, ge=0.0, le=30.0)
+    #: Level of the room-tone floor taken from the speech stem's non-speech parts.
+    room_tone_gain_db: float = Field(
+        default=DEFAULT_ROOM_TONE_GAIN_DB, ge=-60.0, le=0.0
+    )
+
     # Voice accent.
     #   "preserve"         -> clone the speaker's voice AND accent (ICL mode)
     #   "speaker-only"     -> keep only the speaker embedding, letting the model
@@ -492,6 +519,27 @@ class JobConfig(BaseModel):
                 f"Unknown length budget {value!r}. Use: off or words"
             ) from None
 
+    @field_validator("room")
+    @classmethod
+    def _check_room(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "off": "off",
+            "none": "off",
+            "dry": "off",
+            "false": "off",
+            "match": "match",
+            "on": "match",
+            "true": "match",
+            "reverb": "match",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown room mode {value!r}. Use: off or match"
+            ) from None
+
     @field_validator("target_language")
     @classmethod
     def _check_target(cls, value: str) -> str:
@@ -551,8 +599,10 @@ class JobConfig(BaseModel):
             )
 
         # The blend knobs only mean anything in reference-accent mode, and a
-        # silently ignored knob is worse than a rejected one. `model_fields_set`
-        # distinguishes "left at its default" from "the user asked for this".
+        # silently ignored knob is worse than a rejected one. "Asked for" is
+        # decided by the *value*, not by ``model_fields_set``: the CLI passes every
+        # flag explicitly, so a default of ``None`` would otherwise look like a
+        # request and reject the plain `dub.py --video in.mp4 --target fr`.
         if self.accent_mode != "reference-accent":
             for field_name, flag in (
                 ("accent_blend", "--accent-blend"),
@@ -560,7 +610,7 @@ class JobConfig(BaseModel):
                 ("blend_iters", "--blend-iters"),
                 ("blend_ratio", "--blend-ratio"),
             ):
-                if field_name in self.model_fields_set:
+                if getattr(self, field_name) is not None:
                     raise ConfigError(
                         f"{flag} only applies to --accent-mode reference-accent; add "
                         f"that flag or drop {flag}."
@@ -607,6 +657,11 @@ class JobConfig(BaseModel):
     def multi_speaker(self) -> bool:
         """True when the job asked for speaker separation."""
         return self.diarizer != "none"
+
+    @property
+    def room_matching(self) -> bool:
+        """True when the dub should be placed in the source's acoustic space."""
+        return self.room == "match"
 
     @property
     def input_path(self) -> Path:

@@ -460,10 +460,42 @@ Each is built by the same measured search as the single-voice case, with its own
 original `reference_blend.wav` name, so existing scripts and
 `audit_timbre.py` are unaffected.
 
+**Overlapping speech is detected, not guessed away.** Speakers are attributed per
+segment, not per word, so a segment where two people talk over each other cannot
+be given to both of them. Each segment is therefore re-embedded in 2.5 s windows
+and every window is checked against the speakers the labels already establish: a
+line is flagged when a *run* of its windows fits another of those speakers better
+than its own, while its own speaker still owns the majority of it. Flagged lines
+are listed in `02c_overlap.json`, counted in `report.json` → `overlap`, and named
+in the log:
+
+```
+Overlapping speech detected in 1 of 16 segment(s): #1. Each is dubbed in the
+voice of its dominant speaker, so the second voice is not separately dubbed.
+```
+
+The 2.5 s window is measured, not chosen by taste. On the two-person clip in this
+repo a 1 s window splits one speaker's *own* voice by up to 1.08 cosine distance —
+more than three times the 0.34 that separates the two speakers — so short windows
+report noise rather than a second voice (re-clustering them flagged 14 of 16
+segments). Comparing against a speaker *centroid* rather than against other
+windows is the other half of the fix, because an average over many windows is
+what cancels that noise; and a one-voice job is never flagged at all, since with
+no second centroid there is nothing for a window to match.
+
+The trade-off is sensitivity, and it is deliberate: an interruption shorter than
+about a window is not caught, and a segment whose windows *all* match another voice
+is treated as a labelling problem rather than an overlap. On this repo's clip the
+detector flags 1 of 16 segments. A flagged line is still dubbed in one voice —
+separating the two speakers so both can be re-voiced is the next step — but the
+limitation is measured rather than silent. A one-voice job skips the check
+entirely, so its report is unchanged.
+
 **What is *not* attempted.** Speakers are attributed per segment, not per word, so
-a segment where two people overlap is given to one of them. The number of
-speakers comes out of the clustering rather than being declared, so
-`--speaker-threshold` is the knob to reach for when the count looks wrong.
+a segment where two people overlap is dubbed in the voice of its dominant speaker
+(see above). The number of speakers comes out of the clustering rather than being
+declared, so `--speaker-threshold` is the knob to reach for when the count looks
+wrong.
 
 Measured on this repo's TED talk, same French lines and same donor, so the three
 rows are directly comparable:
@@ -518,6 +550,37 @@ above used a machine transcript of the accent clip. Just avoid paraphrasing: the
 text has to match the audio it describes, so correct any obviously normalised
 numbers or names by hand.
 
+### Placing the dub in the room
+
+Synthesised speech is close-mic'd and dry. Laid over a soundtrack it can read as a
+voice *on top of* the picture rather than someone *in* it — the speaker's identity
+is right, the sense of place is missing. `--room match` fixes that as a
+post-synthesis step, so it cannot disturb the voice cloning. It does two things:
+
+- the **room-tone floor**: the separated speech stem's quiet passages (genuine
+  ambience, not the speaker) become a continuous bed under the dub;
+- a **gentler duck** (`--room-duck-db`, 3 dB instead of 6), because the room is
+  part of the voice and a deep duck pulls it away again.
+
+```bash
+python dub.py --video talk.mp4 --target fr --room match
+```
+
+**The reverb tail is opt-in and off by default.** An earlier version enabled it at
+−12 dB, and a real listen rejected it: 2.4 s of undamped, full-bandwidth reverb
+rings under every line and reads as an echo rather than a room. `--room-wet-db -20`
+adds a tail if you want one — the impulse response is now low-passed at 4 kHz,
+because a real room absorbs treble and flat noise does not.
+
+It is **off by default** for the same reason the dry voice-over is the default: a
+close voice-over is correct for narrated content, so it should stay reachable
+rather than being silently replaced. Two things to know before enabling it. The
+RT60 is estimated from the source's own decay, so it is a starting point — trust
+your ears and tune with `--room-rt60` and `--room-wet-db`. And it needs the speech
+stem, which only exists when the background is kept: with `--no-background` the dub
+is delivered dry and `report.json` says `room.applied: false` rather than inventing
+a space.
+
 ### Options in full
 **Input and language** — exactly one of `--video` / `--audio` is required.
 
@@ -557,6 +620,11 @@ numbers or names by hand.
 | `--no-background` | off | Discards the original music/ambience. By default it is separated out and ducked under the dub instead. |
 | `--separator BACKEND` | `auto` | `auto`, `demucs` (split speech from the bed), or `none` (treat the source as a single track). |
 | `--duck-db DB` | `6.0` | How far the background drops while dialogue plays. Higher = the voice sits more forward. |
+| `--room MODE` | `off` | `match` places the dub in the source's own acoustic space — a reverb tail, a continuous room-tone floor, and a shallower duck. `off` keeps the dry voice-over, which is the right choice for narrated content. Needs the background to be kept (the default). |
+| `--room-rt60 SECONDS` | measured | Reverberation time to use instead of measuring one from the speech stem. An escape hatch for a source whose decay cannot be estimated. |
+| `--room-wet-db DB` | `0` | Reverb level relative to the dry voice. **`0` means no reverb** — the tail is opt-in, because it can only be judged by ear and the first default was rejected on a real listen as an audible echo. Try `-20` to enable a subtle tail. |
+| `--room-duck-db DB` | `3.0` | How far the bed drops under dialogue when `--room match`. Shallower than `--duck-db`, because the room is part of the voice. |
+| `--room-tone-db DB` | `-30.0` | Level of the room-tone floor lifted from the speech stem's pauses. |
 | `--loudness POLICY` | `match-source` | `match-source` puts the dub at the original track's measured level; `lufs` forces `--lufs` instead. |
 | `--lufs VALUE` | `-16` | Absolute loudness target in LUFS. Only used with `--loudness lufs`. |
 
@@ -671,6 +739,7 @@ output/talk/
 ├── 01c_background.wav   # separated music/ambience stem
 ├── 02_transcript.json   # ASR result: segments, words, timings, language
 ├── 02b_speakers.json    # segment id -> speaker, from diarization
+├── 02c_overlap.json     # which segments carry a second voice (multi-speaker runs)
 ├── 03_script.json       # source -> target text per segment
 ├── 03b_spoken.json      # lines the length repair re-wrote (only those)
 ├── 03c_refine.json      # what the length repair achieved
@@ -680,6 +749,7 @@ output/talk/
 │   ├── reference_blend_SPK_1.wav   # ...one per speaker once there are several
 │   └── blend.json       # only in reference-accent: how each clip was chosen
 ├── 05_mix.wav           # assembled dub track, before normalisation
+├── 05_room.json         # only with --room match: the decay measured and levels used
 ├── timing.json          # per-segment stretch ratio, placement and deficit
 ├── dub.wav              # final loudness-normalised dub audio
 ├── video_dubbed.mp4     # dubbed video (video input only)
@@ -704,9 +774,11 @@ output/talk/
 | `loudness_gain_db` | Total gain applied to reach the target |
 | `loudness_peak_limited` | `true` when the limiter engaged to avoid clipping |
 | `background_preserved` | `true` when the original music/ambience was kept |
-| `duck_db` | Attenuation applied under dialogue (`null` when no background) |
+| `duck_db` | Attenuation applied under dialogue (`null` when no background). With `--room match` this is the shallower `--room-duck-db`, i.e. the depth actually used |
+| `room` | Present only with `--room match`: the mode, whether it was applied, the measured `rt60_s`, whether the reverb tail is on (`reverb`), and the `wet_db` / `tone_gain_db` / `duck_db` used. Absent — not `null` — on a dry run, so previous reports read unchanged. `applied: false` means the speech stem was missing (usually `--no-background`) and the dub was delivered dry |
 | `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
 | `speakers` | One entry per voice with its segment count and speech time, or `null` for a one-voice job — so single-voice reports read exactly as they did before diarization existed. The names (`SPK_0`, …) are the ones in `02b_speakers.json` |
+| `overlap` | Present only on multi-speaker runs: how many segments were found to carry a second voice (`segments`, `seconds`, `speech_ratio`) and how they were handled (`mode: "dominant"`). Those lines are still dubbed in their dominant speaker's voice; this field records the limitation rather than hiding it. Absent — not `null` — on a one-voice job |
 | `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
 | `donor.speaker_count` | How many voices the run found |
 | `donor.primary_speaker` | The speaker with the most speech. Its own fields are also copied to the top level of `donor`, so `donor.source` / `donor.accent` / `donor.blend` keep naming the voice a single-speaker job would have used |
@@ -791,7 +863,7 @@ video/audio ─► 1. audio extract ─► 2. separate ─► 3. ASR + VAD ─�
 | 4 | Diarize | `pipeline/diarize.py` | embeds each segment and clusters the embeddings into speakers |
 | 5 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
 | 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker |
-| 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked background |
+| 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked bed — optionally matched to the source's room |
 | 8 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
 
 Three design points worth knowing:
@@ -807,6 +879,12 @@ Three design points worth knowing:
   start time; a line that does not fit spills into the pause after it and any
   residue beyond that is trimmed. Lines are never pushed late, so a long
   translation cannot make the rest of the video drift out of sync.
+- **The room can be borrowed without touching the voice.** Synthetic speech is
+  recorded close and dry, which reads as a voice laid over the picture. With
+  `--room match`, the decay (RT60) is measured from the separated speech stem —
+  the only material that carries the room — and applied as a convolution over the
+  finished dub, while the stem's own pauses become a continuous room-tone floor.
+  It runs after synthesis, so it cannot disturb the voice cloning.
 
 ---
 
@@ -822,7 +900,7 @@ python -m pytest
 ```
 
 ```
-565 passed
+674 passed
 ```
 
 Run a single area while iterating:
@@ -832,6 +910,8 @@ python -m pytest tests/test_tts.py -q          # voice cloning, accent modes
 python -m pytest tests/test_pipeline.py -q     # end-to-end orchestration
 python -m pytest tests/test_multi_speaker.py -q  # per-speaker dubbing
 python -m pytest tests/test_diarize.py -q      # speaker clustering
+python -m pytest tests/test_audit.py -q        # timbre audit + quality gates
+python -m pytest tests/test_mixing.py -q       # ducking, room matching
 python -m pytest -k accent -q                  # everything accent-related
 ```
 
@@ -870,6 +950,34 @@ must not be judged against another's. Each group is its own scale — two voices
 have two different "pure accent" floors — so the anchors are printed per group.
 `--reference` overrides that and measures everyone against one clip, which is only
 useful for a deliberate A/B.
+
+### Checking a dub automatically
+
+`audit_qc.py` turns the signals in `report.json` — and, optionally, the timbre
+audit above — into pass/fail gates. It never blocks the pipeline: the dub is
+already written, so a failure is a verdict on the delivery rather than a reason to
+lose the work. Exit status is `0` when every gate passes, `1` when one fails, and
+`2` when the job could not be checked at all, which makes it usable in CI.
+
+```bash
+python audit_qc.py "output/<input-stem>"              # cheap gates, no GPU
+python audit_qc.py "output/<input-stem>" --timbre      # adds the per-line timbre gate
+python audit_qc.py "output/<input-stem>" --json        # machine-readable
+```
+
+| Gate | Checks | Default limit |
+|---|---|---|
+| `sync` | No line pushed later than its slot | `shifted_segments == 0` |
+| `truncation` | No line loses a meaningful share of its words | worst line ≤ 10%, no line over 10% |
+| `loudness` | The dub sits at the source's level | within 1.5 dB (skipped if unmeasurable) |
+| `timbre` | No line followed the accent voice instead of the speaker's | 0% (needs `--timbre`) |
+
+Filling the pause after a line is *not* a failure — overrunning into silence costs
+nothing and is how sync is preserved — so `overrun` is reported as context rather
+than gated. Every limit can be overridden (`--max-shifted`, `--max-deleted-ratio`,
+`--max-deleted-lines`, `--max-loudness-delta`, `--max-accent-share`). A gate that
+could not run (no timbre measurement, unmeasurable source loudness) is reported as
+**skipped**, never as a pass.
 
 ---
 
@@ -911,7 +1019,8 @@ useful for a deliberate A/B.
 | `--blend-iters only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-iters` |
 | `--blend-ratio only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-ratio` |
 | Every line is dubbed in one voice, but the video has several speakers | Diarization is off or unavailable. Check the log for `Diarization (none)` — it means `--diarizer none` was set, or `funasr` is not installed. Install it (`pip install -r requirements-dev.txt`), then re-run. The detection happens before synthesis, so a cached job needs `--force` to pick up a newly installed backend |
-| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled |
+| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled. The same threshold governs overlap detection, so raising it also makes that check more conservative |
+| A line sounds like the wrong person, or you can hear two people on it | `report.json` → `overlap` counts segments that hold a second voice; `02c_overlap.json` lists their ids. Such a line is dubbed in its dominant speaker's voice, and separating the two speakers is the remaining P1 item — there is no flag for it yet. Detection is deliberately conservative (a 2.5 s run that fits another speaker better), so short interruptions are not reported |
 | Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
 | A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
 | `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
@@ -926,6 +1035,8 @@ machine-readable logs.
 
 ```
 dub.py                     CLI entry point
+audit_timbre.py            per-line speaker-timbre audit (needs the GPU)
+audit_qc.py                automated quality gate for a finished job
 pipeline/
 ├── config.py              job + settings models, language normalisation
 ├── errors.py              domain exception hierarchy
@@ -935,11 +1046,14 @@ pipeline/
 ├── subtitles.py           SRT rendering
 ├── asr.py                 transcription + segmentation
 ├── diarize.py             speaker embeddings + clustering (multi-speaker)
+├── separation.py          speech/background split (Demucs)
+├── mixing.py              ducking, bed mix and room matching (pure numpy)
 ├── translate.py           OpenAI-compatible translation
 ├── tts.py                 per-speaker donor selection + voice cloning
 ├── timing.py              stretching backends + timeline assembly
+├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (565 tests)
+tests/                     pytest suite (674 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
@@ -957,7 +1071,9 @@ PLAN.md                    roadmap: MVP + P1–P6
 - **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
   Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
 - **Multi-speaker dubbing attributes speakers per segment**, not per word, so
-  overlapping speech is given to one speaker; the speaker count comes from
+  overlapping speech is dubbed in the voice of its dominant speaker. Those
+  segments are detected and reported (`report.json` → `overlap`, `02c_overlap.json`),
+  but the second voice is not yet separately dubbed; the speaker count comes from
   clustering rather than being declared. Both are tracked in `PLAN.md`.
 - **Known MVP gaps**, all tracked in `PLAN.md`: lip sync, multi-language source
   videos, and iterative length control in the translation loop. Background
@@ -967,5 +1083,12 @@ PLAN.md                    roadmap: MVP + P1–P6
 - **Accent borrowing needs a supplied clip.** `reference-accent` takes
   pronunciation from `--accent-audio`; it does not yet choose or generate a
   native voice by itself. Fully unattended native accent is roadmap P2.
+- **Room matching is off by default and adds no reverb unless asked.**
+  `--room match` adds a room-tone floor and a gentler duck, both derived from the
+  separated speech stem. A dry, close voice-over is the correct choice for narrated
+  content, which is why it stays the default. The reverb tail is a separate, opt-in
+  step (`--room-wet-db -20`): an earlier default of −12 dB was rejected on a real
+  listen as an audible echo. `--no-background` removes the stem, so room matching
+  then degrades to a dry dub and says so (`report.json` → `room.applied: false`).
 - **Changing any setting re-runs the whole job** — the cache fingerprint is
   per-job, not per-stage. Fine for a CLI; worth refining before P6.

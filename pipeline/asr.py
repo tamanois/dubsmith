@@ -56,6 +56,10 @@ class Segment(BaseModel):
     #: diarization existed, and every run with ``--diarizer none``, which the rest
     #: of the pipeline treats as a single voice.
     speaker: str | None = None
+    #: True when the overlap stage found a second voice inside this utterance. A
+    #: flagged line is still dubbed in its dominant speaker's voice; the flag is
+    #: what makes the second voice visible instead of silently attributed.
+    overlapped: bool = False
 
     @property
     def duration(self) -> float:

@@ -419,3 +419,121 @@ class TestLengthRepairOptions:
     def test_unknown_length_budget_is_rejected(self) -> None:
         with pytest.raises(ConfigError, match="Unknown length budget"):
             JobConfig(audio=Path("a.wav"), length_budget="syllables")
+
+
+class TestRoomMatchingOptions:
+    """Options controlling the room-matching pass (P3d)."""
+
+    def test_dry_is_the_default(self) -> None:
+        job = JobConfig(audio=Path("a.wav"))
+        assert job.room == "off"
+        assert job.room_matching is False
+        assert job.room_rt60 is None
+        # Reverb is opt-in: 0 dB means none, because the first default (-12 dB) was
+        # rejected on a real listen as an audible echo.
+        assert job.room_wet_db == pytest.approx(0.0)
+        assert job.room_duck_db == pytest.approx(3.0)
+        assert job.room_tone_gain_db == pytest.approx(-30.0)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("off", "off"),
+            ("none", "off"),
+            ("dry", "off"),
+            ("False", "off"),
+            ("match", "match"),
+            ("on", "match"),
+            ("True", "match"),
+            ("reverb", "match"),
+        ],
+    )
+    def test_room_aliases(self, raw: str, expected: str) -> None:
+        assert JobConfig(audio=Path("a.wav"), room=raw).room == expected
+
+    def test_unknown_room_mode_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown room mode"):
+            JobConfig(audio=Path("a.wav"), room="concert-hall")
+
+    def test_match_enables_the_property(self) -> None:
+        assert JobConfig(audio=Path("a.wav"), room="match").room_matching is True
+
+    def test_room_matching_ducks_the_bed_more_gently_than_the_default(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), room="match")
+        assert job.room_duck_db < job.duck_db
+
+
+class TestCliJobConfig:
+    """The flag-to-config mapping ``dub.py`` uses, exercised through the real parser.
+
+    These tests exist because a validator that keys off ``model_fields_set`` rather
+    than the value rejects an ordinary run: the CLI passes every flag explicitly,
+    including its ``None`` defaults.
+    """
+
+    def test_the_default_invocation_is_accepted(self) -> None:
+        """The Definition of Done's one-liner must build a valid config."""
+        import dub
+
+        args = dub.build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
+        job = dub.job_config_from_args(args)
+
+        assert job.accent_mode == "preserve"
+        assert job.room == "off"
+        assert job.accent_blend_mode == "two-stage"  # the resolved default
+
+    def test_room_match_is_accepted_and_wired(self) -> None:
+        import dub
+
+        args = dub.build_dub_parser().parse_args(
+            ["--video", "in.mp4", "--target", "fr", "--room", "match"]
+        )
+        job = dub.job_config_from_args(args)
+
+        assert job.room_matching is True
+        assert job.room_duck_db == pytest.approx(3.0)
+
+    @pytest.mark.parametrize(
+        ("flag", "value"),
+        [
+            ("--accent-blend", "two-stage"),
+            ("--blend-takes", "2"),
+            ("--blend-iters", "2"),
+            ("--blend-ratio", "0.5"),
+        ],
+    )
+    def test_a_blend_flag_without_the_accent_mode_is_still_rejected(
+        self, flag: str, value: str
+    ) -> None:
+        """The guard still does its job for a knob the user actually asked for."""
+        import dub
+
+        args = dub.build_dub_parser().parse_args(
+            ["--video", "in.mp4", "--target", "fr", flag, value]
+        )
+        with pytest.raises(ConfigError, match="only applies to --accent-mode"):
+            dub.job_config_from_args(args)
+
+    def test_rt60_override_is_bounded(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), room_rt60=1.2)
+        assert job.room_rt60 == pytest.approx(1.2)
+        with pytest.raises(ValidationError):
+            JobConfig(audio=Path("a.wav"), room_rt60=0.0)
+
+    def test_out_of_range_levels_are_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            JobConfig(audio=Path("a.wav"), room_wet_db=3.0)
+        with pytest.raises(ValidationError):
+            JobConfig(audio=Path("a.wav"), room_duck_db=-1.0)
+        with pytest.raises(ValidationError):
+            JobConfig(audio=Path("a.wav"), room_tone_gain_db=6.0)
+
+    def test_fingerprint_changes_with_the_room_mode(self) -> None:
+        dry = JobConfig(audio=Path("a.wav"))
+        roomed = JobConfig(audio=Path("a.wav"), room="match")
+        assert dry.fingerprint() != roomed.fingerprint()
+
+    def test_fingerprint_changes_with_the_room_knobs(self) -> None:
+        base = JobConfig(audio=Path("a.wav"), room="match")
+        louder = JobConfig(audio=Path("a.wav"), room="match", room_wet_db=-6.0)
+        assert base.fingerprint() != louder.fingerprint()

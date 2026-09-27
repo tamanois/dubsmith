@@ -8,6 +8,7 @@ patched where a video would be probed or muxed.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +20,7 @@ from pipeline import media
 from pipeline.asr import Segment, Transcript
 from pipeline.config import JobConfig, Settings
 from pipeline.errors import MediaError, TranslationError
+from pipeline.mixing import RT60_BOUNDS
 from pipeline.orchestrate import Pipeline
 from pipeline.timing import IdentityStretcher
 from pipeline.translate import ShortenRequest, TranslationRequest
@@ -34,6 +36,12 @@ def write_input(tmp_path: Path, seconds: float = 10.0, name: str = "input.wav") 
     path = tmp_path / name
     sf.write(str(path), samples, SR)
     return path
+
+
+def rms(samples: np.ndarray, window: slice) -> float:
+    """RMS of one slice, as a plain float."""
+    data = np.asarray(samples[window], dtype=np.float64)
+    return float(np.sqrt(np.mean(np.square(data))))
 
 
 class FakeTranscriber:
@@ -71,14 +79,60 @@ class FakeSeparator:
         return data, background
 
 
+class RoomToneSeparator:
+    """A separator whose speech stem has real quiet gaps, like a real recording.
+
+    ``FakeSeparator`` hands back the input unchanged as the speech stem, i.e. a
+    constant tone. The room-tone floor gates on level, so a stem with no quiet
+    frames correctly yields nothing — right, but useless for testing the floor.
+    This models the structure the floor is built from: loud utterances with
+    near-silent room tone between them, and a silent bed by default so a test can
+    measure the floor without the music masking it.
+    """
+
+    name = "roomtone"
+
+    #: Where the fake transcript speaks (matches ``simple_transcript``).
+    SPEECH = ((0.0, 2.0), (2.5, 4.5), (5.0, 8.0))
+
+    def __init__(
+        self, room_tone_amplitude: float = 0.001, background_amplitude: float = 0.0
+    ) -> None:
+        # ~-43 dB below the speech burst. Real room tone sits 40-60 dB down, which
+        # is why the level gate keeps it and rejects everything louder.
+        self.room_tone_amplitude = room_tone_amplitude
+        self.background_amplitude = background_amplitude
+        self.calls = 0
+
+    def separate(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self.calls += 1
+        data = np.asarray(samples, dtype=np.float32).reshape(-1)
+        t = np.arange(data.size, dtype=np.float64) / float(sample_rate)
+        rng = np.random.default_rng(0)
+        room = self.room_tone_amplitude * rng.standard_normal(data.size)
+        bursts = np.zeros(data.size, dtype=np.float32)
+        for start, end in self.SPEECH:
+            bursts[int(start * sample_rate) : int(end * sample_rate)] = 1.0
+        stem = (room + data * bursts).astype(np.float32)
+        background = (
+            self.background_amplitude * np.sin(2 * np.pi * 440.0 * t)
+        ).astype(np.float32)
+        return stem, background
+
+
 class FakeDiarizer:
     """Assigns scripted speakers, so per-speaker voices are assertable."""
 
     name = "fake"
 
-    def __init__(self, labels: Sequence[str]) -> None:
+    def __init__(self, labels: Sequence[str], overlap_ids: Sequence[int] = ()) -> None:
         self.labels = list(labels)
+        #: Segments the fake reports as carrying a second voice.
+        self.overlap_ids = set(overlap_ids)
         self.calls = 0
+        self.overlap_calls = 0
 
     def label(
         self,
@@ -92,6 +146,20 @@ class FakeDiarizer:
         return {
             segment_id: self.labels[index % len(self.labels)]
             for index, segment_id in enumerate(segment_ids)
+        }
+
+    def overlaps(
+        self,
+        segment_ids: Sequence[int],
+        regions: Sequence[tuple[float, float]],
+        labels: dict[int, str],
+        samples: np.ndarray,
+        sample_rate: int,
+    ) -> dict[int, bool]:
+        self.overlap_calls += 1
+        return {
+            segment_id: segment_id in self.overlap_ids
+            for segment_id in segment_ids
         }
 
 
@@ -806,6 +874,33 @@ class TestBackgroundPreservation:
         )
         assert pipeline.run().report["duck_db"] == 12.0
 
+    def test_background_gain_lifts_the_bed(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """The static offset still reaches the output after the bed was reworked.
+
+        The gain is applied to the bed when it is assembled (so a room-tone floor
+        keeps its own level), which is a different code path from passing it
+        through ``duck_and_mix``.
+        """
+
+        def gap_rms(gain_db: float, out: Path) -> float:
+            pipeline, _, _, _ = make_pipeline(
+                tmp_path,
+                simple_transcript,
+                separator=FakeSeparator(),
+                background_gain_db=gain_db,
+                output_dir=out,
+            )
+            samples, sample_rate = media.load_audio(pipeline.run().dub_track)
+            return rms(samples, slice(int(8.6 * sample_rate), int(9.6 * sample_rate)))
+
+        quiet = gap_rms(0.0, tmp_path / "out_gain0")
+        loud = gap_rms(6.0, tmp_path / "out_gain6")
+
+        assert quiet > 0.0
+        assert loud > quiet * 1.5
+
     def test_output_still_does_not_clip(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
@@ -823,6 +918,214 @@ class TestBackgroundPreservation:
         )
         samples, sample_rate = media.load_audio(pipeline.run().dub_track)
         assert len(samples) / sample_rate == pytest.approx(10.0, abs=0.1)
+
+
+class TestRoomMatching:
+    """The dub can be placed in the source's own acoustic space (P3d)."""
+
+    def test_off_is_the_default_and_leaves_the_report_unchanged(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator()
+        )
+        report = pipeline.run().report
+
+        assert "room" not in report  # dry runs report exactly as they did before
+        assert report["duck_db"] == 6.0
+        assert not (pipeline.job_dir / "05_room.json").exists()
+
+    def test_match_applies_and_is_reported(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator(), room="match"
+        )
+        report = pipeline.run().report
+
+        room = report["room"]
+        assert room["mode"] == "match"
+        assert room["applied"] is True
+        assert room["reverb"] is False  # opt-in, and off unless asked for
+        assert RT60_BOUNDS[0] <= room["rt60_s"] <= RT60_BOUNDS[1]
+        assert (pipeline.job_dir / "05_room.json").is_file()
+
+    def test_reverb_is_opt_in(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """Two room-matched runs differing only in wet level: the tail is the delta."""
+
+        def run(wet_db: float, out: Path) -> tuple[float, bool]:
+            pipeline, _, _, _ = make_pipeline(
+                tmp_path,
+                simple_transcript,
+                separator=RoomToneSeparator(),
+                room="match",
+                room_wet_db=wet_db,
+                # No room-tone floor in either run, so only the reverb can differ.
+                room_tone_gain_db=-60.0,
+                # A constant-tone stem has no measurable decay, so pin the RT60 to
+                # something long enough to still be ringing in the measured pause.
+                room_rt60=2.0,
+                output_dir=out,
+            )
+            result = pipeline.run()
+            samples, sample_rate = media.load_audio(result.dub_track)
+            pause = rms(samples, slice(int(8.6 * sample_rate), int(9.6 * sample_rate)))
+            return pause, result.report["room"]["reverb"]
+
+        dry_pause, dry_flag = run(0.0, tmp_path / "out_wet0")
+        wet_pause, wet_flag = run(-6.0, tmp_path / "out_wet6")
+
+        assert dry_flag is False
+        assert wet_flag is True
+        assert wet_pause > dry_pause
+
+    def test_match_ducks_the_bed_more_gently(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=FakeSeparator(),
+            room="match",
+            duck_db=12.0,
+        )
+        report = pipeline.run().report
+
+        # The report states the depth actually used, not the flag that was passed.
+        assert report["duck_db"] == 3.0
+        assert report["room"]["duck_db"] == 3.0
+
+    def test_explicit_rt60_overrides_the_measurement(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=FakeSeparator(),
+            room="match",
+            room_rt60=1.5,
+        )
+        assert pipeline.run().report["room"]["rt60_s"] == pytest.approx(1.5)
+
+    def test_match_without_a_speech_stem_degrades_to_dry(
+        self,
+        tmp_path: Path,
+        simple_transcript: Transcript,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No separation means no stem, so the dub is delivered dry - and says so."""
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript, room="match")
+        with caplog.at_level(logging.WARNING):
+            result = pipeline.run()
+        report = result.report
+
+        assert report["room"]["applied"] is False
+        assert report["room"]["rt60_s"] is None
+        assert report["duck_db"] is None  # no bed either
+        assert not (pipeline.job_dir / "01b_speech.wav").exists()
+        assert "Room matching needs the separated speech stem" in caplog.text
+        # Degrading must still deliver a usable dub.
+        samples, _ = media.load_audio(result.dub_track)
+        assert float(np.max(np.abs(samples))) > 0.01
+
+    def test_disabling_the_background_also_disables_room_matching(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, keep_background=False, room="match"
+        )
+        assert pipeline.run().report["room"]["applied"] is False
+
+    def test_output_length_is_unchanged(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, separator=FakeSeparator(), room="match"
+        )
+        samples, sample_rate = media.load_audio(pipeline.run().dub_track)
+        assert len(samples) / sample_rate == pytest.approx(10.0, abs=0.1)
+
+    def test_output_still_does_not_clip(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=FakeSeparator(background_amplitude=0.9),
+            room="match",
+            room_wet_db=-6.0,
+        )
+        samples, _ = media.load_audio(pipeline.run().dub_track)
+        assert float(np.max(np.abs(samples))) <= 1.0
+
+    def test_room_tone_floor_reaches_the_output(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """The floor comes from the stem's quiet gaps, so it must be audible there.
+
+        Both runs use the same separator and a silent bed, so the only difference
+        is the room-tone floor itself - not the bed, which is what the previous
+        version of this test accidentally measured.
+        """
+        dry_pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=RoomToneSeparator(),
+            output_dir=tmp_path / "out_tone_dry",
+        )
+        dry_samples, sample_rate = media.load_audio(dry_pipeline.run().dub_track)
+
+        roomed_pipeline, _, _, _ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            separator=RoomToneSeparator(),
+            room="match",
+            output_dir=tmp_path / "out_tone_roomed",
+        )
+        roomed_samples, _ = media.load_audio(roomed_pipeline.run().dub_track)
+
+        # After the last segment (8s) and before the end of the 10s input.
+        window = slice(int(8.6 * sample_rate), int(9.6 * sample_rate))
+        quiet = rms(dry_samples, window)
+        roomed = rms(roomed_samples, window)
+
+        assert quiet < 1e-5  # nothing there without room matching
+        assert roomed > quiet * 5  # the floor is placed there
+        assert roomed > 1e-6  # ...and it is not numerical noise
+
+        # After the last segment (8s) and before the end of the 10s input.
+        window = slice(int(8.6 * sample_rate), int(9.6 * sample_rate))
+        quiet = rms(dry_samples, window)
+        roomed = rms(roomed_samples, window)
+        assert quiet < 1e-4
+        assert roomed > quiet * 5
+
+    def test_the_dub_carries_a_reverb_tail(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """With the wet level up, the track rings on after a line ends."""
+        def pause(out: Path, wet_db: float) -> float:
+            pipeline, _, _, _ = make_pipeline(
+                tmp_path,
+                simple_transcript,
+                separator=RoomToneSeparator(),
+                room="match",
+                room_wet_db=wet_db,
+                room_rt60=2.0,
+                room_tone_gain_db=-60.0,
+                output_dir=out,
+            )
+            samples, sample_rate = media.load_audio(pipeline.run().dub_track)
+            return rms(samples, slice(int(8.2 * sample_rate), int(9.5 * sample_rate)))
+
+        # Both runs keep the (very quiet, -60 dB) floor, so the difference is the
+        # reverb tail: without it the pause holds nothing else.
+        off = pause(tmp_path / "out_tail_off", 0.0)
+        on = pause(tmp_path / "out_tail_on", -6.0)
+
+        assert on > off * 3
 
 
 class TestVideoJob:
