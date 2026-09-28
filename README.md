@@ -911,7 +911,7 @@ Three design points worth knowing:
 
 All tests run **without** a GPU, downloaded models, or ffmpeg — heavy components
 are injected as fakes and binaries are mocked. The whole suite runs in about
-45 seconds.
+a minute.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -919,7 +919,7 @@ python -m pytest
 ```
 
 ```
-674 passed
+756 passed
 ```
 
 Run a single area while iterating:
@@ -1073,7 +1073,7 @@ pipeline/
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (754 tests)
+tests/                     pytest suite (756 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference

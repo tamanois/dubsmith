@@ -25,7 +25,7 @@
 | Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
 | Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 674 passing | `tests/` |
+| Tests | ✅ 756 passing | `tests/` |
 
 Verification performed:
 
@@ -957,9 +957,52 @@ heard was probably the *floor* carrying the original voice — the other thing t
 change removes. Both mechanisms are now gone from the default path, but only an ear
 can confirm it, which is why the tail is opt-in rather than re-tuned by guesswork.
 
-**Status: fixed, 681 tests pass, re-verified end to end** (`RT60 1.65s measured,
+**Status: fixed, 756 tests pass, re-verified end to end** (`RT60 1.65s measured,
 room tone -30.0 dB, duck 3.0 dB, reverb off`). `--room match` now means the two
 steps the plan always said were "worth doing regardless of whether step 3 follows".
+
+### Still open (verified against the code, 2026-09-28)
+
+The capability work is implemented; this is the verified remainder, so the table
+above is not read as "finished".
+
+**Verification not yet closed**
+
+- **DoD §3.6 remains unverified.** No run longer than 4:47 has been attempted, and
+  that run hit `CUDACachingAllocator` OOM retries (absorbed by batch halving, and
+  not reproducible from a warm cache, so it looks like transient allocator state).
+- **P3f has not been re-listened to.** The fix is measured, but by its own admission
+  only an ear can confirm it — which is why the reverb tail is opt-in.
+- **P1c's happy path is unvalidated on real audio.** Only the false-positive guard has
+  run against the real SepFormer; a genuine two-voice split is covered by fakes, and
+  the detector flags 0/16 on `input/louisavy.mp4` (interruptions shorter than the
+  2.5 s window).
+
+**Code (small and self-contained)**
+
+- The `flash-attn` banner guard is described above but **not applied**, and the same
+  missing stdout wrapper lets funasr's `load_data` dump and tqdm bars through in
+  `pipeline/diarize.py` (`model.generate(...)`, no `disable_pbar`).
+- **Cache fingerprint is per-job, not per-stage** (deliberate; refine before P6).
+
+**Phases not started**
+
+- **P2** native accent (VoiceDesign anchor + voice conversion) — `tts_voice_design` is
+  registered in `pipeline/models.py` but unused, and there is no per-speaker
+  `accent: preserve | native` knob.
+- **P3** model bake-off harness — the only remaining P3 item.
+- **P4** lip sync, **P5** multi-source-language (per-utterance LID), **P6**
+  service-ification (FastAPI + Celery/Redis).
+
+**Engineering standards** (`.agents/technical-guidelines.md`, tracked separately)
+
+- No `mypy --strict`, Black or Ruff: `pyproject.toml` holds only pytest settings and
+  `requirements-dev.txt` only `pytest`, `funasr`, `modelscope`.
+- No coverage measurement (so the >85% target is unverified), no CI, no `Dockerfile`,
+  no `scripts/`.
+- No real tiny-fixture integration test; every heavy part is faked.
+- `structlog`/`Loguru` are not used (stdlib logging), but every record already carries
+  a `job_id` via `pipeline/logging_utils.py`.
 
 ---
 
@@ -1112,7 +1155,7 @@ people (D13).
 | Timing | `rubberband` → `sox` → `librosa` | three interchangeable backends, auto-detected; stretches clamped to ±15–18% |
 | Loudness | `pyloudnorm` (EBU R128) + a numpy limiter | `match-source` by default |
 | Mix | numpy ducking | 6 dB under dialogue, 150 ms ramps |
-| Room matching | numpy FFT convolution + a synthetic impulse response | `--room match`: RT60 measured from the speech stem, clamped to 0.2–3.0 s, 3 dB duck. No new dependency |
+| Room matching | numpy FFT convolution + a synthetic impulse response | `--room match`: room-tone floor and a 3 dB duck, plus an RT60 measured from the speech stem (clamped to 0.2–3.0 s). The reverb tail is opt-in (`--room-wet-db`, default `0` = none). No new dependency |
 | Quality gate | `audit_qc.py` over `pipeline/audit.py` | sync / truncation / loudness / timbre thresholds; exit 0/1, never blocks the dub |
 | Mux / subs | `ffmpeg`, `pipeline/subtitles.py` | video stream copied, not re-encoded |
 
@@ -1147,6 +1190,10 @@ diarizer: auto                   # auto | none (none = every line in one voice)
 speaker_threshold: 0.40          # cosine distance above which voices differ
 min_speaker_seconds: 3.0         # shorter clusters join their nearest neighbour
 
+# Overlapping speech
+overlap: dominant                # dominant | separate (--overlap)
+overlap_separator: auto          # auto | sepformer | none
+
 # Timing
 min_stretch: 0.85
 max_stretch: 1.18
@@ -1169,7 +1216,7 @@ background_gain_db: 0.0
 # Room matching (off = dry voice-over; match = the source's acoustic space)
 room: off                        # off | match
 room_rt60: null                  # null = measure it from the speech stem
-room_wet_db: -12.0               # reverb level relative to the dry voice
+room_wet_db: 0.0                 # 0 = no reverb (opt-in); -20 for a subtle tail
 room_duck_db: 3.0                # shallower than duck_db, by design
 room_tone_gain_db: -30.0         # level of the room-tone floor
 
