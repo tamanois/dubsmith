@@ -72,3 +72,20 @@ def _never_load_diarizer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "pipeline.orchestrate.detect_diarizer", lambda *args, **kwargs: NullDiarizer()
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_load_speaker_separator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite isolated from the real SepFormer backend.
+
+    ``speechbrain`` is an optional dependency: without this, a test that turns on
+    ``--overlap separate`` would download and load the SepFormer checkpoint. Tests
+    that need separation inject their own separator, so the real path stays
+    covered without a model here.
+    """
+    from pipeline.overlap_separation import NullSpeakerSeparator
+
+    monkeypatch.setattr(
+        "pipeline.orchestrate.detect_speaker_separator",
+        lambda *args, **kwargs: NullSpeakerSeparator(),
+    )

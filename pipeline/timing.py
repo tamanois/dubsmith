@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Collection, Protocol, Sequence
 
 import numpy as np
 import soundfile as sf
@@ -356,17 +356,24 @@ def build_timeline(
     *,
     sample_rate: int,
     total_duration: float | None = None,
+    overlay_ids: Collection[int] = (),
 ) -> Timeline:
     """Place fitted lines on a silent track at their original start times.
 
-    Overlaps are resolved by pushing a line later: dubbing two voices on top of
-    each other is worse than a small timing shift, and diarization already flags
-    genuinely simultaneous speech for later manual review.
+    Overlaps are resolved by pushing a line later - dubbing two voices on top of
+    each other is normally worse than a small timing shift. The exception is
+    genuinely simultaneous speech: a line whose id is in ``overlay_ids`` is the
+    second voice of a separated overlap segment, so it is summed at its true time
+    rather than shifted, because that simultaneity is exactly what separation
+    recovered.
 
     Args:
         items: ``(segment_id, start_seconds, audio)`` triples.
         sample_rate: Sample rate of every audio array.
         total_duration: Minimum track length; the result grows if needed.
+        overlay_ids: Segment ids placed at their true time instead of being pushed
+            later. An overlay line never advances the cursor, so it cannot shift a
+            following line.
 
     Returns:
         A :class:`Timeline` with the assembled audio and placement records.
@@ -374,20 +381,27 @@ def build_timeline(
     if sample_rate <= 0:
         raise TimingError("sample_rate must be positive")
 
+    overlays = set(overlay_ids)
     positions: list[tuple[int, int, np.ndarray, float, bool]] = []
     cursor = 0
+    required = 0
     for segment_id, start, audio in items:
         data = np.asarray(audio, dtype=np.float32).reshape(-1)
         if data.size == 0:
             continue
         start_sample = max(0, int(round(float(start) * sample_rate)))
+        overlay = segment_id in overlays
         shifted = False
-        if start_sample < cursor:
+        if not overlay and start_sample < cursor:
             start_sample, shifted = cursor, True
         positions.append((segment_id, start_sample, data, float(start), shifted))
-        cursor = start_sample + data.size
+        # An overlay line is simultaneous with the line it accompanies, so it must
+        # not advance the cursor even though it lengthens the track.
+        if not overlay:
+            cursor = start_sample + data.size
+        required = max(required, start_sample + data.size)
 
-    required = max(cursor, int(round((total_duration or 0.0) * sample_rate)))
+    required = max(required, int(round((total_duration or 0.0) * sample_rate)))
     track = np.zeros(required, dtype=np.float32)
 
     placements: list[Placement] = []

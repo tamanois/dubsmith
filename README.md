@@ -486,16 +486,31 @@ no second centroid there is nothing for a window to match.
 The trade-off is sensitivity, and it is deliberate: an interruption shorter than
 about a window is not caught, and a segment whose windows *all* match another voice
 is treated as a labelling problem rather than an overlap. On this repo's clip the
-detector flags 1 of 16 segments. A flagged line is still dubbed in one voice —
-separating the two speakers so both can be re-voiced is the next step — but the
-limitation is measured rather than silent. A one-voice job skips the check
-entirely, so its report is unchanged.
+detector flags 1 of 16 segments. By default a flagged line is still dubbed in one
+voice, but the limitation is measured rather than silent; `--overlap separate`
+splits it instead. A one-voice job skips the check entirely, so its report is
+unchanged.
 
-**What is *not* attempted.** Speakers are attributed per segment, not per word, so
-a segment where two people overlap is dubbed in the voice of its dominant speaker
-(see above). The number of speakers comes out of the clustering rather than being
-declared, so `--speaker-threshold` is the knob to reach for when the count looks
-wrong.
+**Both voices are dubbed with `--overlap separate`.** A flagged segment is split
+into one stream per voice by SpeechBrain's 16 kHz SepFormer, each stream is
+re-transcribed (the second voice's words are not in Whisper's one-utterance
+output), and each stream is matched to a speaker by comparing its embedding to the
+same centroids the labelling used. Both lines are then translated and synthesised
+in their own voice, and placed *simultaneously* on the timeline rather than one
+being pushed behind the other — the overlap is genuine, so the dub keeps it. The
+two voices are recorded in `02d_overlap_segments.json`, and the run's `report.json`
+→ `overlap` gains `mode: "separate"`, `separated` and `lines`.
+
+Separation is best-effort by construction: a segment whose streams cannot be told
+apart (a likely false-positive flag), or whose second stream recovers no speech, is
+left exactly as it was. `speechbrain` is an optional dependency — without it
+`--overlap separate` warns and behaves as `--overlap dominant`.
+
+**What is *not* attempted.** The number of speakers comes out of the clustering
+rather than being declared, so `--speaker-threshold` is the knob to reach for when
+the count looks wrong. Separation handles two overlapping voices per segment
+(SepFormer is a fixed two-speaker model); a third voice on the same instant is not
+recovered.
 
 Measured on this repo's TED talk, same French lines and same donor, so the three
 rows are directly comparable:
@@ -612,6 +627,8 @@ a space.
 | `--diarizer BACKEND` | `auto` | `auto` finds the speakers with the embedding model; `none` dubs every line in one voice, which is the pre-P1 behaviour. Without `funasr` installed, `auto` warns and behaves as `none`. |
 | `--speaker-threshold D` | `0.40` | Cosine distance above which two embeddings count as different people. Raise it if one speaker is being split in two; lower it if two speakers are being merged. |
 | `--min-speaker-seconds S` | `3.0` | A speaker must have at least this much speech, otherwise their lines join the nearest other voice — below the 3 s donor window there is nothing to clone from. `0` keeps every cluster. |
+| `--overlap MODE` | `dominant` | What to do with a segment that carries two voices at once. `dominant` dubs the whole line in its dominant speaker's voice; `separate` splits it and dubs both voices (needs the optional `speechbrain`). See [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers). |
+| `--overlap-separator BACKEND` | `auto` | `auto` uses SpeechBrain's SepFormer when installed, `sepformer` requires it, `none` disables it. Only used with `--overlap separate`. |
 
 **Audio bed and loudness**
 
@@ -740,6 +757,7 @@ output/talk/
 ├── 02_transcript.json   # ASR result: segments, words, timings, language
 ├── 02b_speakers.json    # segment id -> speaker, from diarization
 ├── 02c_overlap.json     # which segments carry a second voice (multi-speaker runs)
+├── 02d_overlap_segments.json   # only with --overlap separate: the per-voice lines
 ├── 03_script.json       # source -> target text per segment
 ├── 03b_spoken.json      # lines the length repair re-wrote (only those)
 ├── 03c_refine.json      # what the length repair achieved
@@ -778,7 +796,7 @@ output/talk/
 | `room` | Present only with `--room match`: the mode, whether it was applied, the measured `rt60_s`, whether the reverb tail is on (`reverb`), and the `wet_db` / `tone_gain_db` / `duck_db` used. Absent — not `null` — on a dry run, so previous reports read unchanged. `applied: false` means the speech stem was missing (usually `--no-background`) and the dub was delivered dry |
 | `accent_mode` | `preserve`, `speaker-only`, or `reference-accent` |
 | `speakers` | One entry per voice with its segment count and speech time, or `null` for a one-voice job — so single-voice reports read exactly as they did before diarization existed. The names (`SPK_0`, …) are the ones in `02b_speakers.json` |
-| `overlap` | Present only on multi-speaker runs: how many segments were found to carry a second voice (`segments`, `seconds`, `speech_ratio`) and how they were handled (`mode: "dominant"`). Those lines are still dubbed in their dominant speaker's voice; this field records the limitation rather than hiding it. Absent — not `null` — on a one-voice job |
+| `overlap` | Present only on multi-speaker runs: how many segments were found to carry a second voice (`segments`, `seconds`, `speech_ratio`) and how they were handled. `mode: "dominant"` means each flagged line was dubbed in its dominant speaker's voice; `mode: "separate"` (with `--overlap separate`) means both voices were recovered and dubbed, adding `separated` and `lines` counts. Absent — not `null` — on a one-voice job |
 | `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
 | `donor.speaker_count` | How many voices the run found |
 | `donor.primary_speaker` | The speaker with the most speech. Its own fields are also copied to the top level of `donor`, so `donor.source` / `donor.accent` / `donor.blend` keep naming the voice a single-speaker job would have used |
@@ -861,6 +879,7 @@ video/audio ─► 1. audio extract ─► 2. separate ─► 3. ASR + VAD ─�
 | 2 | Separate | `pipeline/separation.py` | Demucs splits speech from music/ambience; ASR then reads the clean speech stem |
 | 3 | ASR | `pipeline/asr.py` | faster-whisper + Silero VAD, word timestamps, drops non-speech |
 | 4 | Diarize | `pipeline/diarize.py` | embeds each segment and clusters the embeddings into speakers |
+| 4b | Overlap | `pipeline/overlap_separation.py` | with `--overlap separate`, splits a flagged segment into per-speaker streams for re-transcription |
 | 5 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
 | 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker |
 | 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked bed — optionally matched to the source's room |
@@ -1019,8 +1038,8 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | `--blend-iters only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-iters` |
 | `--blend-ratio only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-ratio` |
 | Every line is dubbed in one voice, but the video has several speakers | Diarization is off or unavailable. Check the log for `Diarization (none)` — it means `--diarizer none` was set, or `funasr` is not installed. Install it (`pip install -r requirements-dev.txt`), then re-run. The detection happens before synthesis, so a cached job needs `--force` to pick up a newly installed backend |
-| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled. The same threshold governs overlap detection, so raising it also makes that check more conservative |
-| A line sounds like the wrong person, or you can hear two people on it | `report.json` → `overlap` counts segments that hold a second voice; `02c_overlap.json` lists their ids. Such a line is dubbed in its dominant speaker's voice, and separating the two speakers is the remaining P1 item — there is no flag for it yet. Detection is deliberately conservative (a 2.5 s run that fits another speaker better), so short interruptions are not reported |
+| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled. (Overlap detection is supervised by those labels but does not use this threshold.) |
+| A line sounds like the wrong person, or you can hear two people on it | `report.json` → `overlap` counts segments that hold a second voice; `02c_overlap.json` lists their ids. By default such a line is dubbed in its dominant speaker's voice — run with `--overlap separate` (needs the optional `speechbrain`) to split it and dub both voices. Detection is deliberately conservative (a 2.5 s run that fits another speaker better), so short interruptions are not reported |
 | Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
 | A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
 | `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
@@ -1046,6 +1065,7 @@ pipeline/
 ├── subtitles.py           SRT rendering
 ├── asr.py                 transcription + segmentation
 ├── diarize.py             speaker embeddings + clustering (multi-speaker)
+├── overlap_separation.py  SepFormer backend for splitting overlapping voices
 ├── separation.py          speech/background split (Demucs)
 ├── mixing.py              ducking, bed mix and room matching (pure numpy)
 ├── translate.py           OpenAI-compatible translation
@@ -1053,7 +1073,7 @@ pipeline/
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (674 tests)
+tests/                     pytest suite (754 tests)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
@@ -1071,9 +1091,10 @@ PLAN.md                    roadmap: MVP + P1–P6
 - **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
   Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
 - **Multi-speaker dubbing attributes speakers per segment**, not per word, so
-  overlapping speech is dubbed in the voice of its dominant speaker. Those
-  segments are detected and reported (`report.json` → `overlap`, `02c_overlap.json`),
-  but the second voice is not yet separately dubbed; the speaker count comes from
+  overlapping speech is shown as a flag on the segment. By default such a line is
+dubbed in the voice of its dominant speaker and reported (`report.json` →
+  `overlap`, `02c_overlap.json`); `--overlap separate` splits the two voices apart
+  with SepFormer, re-transcribes each and dubs both. The speaker count comes from
   clustering rather than being declared. Both are tracked in `PLAN.md`.
 - **Known MVP gaps**, all tracked in `PLAN.md`: lip sync, multi-language source
   videos, and iterative length control in the translation loop. Background

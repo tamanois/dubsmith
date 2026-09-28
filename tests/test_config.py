@@ -493,6 +493,26 @@ class TestCliJobConfig:
         assert job.room_matching is True
         assert job.room_duck_db == pytest.approx(3.0)
 
+    def test_overlap_defaults_to_dominant(self) -> None:
+        import dub
+
+        args = dub.build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
+        job = dub.job_config_from_args(args)
+
+        assert job.overlap_mode == "dominant"
+        assert job.overlap_separation is False
+        assert job.overlap_separator == "auto"
+
+    def test_overlap_separate_is_accepted_and_wired(self) -> None:
+        import dub
+
+        args = dub.build_dub_parser().parse_args(
+            ["--video", "in.mp4", "--target", "fr", "--overlap", "separate"]
+        )
+        job = dub.job_config_from_args(args)
+
+        assert job.overlap_separation is True
+
     @pytest.mark.parametrize(
         ("flag", "value"),
         [

@@ -26,6 +26,12 @@ def tone(seconds: float, amplitude: float = 0.3) -> np.ndarray:
     return (amplitude * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
 
 
+def rms(samples: np.ndarray) -> float:
+    """RMS of an array, as a plain float."""
+    data = np.asarray(samples, dtype=np.float64)
+    return float(np.sqrt(np.mean(np.square(data))))
+
+
 class SpyStretcher:
     """Records stretch requests and returns the audio unchanged."""
 
@@ -185,6 +191,45 @@ class TestBuildTimeline:
             [(0, 0.0, loud), (1, 0.0, loud)], sample_rate=SR, total_duration=2.0
         )
         assert float(np.max(np.abs(timeline.samples))) <= 1.0
+
+    def test_overlay_lines_are_summed_at_their_true_time(self) -> None:
+        # A separated second voice is genuinely simultaneous, so it is placed at
+        # its own start instead of being pushed behind the dominant line.
+        first = tone(1.0, amplitude=0.2)
+        second = tone(0.5, amplitude=0.2)
+        timeline = build_timeline(
+            [(0, 0.0, first), (1, 0.0, second)],
+            sample_rate=SR,
+            total_duration=2.0,
+            overlay_ids={1},
+        )
+        overlay = timeline.placements[1]
+        assert overlay.shifted is False
+        assert overlay.start == pytest.approx(0.0)
+        # Summed, not replaced: the overlay's span is louder than either alone.
+        window = slice(0, int(0.5 * SR))
+        assert rms(timeline.samples[window]) > rms(first[window])
+
+    def test_an_overlay_does_not_shift_a_following_line(self) -> None:
+        timeline = build_timeline(
+            [(0, 0.0, tone(1.0)), (1, 0.0, tone(2.0)), (2, 1.0, tone(0.5))],
+            sample_rate=SR,
+            total_duration=3.0,
+            overlay_ids={1},
+        )
+        # The cursor advances only for the dominant line, so line 2 starts where
+        # its own timeline says rather than after the (simultaneous) overlay.
+        assert timeline.placements[2].shifted is False
+        assert timeline.placements[2].start == pytest.approx(1.0)
+
+    def test_a_long_overlay_still_grows_the_track(self) -> None:
+        timeline = build_timeline(
+            [(0, 0.0, tone(0.5)), (1, 0.0, tone(3.0))],
+            sample_rate=SR,
+            total_duration=1.0,
+            overlay_ids={1},
+        )
+        assert len(timeline.samples) >= int(3.0 * SR)
 
     def test_negative_start_is_clamped_to_zero(self) -> None:
         timeline = build_timeline(

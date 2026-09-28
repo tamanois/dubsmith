@@ -22,7 +22,14 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from . import media, subtitles
-from .asr import Segment, Transcript, load_transcript, save_transcript, transcribe
+from .asr import (
+    Segment,
+    Transcript,
+    load_transcript,
+    save_transcript,
+    transcribe,
+    transcribe_many,
+)
 from .config import (
     JobConfig,
     Settings,
@@ -30,11 +37,12 @@ from .config import (
     normalize_loudness_policy,
     release_gpu_memory,
 )
-from .diarize import NullDiarizer, detect_diarizer, single_speaker_labels
+from .diarize import NullDiarizer, assign_streams, detect_diarizer, single_speaker_labels
 from .errors import ASRError, DubbingError, MediaError, TimingError
 from .logging_utils import job_logger
 from .models import resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
+from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
 from .separation import NullSeparator, detect_separator
 from .timing import Placement, Timeline, build_timeline, detect_stretcher, fit_line
 from .translate import (
@@ -73,6 +81,10 @@ _SPEAKERS_NAME = "02b_speakers.json"
 #: for the same reason as the labels: it depends on the audio and the threshold,
 #: not on the translation or the chosen voice.
 _OVERLAP_NAME = "02c_overlap.json"
+#: The lines a flagged segment was split into, one per voice, and the speaker each
+#: belongs to. Written by the overlap-separation stage and consumed when the lines
+#: to dub are assembled, so the handling is cached independently of the flags.
+_OVERLAP_LINES_NAME = "02d_overlap_segments.json"
 #: Re-synthesises a chosen subset of lines, each in its own speaker's voice, and
 #: returns one waveform per line in the order given (``None`` for a blank line).
 Resynthesize = Callable[[Sequence[Segment], Sequence[str]], list[np.ndarray | None]]
@@ -232,6 +244,8 @@ class Pipeline:
         stretcher: Any | None = None,
         separator: Any | None = None,
         diarizer: Any | None = None,
+        speaker_separator: Any | None = None,
+        stream_transcriber: Callable[[Path], Transcript] | None = None,
         stretcher_preference: str = "auto",
     ) -> None:
         self.job = job
@@ -248,9 +262,15 @@ class Pipeline:
         self._stretcher = stretcher
         self._separator = separator
         self._diarizer = diarizer
+        self._speaker_separator = speaker_separator
+        #: Re-transcribes a separated stream. Injected in tests; ``None`` falls back
+        #: to the transcriber above, or to a batched real Whisper pass.
+        self._stream_transcriber = stream_transcriber
         #: Cached :meth:`detect_diarizer` result. ``detect_diarizer`` never returns
         #: ``None``, so ``None`` here reliably means "not probed yet".
         self.__diarizer_resolved: Any | None = None
+        #: Cached :meth:`detect_speaker_separator` result, same reasoning.
+        self.__speaker_separator_resolved: Any | None = None
         self._stretcher_preference = stretcher_preference
         self._stage_seconds: dict[str, float] = {}
         #: Segments of the run currently being refined (set by the length repair).
@@ -289,19 +309,28 @@ class Pipeline:
             # short windows rather than whole segments, so sharing the diarization
             # stage would couple two independent answers to one cache entry.
             self._stage_overlap(source_audio, transcript)
+            # Split the flagged segments into one stream per voice, re-transcribe
+            # each and match it to a speaker. Runs before `release_gpu_memory`
+            # because it needs both the ASR model (re-transcription) and the
+            # speaker embedder (stream-to-speaker matching).
+            self._stage_overlap_separate(source_audio, transcript)
+            # The lines actually dubbed: the ASR segments, with each flagged overlap
+            # segment replaced by one line per voice. Donor selection and the source
+            # subtitles keep using the original ASR segments.
+            lines = self._dub_lines(transcript)
             # Free the ASR model's cache before TTS loads its own weights;
             # otherwise the two multi-GB models contend for the same GPU.
             release_gpu_memory()
-            script = self._stage_translate(transcript)
+            script = self._stage_translate(transcript, lines)
             # Rendered before synthesis so every line is cloned from one clip
             # whose speech codes and speaker embedding agree - one clip per voice.
             blends = self._stage_blend(source_audio, transcript)
             dubbed = self._stage_synthesize(
-                source_audio, transcript, script, tmp_dir, blends
+                source_audio, transcript, lines, script, tmp_dir, blends
             )
             release_gpu_memory()
-            timeline = self._stage_mix(audio_path, transcript, dubbed, tmp_dir)
-            return self._stage_deliver(timeline, transcript, script)
+            timeline = self._stage_mix(audio_path, transcript, lines, dubbed, tmp_dir)
+            return self._stage_deliver(timeline, transcript, lines, script)
         finally:
             # Never leak scratch space, even on failure.
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -355,6 +384,21 @@ class Pipeline:
         if self._separator is None:
             self._separator = detect_separator(self.job.separator, device=self.job.device)
         return self._separator
+
+    def _resolve_speaker_separator(self) -> Any:
+        """The overlap separator for this job (never ``None``).
+
+        Degrades to :class:`NullSpeakerSeparator` when the optional backend is
+        absent, so ``--overlap separate`` on a machine without it leaves the
+        dominant-only behaviour rather than failing the job.
+        """
+        if self._speaker_separator is not None:
+            return self._speaker_separator
+        if self.__speaker_separator_resolved is None:
+            self.__speaker_separator_resolved = detect_speaker_separator(
+                self.job.overlap_separator, device=self.job.device
+            )
+        return self.__speaker_separator_resolved
 
     def _resolve_diarizer(self) -> Any | None:
         """The speaker labeler for this job, or ``None`` for a single voice.
@@ -633,7 +677,19 @@ class Pipeline:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        # When separation ran, the flagged lines were split into two voices rather
+        # than dubbed in one: record what actually happened, so the report does not
+        # say "dominant" when the second voice was recovered.
+        lines = self._overlap_lines()
+        if lines:
+            payload["mode"] = "separate"
+            payload["separated"] = len(
+                {record.get("parent_id") for record in lines}
+            )
+            payload["lines"] = len(lines)
+        return payload
 
     def _room_stats(self) -> dict[str, Any] | None:
         """What room matching did, or ``None`` when it was not enabled.
@@ -878,6 +934,248 @@ class Pipeline:
             segment.overlapped = bool(flags.get(segment.id, False))
         return flags
 
+    # -- overlapping speech ------------------------------------------------ #
+
+    def _overlap_lines(self) -> list[dict[str, Any]]:
+        """The sub-lines the overlap stage split out, or ``[]`` when it did not run."""
+        path = self.job_dir / _OVERLAP_LINES_NAME
+        if not path.is_file():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+        records = payload.get("segments") if isinstance(payload, dict) else None
+        return records if isinstance(records, list) else []
+
+    def _dub_lines(self, transcript: Transcript) -> list[Segment]:
+        """The lines to dub: ASR segments with flagged overlaps split per voice.
+
+        The dominant voice's line reuses its parent's id, so donor, timing and
+        report keys stay stable; the second voice becomes an overlay line with a
+        fresh id. Donor selection and the source subtitles keep using the original
+        ASR segments, so a donor is never taken from a separated - and therefore
+        filtered - stream.
+        """
+        records = self._overlap_lines()
+        if not records:
+            return list(transcript.segments)
+
+        by_parent: dict[int, list[dict[str, Any]]] = {}
+        for record in records:
+            try:
+                by_parent.setdefault(int(record["parent_id"]), []).append(record)
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not by_parent:
+            return list(transcript.segments)
+
+        lines: list[Segment] = []
+        next_id = max((segment.id for segment in transcript.segments), default=-1) + 1
+        for segment in transcript.segments:
+            owned = by_parent.get(segment.id)
+            if not owned:
+                lines.append(segment)
+                continue
+            for index, record in enumerate(
+                sorted(owned, key=lambda item: item.get("start", 0.0))
+            ):
+                line_id = segment.id if index == 0 else next_id
+                if index > 0:
+                    next_id += 1
+                lines.append(
+                    Segment(
+                        id=line_id,
+                        start=float(record.get("start", segment.start)),
+                        end=float(record.get("end", segment.end)),
+                        text=str(record.get("text", "")),
+                        speaker=str(
+                            record.get("speaker") or segment.speaker or _SINGLE_SPEAKER
+                        ),
+                        parent_id=segment.id,
+                        overlay=index > 0,
+                    )
+                )
+        return lines
+
+    @staticmethod
+    def _embed_stream(labeler: Any, stream: np.ndarray, sample_rate: int) -> Any:
+        """Embed one separated stream, or ``None`` when it cannot be embedded."""
+        embedder = getattr(labeler, "embedder", None)
+        if embedder is None:
+            return None
+        data = np.asarray(stream, dtype=np.float32).reshape(-1)
+        duration = data.size / float(sample_rate or 1)
+        if duration <= 0:
+            return None
+        vectors = embedder.embed(data, sample_rate, [(0.0, duration)])
+        return vectors[0] if vectors else None
+
+    def _transcribe_streams(self, paths: Sequence[Path]) -> list[Transcript]:
+        """Re-transcribe separated streams, loading the ASR model once."""
+        if self._stream_transcriber is not None:
+            return [self._stream_transcriber(path) for path in paths]
+        if self._transcriber is not None:
+            return [self._transcriber(path) for path in paths]
+        model_dir = resolve_model("whisper_large_v3", self.settings.models_dir)
+        return transcribe_many(
+            paths,
+            model_dir,
+            device=self.job.device,
+            language=language_code_for_name(self.job.source_language),
+            no_speech_threshold=self.job.no_speech_threshold,
+        )
+
+    def _stage_overlap_separate(
+        self, audio_path: Path, transcript: Transcript
+    ) -> list[dict[str, Any]]:
+        """Split each flagged segment into one stream per voice and re-transcribe it.
+
+        Gated on the overlap flags, so separation only runs on the handful of
+        segments that need it. Each stream is matched to a speaker by comparing its
+        embedding to the diarization centroids; a segment whose streams cannot be
+        told apart keeps its dominant-only treatment. The second voice's words are
+        not in Whisper's one-utterance output, which is why each stream is
+        re-transcribed rather than reusing the original text.
+
+        Best-effort by construction: a segment that cannot be separated, matched or
+        re-transcribed is left exactly as it was, so this stage cannot make a job
+        worse than the dominant-only path.
+        """
+        labeler = self._resolve_diarizer()
+        if (
+            not self.job.overlap_separation
+            or labeler is None
+            or isinstance(labeler, NullDiarizer)
+            or getattr(labeler, "overlaps", None) is None
+            # Stream-to-speaker matching needs the embedder behind the labels; a
+            # labeler that only produces labels cannot separate.
+            or getattr(labeler, "centroids", None) is None
+        ):
+            return []
+        flagged = [segment for segment in transcript.segments if segment.overlapped]
+        if not flagged:
+            return []
+        separator = self._resolve_speaker_separator()
+        if isinstance(separator, NullSpeakerSeparator):
+            return []
+
+        out = self.job_dir / _OVERLAP_LINES_NAME
+
+        def build() -> list[dict[str, Any]]:
+            samples, sample_rate = media.load_audio(audio_path)
+            centroids = labeler.centroids(
+                [segment.id for segment in transcript.segments],
+                [(segment.start, segment.end) for segment in transcript.segments],
+                {
+                    segment.id: self._speaker_of(segment)
+                    for segment in transcript.segments
+                },
+                samples,
+                sample_rate,
+            )
+            if len(centroids) < 2:
+                # Nothing to match a second stream against, so every assignment
+                # below is ``None`` and the artifact records an empty split.
+                self.log.info(
+                    "Overlap separation: fewer than two speakers could be embedded, "
+                    "so no line can be split."
+                )
+
+            tmp_dir = self.job_dir / _TMP_DIR
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            pending: list[tuple[Segment, str, Path]] = []
+            for segment in flagged:
+                first = max(0, int(round(segment.start * sample_rate)))
+                last = min(samples.size, int(round(segment.end * sample_rate)))
+                if last - first <= 0:
+                    continue
+                try:
+                    streams = separator.separate(
+                        samples[first:last], sample_rate, num_speakers=2
+                    )
+                    if len(streams) != 2 or any(
+                        np.asarray(stream).size == 0 for stream in streams
+                    ):
+                        continue
+                    embeddings = [
+                        self._embed_stream(labeler, stream, sample_rate)
+                        for stream in streams
+                    ]
+                    assignment = assign_streams(
+                        embeddings, self._speaker_of(segment), centroids
+                    )
+                    if assignment is None:
+                        # The two streams cannot be told apart: most likely a
+                        # false-positive flag, so keep the dominant-only treatment.
+                        continue
+                    for index, (stream, speaker) in enumerate(zip(streams, assignment)):
+                        path = tmp_dir / f"overlap_{segment.id:04d}_{index}.wav"
+                        media.write_audio(path, stream, sample_rate)
+                        pending.append((segment, speaker, path))
+                except Exception as exc:  # noqa: BLE001 - one bad segment must not fail a job
+                    self.log.warning(
+                        "Could not separate overlapping speech in segment %d: %s. "
+                        "Keeping the dominant-speaker treatment for it.",
+                        segment.id,
+                        exc,
+                    )
+
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            if pending:
+                transcripts = self._transcribe_streams(
+                    [path for _segment, _speaker, path in pending]
+                )
+                for (segment, speaker, _path), sub in zip(pending, transcripts):
+                    if sub.is_empty():
+                        # A stream that recovered nothing cannot supply a line.
+                        continue
+                    start = segment.start + min(item.start for item in sub.segments)
+                    end = segment.start + max(item.end for item in sub.segments)
+                    text = " ".join(
+                        item.text.strip() for item in sub.segments if item.text.strip()
+                    )
+                    grouped.setdefault(segment.id, []).append(
+                        {
+                            "parent_id": segment.id,
+                            "speaker": speaker,
+                            "start": round(start, 3),
+                            "end": round(end, 3),
+                            "text": text,
+                        }
+                    )
+
+            records: list[dict[str, Any]] = []
+            for segment in flagged:
+                lines = grouped.get(segment.id)
+                # Both voices must have been recovered; a single recovered voice is
+                # what the dominant-only path already delivers.
+                if lines is not None and len(lines) == 2:
+                    records.extend(sorted(lines, key=lambda item: item["start"]))
+            records.sort(key=lambda item: item["start"])
+
+            out.write_text(
+                json.dumps(
+                    {
+                        "mode": "separate",
+                        "segments": records,
+                        "separated": len({item["parent_id"] for item in records}),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.log.info(
+                "Overlap separation: %d flagged segment(s) split into %d line(s).",
+                len({item["parent_id"] for item in records}),
+                len(records),
+            )
+            return records
+
+        result = self._stage("overlap-separate", [out], build)
+        return self._overlap_lines() if result is None else result
+
     def _reference_speech_rate(self) -> float | None:
         """Words per second of the target language, measured from a reference clip.
 
@@ -916,8 +1214,14 @@ class Pipeline:
         self.log.info("Reference speaking rate: %.2f words/s (from %s)", rate, clip)
         return rate
 
-    def _stage_translate(self, transcript: Transcript) -> dict[int, str]:
-        """Translate every segment to the target language."""
+    def _stage_translate(
+        self, transcript: Transcript, lines: Sequence[Segment]
+    ) -> dict[int, str]:
+        """Translate every line to the target language.
+
+        ``lines`` may include separated overlap lines, so the second voice's words
+        are translated too.
+        """
         out = self.job_dir / _SCRIPT_NAME
 
         def build() -> dict[int, str]:
@@ -933,7 +1237,7 @@ class Pipeline:
                         max(1, int(round(segment.duration * rate))) if rate else None
                     ),
                 )
-                for segment in transcript.segments
+                for segment in lines
             ]
             translations = self._resolve_translator().translate(
                 requests,
@@ -956,7 +1260,7 @@ class Pipeline:
                                 "source": segment.text,
                                 "target": translations[segment.id],
                             }
-                            for segment in transcript.segments
+                            for segment in lines
                         ],
                     },
                     indent=2,
@@ -1128,21 +1432,23 @@ class Pipeline:
         self,
         audio_path: Path,
         transcript: Transcript,
+        lines: Sequence[Segment],
         script: dict[int, str],
         tmp_dir: Path,
         blends: Mapping[str, Path] | None = None,
     ) -> dict[int, Path]:
-        """Clone each speaker's voice and synthesise one file per segment.
+        """Clone each speaker's voice and synthesise one file per line.
 
         ``blends`` maps speaker to the stage-1 clip from :meth:`_stage_blend`. Where
         a speaker has one, that speaker's lines are cloned from it, so the clip's
-        codes and its speaker embedding cannot disagree.
+        codes and its speaker embedding cannot disagree. ``lines`` may include
+        separated overlap lines, each dubbed in the speaker it was matched to.
         """
         blends = blends or {}
         out_dir = self.job_dir / _DUBBED_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         marker = out_dir / _DONE_MARKER
-        expected = {segment.id: out_dir / f"seg_{segment.id:04d}.wav" for segment in transcript.segments}
+        expected = {segment.id: out_dir / f"seg_{segment.id:04d}.wav" for segment in lines}
 
         def build() -> dict[int, Path]:
             engine = self._resolve_tts()
@@ -1153,13 +1459,13 @@ class Pipeline:
             self._write_voices(transcript, donors, blends)
 
             produced = self._synthesize_grouped(
-                engine, transcript.segments, script, donors, blends
+                engine, lines, script, donors, blends
             )
             wavs = self._refine_overlong(
                 engine,
-                transcript,
+                lines,
                 script,
-                [produced.get(segment.id) for segment in transcript.segments],
+                [produced.get(segment.id) for segment in lines],
                 tmp_dir,
                 resynthesize=lambda owned, texts: self._retry_lines(
                     engine, owned, texts, donors, blends
@@ -1167,7 +1473,7 @@ class Pipeline:
             )
 
             written: dict[int, Path] = {}
-            for segment, wav in zip(transcript.segments, wavs):
+            for segment, wav in zip(lines, wavs):
                 path = expected[segment.id]
                 if wav is None:
                     # Blank line: leave no file so the timing stage emits silence.
@@ -1378,7 +1684,7 @@ class Pipeline:
     def _refine_overlong(
         self,
         engine: TTSEngine,
-        transcript: Transcript,
+        segments: Sequence[Segment],
         script: dict[int, str],
         wavs: list[np.ndarray | None],
         tmp_dir: Path,
@@ -1422,7 +1728,7 @@ class Pipeline:
             )
             return wavs
 
-        segments = transcript.segments
+        segments = list(segments)
         self._segments_for_refine = segments
         sample_rate = engine.sample_rate
         spoken: dict[int, str] = {}
@@ -1534,6 +1840,7 @@ class Pipeline:
         self,
         audio_path: Path,
         transcript: Transcript,
+        lines: Sequence[Segment],
         dubbed: dict[int, Path],
         tmp_dir: Path,
     ) -> Timeline:
@@ -1551,7 +1858,7 @@ class Pipeline:
             trimmed: dict[int, float] = {}
             synth_seconds: dict[int, float] = {}
             deficits: dict[int, float] = {}
-            segments = transcript.segments
+            segments = lines
 
             for index, segment in enumerate(segments):
                 path = dubbed.get(segment.id)
@@ -1565,10 +1872,13 @@ class Pipeline:
                 # A line may spill into the silence before the next utterance:
                 # that costs nothing (nobody is talking) and avoids cutting
                 # words. Anything beyond it would push the next line late, so the
-                # residue is trimmed. The last line may run freely.
-                if index + 1 < len(segments):
+                # residue is trimmed. The last line may run freely. An overlay line
+                # shares its slot with the dominant line, so it must not spill.
+                if segment.overlay:
+                    max_overrun: float | None = 0.0
+                elif index + 1 < len(segments):
                     gap = max(0.0, segments[index + 1].start - segment.end)
-                    max_overrun: float | None = gap
+                    max_overrun = gap
                 else:
                     max_overrun = None
 
@@ -1599,8 +1909,12 @@ class Pipeline:
 
                 items.append((segment.id, segment.start, fitted))
 
+            overlay_ids = {segment.id for segment in segments if segment.overlay}
             timeline = build_timeline(
-                items, sample_rate=sample_rate, total_duration=total_duration
+                items,
+                sample_rate=sample_rate,
+                total_duration=total_duration,
+                overlay_ids=overlay_ids,
             )
             for placement in timeline.placements:
                 placement.ratio = ratios.get(placement.segment_id, 1.0)
@@ -1692,6 +2006,7 @@ class Pipeline:
         self,
         timeline: Timeline,
         transcript: Transcript,
+        lines: Sequence[Segment],
         script: dict[int, str],
     ) -> JobResult:
         """Normalise loudness, write subtitles, mux the video and report."""
@@ -1721,7 +2036,7 @@ class Pipeline:
                     subtitles.Cue(
                         s.start, s.end, spoken.get(s.id) or script.get(s.id, "")
                     )
-                    for s in transcript.segments
+                    for s in lines
                 ],
                 self.job_dir / "subs_target.srt",
             )

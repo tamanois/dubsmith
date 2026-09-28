@@ -29,6 +29,7 @@ __all__ = [
     "resolve_compute_type",
     "build_transcript",
     "transcribe",
+    "transcribe_many",
     "load_transcript",
     "save_transcript",
 ]
@@ -60,6 +61,13 @@ class Segment(BaseModel):
     #: flagged line is still dubbed in its dominant speaker's voice; the flag is
     #: what makes the second voice visible instead of silently attributed.
     overlapped: bool = False
+    #: The ASR segment a separated sub-line came from. ``None`` for an ordinary
+    #: segment; set on the per-speaker lines produced by overlap separation.
+    parent_id: int | None = None
+    #: True for the *second* voice's line in a separated segment. Overlay lines are
+    #: summed onto the track at their true times instead of being pushed later,
+    #: because the overlap is genuine simultaneous speech.
+    overlay: bool = False
 
     @property
     def duration(self) -> float:
@@ -97,6 +105,7 @@ def build_transcript(
     language_probability: float | None = None,
     model: str = "",
     no_speech_threshold: float = 0.6,
+    allow_empty: bool = False,
 ) -> Transcript:
     """Convert raw faster-whisper segments into a :class:`Transcript`.
 
@@ -108,12 +117,16 @@ def build_transcript(
         model: Identifier recorded for provenance.
         no_speech_threshold: Segments at or above this probability are dropped as
             non-speech hallucinations.
+        allow_empty: Return a transcript with no segments instead of raising when
+            nothing usable survives. Used for separated streams, which are often
+            silent for the weaker voice.
 
     Returns:
         Transcript with gaps removed and contiguous ids assigned.
 
     Raises:
-        ASRError: If no usable segment survives filtering.
+        ASRError: If no usable segment survives filtering and ``allow_empty`` is
+            ``False``.
     """
     segments: list[Segment] = []
     for raw in raw_segments:
@@ -154,7 +167,7 @@ def build_transcript(
             )
         )
 
-    if not segments:
+    if not segments and not allow_empty:
         raise ASRError(
             "No speech detected in the input. Check that the file contains audible "
             "speech and that the correct audio track was selected."
@@ -271,6 +284,45 @@ def _attempt_plan(ct2_device: str, allow_cpu_fallback: bool) -> list[tuple[str, 
     return plan
 
 
+def _load_whisper(model_dir: Path | str, device: str, compute_type: str | None) -> Any:
+    """Load a faster-whisper model on ``device``."""
+    from faster_whisper import WhisperModel
+
+    compute = compute_type or resolve_compute_type(device)
+    return WhisperModel(str(model_dir), device=device, compute_type=compute)
+
+
+def _decode_transcript(
+    model: Any,
+    audio_path: Path | str,
+    *,
+    language: str | None,
+    vad_filter: bool,
+    beam_size: int,
+    no_speech_threshold: float,
+    model_id: str,
+    allow_empty: bool = False,
+) -> Transcript:
+    """Decode one file with an already-loaded model."""
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=language,
+        beam_size=beam_size,
+        word_timestamps=True,
+        vad_filter=vad_filter,
+    )
+    # Materialise the generator here so decoding errors surface inside this call
+    # rather than later, when a device fallback would no longer be available.
+    return build_transcript(
+        list(segments),
+        language=getattr(info, "language", None),
+        language_probability=getattr(info, "language_probability", None),
+        model=str(model_id),
+        no_speech_threshold=no_speech_threshold,
+        allow_empty=allow_empty,
+    )
+
+
 def transcribe(
     audio_path: Path | str,
     model_dir: Path | str,
@@ -321,23 +373,15 @@ def transcribe(
     ct2_device = "cuda" if resolved_device.startswith("cuda") else resolved_device
 
     def run(target_device: str) -> Transcript:
-        compute = compute_type or resolve_compute_type(target_device)
-        model = WhisperModel(str(model_dir), device=target_device, compute_type=compute)
-        segments, info = model.transcribe(
-            str(audio_path),
+        model = _load_whisper(model_dir, target_device, compute_type)
+        return _decode_transcript(
+            model,
+            audio_path,
             language=language,
-            beam_size=beam_size,
-            word_timestamps=True,
             vad_filter=vad_filter,
-        )
-        # Materialise the generator here so decoding errors surface inside this
-        # call rather than later, when the fallback would no longer be available.
-        return build_transcript(
-            list(segments),
-            language=getattr(info, "language", None),
-            language_probability=getattr(info, "language_probability", None),
-            model=str(model_dir),
+            beam_size=beam_size,
             no_speech_threshold=no_speech_threshold,
+            model_id=str(model_dir),
         )
 
     last_error: RuntimeError | None = None
@@ -347,6 +391,101 @@ def transcribe(
             if not count:
                 continue  # Nothing to preload; skip straight to the next attempt.
             _LOGGER.info("Preloaded %d bundled CUDA libraries; retrying on %s.", count, target_device)
+
+        try:
+            return run(target_device)
+        except RuntimeError as exc:
+            if not _looks_like_cuda_library_failure(exc):
+                raise ASRError(f"Speech recognition failed: {exc}") from exc
+            last_error = exc
+            _LOGGER.warning(
+                "CUDA is unusable for speech recognition on %s (%s).",
+                target_device,
+                exc,
+            )
+
+    raise ASRError(
+        "Speech recognition failed on every available device "
+        f"(last error: {last_error}). Try --device cpu."
+    )
+
+
+def transcribe_many(
+    audio_paths: Sequence[Path | str],
+    model_dir: Path | str,
+    *,
+    device: str = "auto",
+    compute_type: str | None = None,
+    language: str | None = None,
+    vad_filter: bool = True,
+    no_speech_threshold: float = 0.6,
+    beam_size: int = 5,
+    allow_cpu_fallback: bool = True,
+    allow_empty: bool = True,
+) -> list[Transcript]:
+    """Transcribe several clips, loading the Whisper model once.
+
+    Overlap separation re-transcribes each separated stream, and loading a
+    multi-GB model per stream would dominate the stage. Device fallback mirrors
+    :func:`transcribe`: a CUDA library failure retries the whole batch on the next
+    device, because the model - not the clip - is what failed.
+
+    Args:
+        audio_paths: Clips to transcribe.
+        model_dir: Local faster-whisper model directory.
+        allow_empty: Return an empty transcript instead of raising when a clip has
+            no speech. A separated stream is often silent for the weaker voice, so
+            this defaults to ``True`` here, unlike :func:`transcribe`.
+
+    Other args are as in :func:`transcribe`.
+
+    Returns:
+        One transcript per input path, in the same order.
+
+    Raises:
+        DependencyError: If faster-whisper is not installed.
+        ASRError: If every device fails.
+    """
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - exercised via CLI paths
+        raise DependencyError(
+            "faster-whisper is not installed. Run: pip install -r requirements.txt"
+        ) from exc
+
+    from .config import resolve_device
+
+    resolved_device = resolve_device(device)
+    ct2_device = "cuda" if resolved_device.startswith("cuda") else resolved_device
+    paths = [Path(path) for path in audio_paths]
+
+    def run(target_device: str) -> list[Transcript]:
+        model = _load_whisper(model_dir, target_device, compute_type)
+        return [
+            _decode_transcript(
+                model,
+                path,
+                language=language,
+                vad_filter=vad_filter,
+                beam_size=beam_size,
+                no_speech_threshold=no_speech_threshold,
+                model_id=str(model_dir),
+                allow_empty=allow_empty,
+            )
+            for path in paths
+        ]
+
+    last_error: RuntimeError | None = None
+    for target_device, should_preload in _attempt_plan(ct2_device, allow_cpu_fallback):
+        if should_preload:
+            count = preload_cuda_libraries()
+            if not count:
+                continue  # Nothing to preload; skip straight to the next attempt.
+            _LOGGER.info(
+                "Preloaded %d bundled CUDA libraries; retrying on %s.",
+                count,
+                target_device,
+            )
 
         try:
             return run(target_device)

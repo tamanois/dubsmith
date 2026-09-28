@@ -326,6 +326,29 @@ def build_dub_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--overlap",
+        dest="overlap_mode",
+        default="dominant",
+        choices=["dominant", "separate"],
+        help=(
+            "How to handle a segment that carries two voices at once. 'dominant' "
+            "dubs the whole line in its dominant speaker's voice (the default); "
+            "'separate' splits it, re-transcribes each stream and dubs both "
+            "voices. Separating needs the optional speechbrain dependency."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-separator",
+        dest="overlap_separator",
+        default="auto",
+        choices=["auto", "none", "sepformer"],
+        help=(
+            "Backend for splitting overlapping speech: 'auto' uses SpeechBrain's "
+            "SepFormer when installed, 'sepformer' requires it, 'none' disables "
+            "it. (default: auto)"
+        ),
+    )
+    parser.add_argument(
         "--refine",
         dest="refine",
         action="store_true",
@@ -466,6 +489,8 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         diarizer=args.diarizer,
         speaker_threshold=args.speaker_threshold,
         min_speaker_seconds=args.min_speaker_seconds,
+        overlap_mode=args.overlap_mode,
+        overlap_separator=args.overlap_separator,
         refine=args.refine,
         refine_max_passes=args.refine_max_passes,
         refine_threshold=args.refine_threshold,

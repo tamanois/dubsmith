@@ -385,6 +385,13 @@ class JobConfig(BaseModel):
     #: a voice needs a few seconds of speech before it can be cloned.
     min_speaker_seconds: float = Field(default=MIN_SPEAKER_S, ge=0.0, le=120.0)
 
+    # Overlapping speech: a segment that carries two voices at once.
+    #   "dominant" -> dub the whole line in its dominant speaker's voice (v1)
+    #   "separate" -> split the line, re-transcribe each stream and dub both voices
+    overlap_mode: str = "dominant"
+    #: Backend used to split overlapping speech: auto | sepformer | none.
+    overlap_separator: str = "auto"
+
     keep_subtitles: bool = True
     force: bool = False
 
@@ -500,6 +507,43 @@ class JobConfig(BaseModel):
                 "--speaker-threshold must be greater than 0 and at most 2"
             )
         return distance
+
+    @field_validator("overlap_mode")
+    @classmethod
+    def _check_overlap_mode(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "dominant": "dominant",
+            "keep": "dominant",
+            "off": "dominant",
+            "separate": "separate",
+            "split": "separate",
+            "on": "separate",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown overlap mode {value!r}. Use: dominant or separate"
+            ) from None
+
+    @field_validator("overlap_separator")
+    @classmethod
+    def _check_overlap_separator(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "auto": "auto",
+            "sepformer": "sepformer",
+            "speechbrain": "sepformer",
+            "none": "none",
+            "off": "none",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown overlap separator {value!r}. Use: auto, sepformer or none"
+            ) from None
 
     @field_validator("length_budget")
     @classmethod
@@ -652,6 +696,11 @@ class JobConfig(BaseModel):
             if self.speaker_threshold is not None
             else DEFAULT_THRESHOLD
         )
+
+    @property
+    def overlap_separation(self) -> bool:
+        """True when overlapping speech should be split into two voices."""
+        return self.overlap_mode == "separate"
 
     @property
     def multi_speaker(self) -> bool:

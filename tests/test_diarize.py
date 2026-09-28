@@ -16,11 +16,18 @@ import pytest
 from pipeline.diarize import (
     DEFAULT_THRESHOLD,
     MIN_EMBED_S,
+    MIN_OVERLAP_S,
     MIN_SPEAKER_S,
+    OVERLAP_HOP_S,
+    OVERLAP_WINDOW_S,
     SPEAKER_RATE,
     EmbeddingDiarizer,
     FunASREmbedder,
     NullDiarizer,
+    _cosine,
+    _longest_other_span,
+    _window_bounds,
+    assign_streams,
     cluster_speakers,
     detect_diarizer,
     single_speaker_labels,
@@ -389,6 +396,180 @@ class _ExplodingModel:
         raise RuntimeError("boom")
 
 
+class TimeVoiceEmbedder:
+    """Returns a voice's vector for each window, chosen by the window midpoint.
+
+    The overlap detector generates its windows internally, so the script is a
+    function of time rather than a fixed list: each ``(start, end, vector)`` entry
+    says which voice occupies that span, and a window is labelled by its midpoint.
+    """
+
+    name = "scripted"
+
+    def __init__(self, timeline: Sequence[tuple[float, float, np.ndarray]]) -> None:
+        self.timeline = list(timeline)
+        self.calls = 0
+        self.regions: list[tuple[float, float]] = []
+
+    def embed(
+        self,
+        samples: np.ndarray,
+        sample_rate: int,
+        regions: Sequence[tuple[float, float]],
+    ) -> list[np.ndarray | None]:
+        self.calls += 1
+        results: list[np.ndarray | None] = []
+        for start, end in regions:
+            self.regions.append((start, end))
+            midpoint = (start + end) / 2.0
+            vector: np.ndarray | None = None
+            for low, high, voice in self.timeline:
+                if low <= midpoint < high:
+                    vector = np.asarray(voice, dtype=np.float64)
+                    break
+            results.append(vector)
+        return results
+
+
+class TestWindowBounds:
+    """Cutting a segment into overlap windows."""
+
+    def test_a_long_segment_is_covered_without_gaps(self) -> None:
+        assert _window_bounds(0.0, 5.0) == [(0.0, 2.5), (1.25, 3.75), (2.5, 5.0)]
+
+    def test_a_segment_shorter_than_a_window_is_one_window(self) -> None:
+        assert _window_bounds(2.0, 4.0) == [(2.0, 4.0)]
+
+    def test_the_final_window_is_flush_with_the_end(self) -> None:
+        bounds = _window_bounds(0.0, 6.0)
+        assert bounds[-1][1] == 6.0
+        assert all(start < end for start, end in bounds)
+
+    def test_an_empty_region_has_no_windows(self) -> None:
+        assert _window_bounds(3.0, 3.0) == []
+
+    def test_the_constants_match_the_measured_calibration(self) -> None:
+        assert OVERLAP_WINDOW_S == 2.5
+        assert OVERLAP_HOP_S == 1.25
+        assert MIN_OVERLAP_S == 0.6
+
+
+class TestLongestOtherSpan:
+    """The consecutive-run measure behind the overlap flag."""
+
+    def test_a_run_is_measured_from_its_first_start_to_its_last_end(self) -> None:
+        windows = [
+            (0.0, 2.5, True),
+            (1.25, 3.75, False),
+            (2.5, 5.0, False),
+            (3.75, 6.25, True),
+        ]
+        assert _longest_other_span(windows) == 3.75
+
+    def test_non_consecutive_windows_are_not_one_run(self) -> None:
+        windows = [(0.0, 2.5, False), (1.25, 3.75, True), (2.5, 5.0, False)]
+        assert _longest_other_span(windows) == 2.5
+
+    def test_an_unscored_window_ends_a_run(self) -> None:
+        windows = [(0.0, 2.5, False), (1.25, 3.75, None), (2.5, 5.0, False)]
+        assert _longest_other_span(windows) == 2.5
+
+    def test_no_other_windows_is_zero(self) -> None:
+        assert _longest_other_span([(0.0, 2.5, True)]) == 0.0
+
+
+class TestOverlapDetection:
+    """Flagging segments that carry a second voice."""
+
+    def test_a_one_voice_job_is_never_flagged(self) -> None:
+        embedder = TimeVoiceEmbedder([(0.0, 10.0, VOICE_A)])
+        diarizer = EmbeddingDiarizer(embedder=embedder)
+        flags = diarizer.overlaps(
+            [0, 1],
+            [(0.0, 5.0), (5.0, 10.0)],
+            {0: "SPK_0", 1: "SPK_0"},
+            np.zeros(10),
+            16_000,
+        )
+        assert flags == {0: False, 1: False}
+        # No second centroid means no window can match one, so the audio is never
+        # even read - a noisy solo recording cannot be mistaken for an overlap.
+        assert embedder.calls == 0
+
+    def test_a_clean_exchange_is_not_flagged(self) -> None:
+        embedder = TimeVoiceEmbedder([(0.0, 5.0, VOICE_A), (5.0, 10.0, VOICE_B)])
+        diarizer = EmbeddingDiarizer(embedder=embedder)
+        flags = diarizer.overlaps(
+            [0, 1],
+            [(0.0, 5.0), (5.0, 10.0)],
+            {0: "SPK_0", 1: "SPK_1"},
+            np.zeros(10),
+            16_000,
+        )
+        assert flags == {0: False, 1: False}
+
+    def test_a_second_voice_inside_a_segment_is_flagged(self) -> None:
+        embedder = TimeVoiceEmbedder(
+            [(0.0, 2.0, VOICE_A), (2.0, 3.0, VOICE_B), (3.0, 5.0, VOICE_A), (5.0, 10.0, VOICE_B)]
+        )
+        diarizer = EmbeddingDiarizer(embedder=embedder)
+        flags = diarizer.overlaps(
+            [0, 1],
+            [(0.0, 5.0), (5.0, 10.0)],
+            {0: "SPK_0", 1: "SPK_1"},
+            np.zeros(10),
+            16_000,
+        )
+        assert flags == {0: True, 1: False}
+
+    def test_a_segment_owned_by_another_voice_is_not_an_overlap(self) -> None:
+        # Two of three windows match the other speaker: that is a labelling
+        # problem (a mislabelled segment), so it is not reported as an overlap.
+        embedder = TimeVoiceEmbedder(
+            [
+                (0.0, 5.0, VOICE_A),
+                (5.0, 10.0, VOICE_B),
+                (10.0, 11.25, VOICE_B),
+                (11.25, 13.75, VOICE_B),
+                (13.75, 15.0, VOICE_A),
+            ]
+        )
+        diarizer = EmbeddingDiarizer(embedder=embedder)
+        flags = diarizer.overlaps(
+            [0, 1, 2],
+            [(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)],
+            {0: "SPK_0", 1: "SPK_1", 2: "SPK_0"},
+            np.zeros(10),
+            16_000,
+        )
+        assert flags[2] is False
+
+    def test_an_unscored_window_is_skipped_rather_than_guessed(self) -> None:
+        # The middle window cannot be embedded (no voice covers its midpoint), so
+        # it neither flags the segment nor breaks the run accounting.
+        embedder = TimeVoiceEmbedder(
+            [(0.0, 2.0, VOICE_A), (3.0, 5.0, VOICE_A), (5.0, 10.0, VOICE_B)]
+        )
+        diarizer = EmbeddingDiarizer(embedder=embedder)
+        flags = diarizer.overlaps(
+            [0, 1],
+            [(0.0, 5.0), (5.0, 10.0)],
+            {0: "SPK_0", 1: "SPK_1"},
+            np.zeros(10),
+            16_000,
+        )
+        assert flags == {0: False, 1: False}
+
+    def test_mismatched_lengths_are_rejected(self) -> None:
+        diarizer = EmbeddingDiarizer(embedder=TimeVoiceEmbedder([]))
+        with pytest.raises(ValueError, match="same length"):
+            diarizer.overlaps([0, 1], [(0.0, 5.0)], {}, np.zeros(10), 16_000)
+
+    def test_an_empty_run_is_an_empty_mapping(self) -> None:
+        diarizer = EmbeddingDiarizer(embedder=TimeVoiceEmbedder([]))
+        assert diarizer.overlaps([], [], {}, np.zeros(10), 16_000) == {}
+
+
 class _RecordingModel:
     """Records the rate it was asked for, and returns a fixed embedding."""
 
@@ -398,3 +579,71 @@ class _RecordingModel:
     def generate(self, *, input: Any, fs: int) -> Any:
         self.rates.append(fs)
         return [{"spk_embedding": np.array([1.0, 0.0], dtype=np.float32)}]
+
+
+class TestAssignStreams:
+    """Matching separated streams back to the speakers that produced them."""
+
+    CENTROIDS = {"SPK_0": VOICE_A, "SPK_1": VOICE_B}
+
+    def test_two_streams_are_matched_to_their_speakers(self) -> None:
+        assert assign_streams(
+            [jitter(VOICE_A), jitter(VOICE_B)], "SPK_0", self.CENTROIDS
+        ) == ["SPK_0", "SPK_1"]
+
+    def test_the_stream_order_does_not_matter(self) -> None:
+        # The dominant voice happens to be the *second* stream here.
+        assert assign_streams(
+            [jitter(VOICE_B), jitter(VOICE_A)], "SPK_0", self.CENTROIDS
+        ) == ["SPK_1", "SPK_0"]
+
+    def test_a_false_positive_flag_is_not_split(self) -> None:
+        # Both streams are the same voice, so the segment was never overlapped.
+        assert assign_streams(
+            [jitter(VOICE_A), jitter(VOICE_A)], "SPK_0", self.CENTROIDS
+        ) is None
+
+    def test_one_speaker_cannot_be_assigned(self) -> None:
+        assert assign_streams(
+            [jitter(VOICE_A), jitter(VOICE_B)], "SPK_0", {"SPK_0": VOICE_A}
+        ) is None
+
+    def test_an_unembeddable_stream_is_rejected(self) -> None:
+        assert assign_streams([None, jitter(VOICE_B)], "SPK_0", self.CENTROIDS) is None
+
+    def test_an_unknown_dominant_speaker_is_rejected(self) -> None:
+        assert assign_streams(
+            [jitter(VOICE_A), jitter(VOICE_B)], "SPK_9", self.CENTROIDS
+        ) is None
+
+
+class TestCentroids:
+    """One mean embedding per speaker, used to match a separated stream."""
+
+    def test_one_centroid_per_speaker(self) -> None:
+        engine = diarizer([jitter(VOICE_A), jitter(VOICE_B), jitter(VOICE_A)])
+        result = engine.centroids(
+            [0, 1, 2],
+            REGIONS,
+            {0: "SPK_0", 1: "SPK_1", 2: "SPK_0"},
+            np.zeros(10),
+            16_000,
+        )
+        assert set(result) == {"SPK_0", "SPK_1"}
+        # SPK_0's centroid averages its two recordings, so it sits nearer VOICE_A.
+        assert _cosine(result["SPK_0"], VOICE_A) > _cosine(result["SPK_0"], VOICE_B)
+
+    def test_a_speaker_with_no_usable_segment_is_omitted(self) -> None:
+        engine = diarizer([None, jitter(VOICE_B)])
+        result = engine.centroids(
+            [0, 1],
+            [(0.0, 5.0), (5.0, 10.0)],
+            {0: "SPK_0", 1: "SPK_1"},
+            np.zeros(10),
+            16_000,
+        )
+        assert set(result) == {"SPK_1"}
+
+    def test_mismatched_lengths_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="same length"):
+            diarizer([]).centroids([0, 1], [(0.0, 5.0)], {}, np.zeros(10), 16_000)

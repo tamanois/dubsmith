@@ -290,6 +290,8 @@ def make_pipeline(
     tts: FakeTTSEngine | None = None,
     separator: Any | None = None,
     labeler: Any | None = None,
+    speaker_separator: Any | None = None,
+    stream_transcriber: Any | None = None,
     **job_kwargs: Any,
 ) -> tuple[Pipeline, FakeTranscriber, FakeTranslator, FakeTTSEngine]:
     audio = job_kwargs.pop("input_path", None) or write_input(tmp_path)
@@ -308,6 +310,8 @@ def make_pipeline(
         separator=separator,
         # Named apart from JobConfig.diarizer, which is the *preference* string.
         diarizer=labeler,
+        speaker_separator=speaker_separator,
+        stream_transcriber=stream_transcriber,
     )
     return pipeline, transcriber, translator, tts
 

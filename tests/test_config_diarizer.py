@@ -94,3 +94,56 @@ class TestDiarizerFingerprint:
             job().fingerprint()
             != job(speaker_threshold=DEFAULT_THRESHOLD).fingerprint()
         )
+
+
+class TestOverlapOption:
+    """`--overlap` decides what happens to a segment carrying two voices."""
+
+    def test_dominant_is_the_default_and_means_no_separation(self) -> None:
+        resolved = job()
+        assert resolved.overlap_mode == "dominant"
+        assert resolved.overlap_separation is False
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("dominant", "dominant"),
+            ("keep", "dominant"),
+            ("off", "dominant"),
+            ("separate", "separate"),
+            ("split", "separate"),
+            ("on", "separate"),
+            ("SEPARATE", "separate"),
+        ],
+    )
+    def test_mode_aliases(self, raw: str, expected: str) -> None:
+        assert job(overlap_mode=raw).overlap_mode == expected
+
+    def test_separate_enables_separation(self) -> None:
+        assert job(overlap_mode="separate").overlap_separation is True
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown overlap mode"):
+            job(overlap_mode="telepathy")
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("auto", "auto"),
+            ("sepformer", "sepformer"),
+            ("speechbrain", "sepformer"),
+            ("none", "none"),
+            ("off", "none"),
+        ],
+    )
+    def test_separator_aliases(self, raw: str, expected: str) -> None:
+        assert job(overlap_separator=raw).overlap_separator == expected
+
+    def test_an_unknown_separator_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown overlap separator"):
+            job(overlap_separator="magic")
+
+    def test_overlap_settings_change_the_fingerprint(self) -> None:
+        base = job().fingerprint()
+        assert base != job(overlap_mode="separate").fingerprint()
+        assert base != job(overlap_separator="none").fingerprint()

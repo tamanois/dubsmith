@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -31,7 +31,10 @@ _LOGGER = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_MODEL_ID",
     "DEFAULT_THRESHOLD",
+    "MIN_OVERLAP_S",
     "MIN_SPEAKER_S",
+    "OVERLAP_HOP_S",
+    "OVERLAP_WINDOW_S",
     "SPEAKER_RATE",
     "NullDiarizer",
     "EmbeddingDiarizer",
@@ -39,6 +42,7 @@ __all__ = [
     "SpeakerEmbedder",
     "cluster_speakers",
     "detect_diarizer",
+    "assign_streams",
     "single_speaker_labels",
 ]
 
@@ -62,6 +66,24 @@ MIN_SPEAKER_S = 3.0
 
 #: Shortest segment worth embedding; below this the embedding is mostly noise.
 MIN_EMBED_S = 0.4
+
+#: Window used to look for a second voice inside a segment. Short windows are
+#: unusable here: on the repo's two-person clip a 1 s window splits one speaker's
+#: *own* voice by up to 1.08 cosine distance, versus 0.34 between the two
+#: speakers, so a short-window "split" reports embedding noise rather than a
+#: second voice. Same-speaker spread falls with window length (0.88 at 1.5 s,
+#: 0.85 at 2 s, 0.63 at 2.5 s) and so does the false-flip rate (6/13, 3/13,
+#: 1/13), so 2.5 s is the shortest window at which noise stops driving the answer.
+OVERLAP_WINDOW_S = 2.5
+
+#: Hop between consecutive overlap windows.
+OVERLAP_HOP_S = 1.25
+
+#: A different voice must own at least this much of a segment, in one consecutive
+#: run of windows, before the segment counts as overlapped. It is a floor for
+#: short segments - a window is already longer than this - so an interruption
+#: shorter than about a window is deliberately missed.
+MIN_OVERLAP_S = 0.6
 
 
 class SpeakerEmbedder(Protocol):
@@ -114,6 +136,144 @@ def _similarity_matrix(vectors: Sequence[np.ndarray]) -> np.ndarray:
             value = _cosine(vectors[i], vectors[j])
             matrix[i, j] = matrix[j, i] = value
     return matrix
+
+
+def _window_bounds(
+    start: float,
+    end: float,
+    *,
+    window: float = OVERLAP_WINDOW_S,
+    hop: float = OVERLAP_HOP_S,
+) -> list[tuple[float, float]]:
+    """Cut ``[start, end]`` into overlapping windows for overlap detection.
+
+    A region shorter than one window yields a single window covering it, so a
+    short exchange is still compared rather than skipped; the final window is
+    flush with the region's end so no speech is left unexamined.
+    """
+    length = end - start
+    if length <= 0:
+        return []
+    if length <= window:
+        return [(start, end)]
+    bounds: list[tuple[float, float]] = []
+    offset = start
+    while offset + window < end:
+        bounds.append((offset, offset + window))
+        offset += hop
+    bounds.append((end - window, end))
+    return bounds
+
+
+def _centroid(members: Sequence[np.ndarray]) -> np.ndarray | None:
+    """Mean of a speaker's window embeddings (unit-normalised), or ``None``.
+
+    Averaging many windows is the whole point: it cancels the per-window noise
+    that makes comparing two short windows directly meaningless.
+    """
+    usable = [np.asarray(member, dtype=np.float64).reshape(-1) for member in members]
+    usable = [member for member in usable if member.size and np.isfinite(member).all()]
+    if not usable or len({member.size for member in usable}) != 1:
+        return None
+    centroid = np.mean(np.stack(usable, axis=0), axis=0)
+    norm = float(np.linalg.norm(centroid))
+    if norm == 0.0:
+        return None
+    return centroid / norm
+
+
+def _best_speaker(
+    vector: np.ndarray, centroids: Mapping[str, np.ndarray | None]
+) -> str | None:
+    """The speaker whose centroid is closest to ``vector``, or ``None``."""
+    best: str | None = None
+    best_score = -np.inf
+    for speaker, centroid in centroids.items():
+        if centroid is None:
+            continue
+        score = _cosine(vector, centroid)
+        if np.isfinite(score) and score > best_score:
+            best, best_score = speaker, score
+    return best
+
+
+def _longest_other_span(
+    windows: Sequence[tuple[float, float, bool | None]],
+) -> float:
+    """Longest consecutive run assigned to another speaker, in seconds.
+
+    ``windows`` is ``(start, end, own)`` per window, where ``own`` is ``True``
+    when the window fits its own speaker's centroid better, ``False`` when it
+    fits another speaker's, and ``None`` when it could not be scored. The span is
+    measured from the run's first window start to its last window end, so it
+    counts the audio covered, not the number of windows.
+    """
+    longest = 0.0
+    run_start: float | None = None
+    for start, end, own in windows:
+        if own is False:
+            if run_start is None:
+                run_start = start
+            longest = max(longest, end - run_start)
+        else:
+            run_start = None
+    return longest
+
+
+def assign_streams(
+    embeddings: Sequence[np.ndarray | None],
+    dominant: str,
+    centroids: Mapping[str, np.ndarray | None],
+) -> list[str] | None:
+    """Match two separated streams to speakers, or ``None`` when ambiguous.
+
+    The dominant stream is the one closest to the segment's own speaker centroid;
+    the other stream is matched to the best-scoring *different* speaker, and only
+    accepted when it fits that speaker better than the dominant one. That last
+    check is what stops a false-positive overlap flag - a segment one person
+    actually said - from being split into two voices.
+
+    Args:
+        embeddings: One embedding per separated stream (exactly two).
+        dominant: The speaker the diarization assigned the original segment.
+        centroids: Mean embedding per speaker.
+
+    Returns:
+        One speaker per stream, aligned with ``embeddings``, or ``None`` when the
+        streams cannot be told apart - in which case the caller keeps the
+        dominant-only treatment rather than guessing.
+    """
+    vectors = [_as_vector(value) for value in embeddings]
+    if len(vectors) != 2 or any(vector is None for vector in vectors):
+        return None
+    names = [name for name, centroid in centroids.items() if centroid is not None]
+    if len(names) < 2 or dominant not in names:
+        return None
+
+    typed = [vector for vector in vectors if vector is not None]
+    score = {
+        (index, name): _cosine(typed[index], centroids[name])
+        for index in range(2)
+        for name in names
+    }
+    if not (np.isfinite(score[(0, dominant)]) and np.isfinite(score[(1, dominant)])):
+        return None
+
+    first, second = (0, 1)
+    if score[(second, dominant)] > score[(first, dominant)]:
+        first, second = second, first
+
+    others = [name for name in names if name != dominant]
+    match = max(others, key=lambda name: score[(second, name)])
+    if not np.isfinite(score[(second, match)]):
+        return None
+    if score[(second, match)] <= score[(second, dominant)]:
+        return None
+
+    assignment = ["", ""]
+    assignment[first] = dominant
+    assignment[second] = match
+    return assignment
 
 
 def cluster_speakers(
@@ -278,6 +438,150 @@ class EmbeddingDiarizer:
         # speaker that was actually assigned.
         first = next(label for label in resolved.values() if label)
         return {segment_id: label or first for segment_id, label in resolved.items()}
+
+    def centroids(
+        self,
+        segment_ids: Sequence[int],
+        regions: Sequence[tuple[float, float]],
+        labels: Mapping[int, str],
+        samples: np.ndarray,
+        sample_rate: int,
+    ) -> dict[str, np.ndarray]:
+        """Mean embedding per speaker, from the segments the labels assign.
+
+        Used to match a separated stream back to a voice: a stream is compared to
+        these centroids rather than to a single segment, so the same averaging that
+        makes overlap detection stable applies here too.
+
+        Args:
+            segment_ids: Ids in the same order as ``regions``.
+            regions: ``(start, end)`` seconds per segment.
+            labels: Segment id to speaker.
+            samples: The speech stem the regions index into.
+            sample_rate: Its rate.
+
+        Returns:
+            Speaker to unit-normalised centroid, omitting speakers that could not
+            be embedded.
+
+        Raises:
+            ValueError: If ``segment_ids`` and ``regions`` differ in length.
+        """
+        if len(segment_ids) != len(regions):
+            raise ValueError("segment_ids and regions must be the same length")
+
+        embeddings = self.embedder.embed(samples, sample_rate, regions)
+        owned: dict[str, list[np.ndarray]] = {}
+        for segment_id, value in zip(segment_ids, embeddings):
+            vector = _as_vector(value)
+            speaker = labels.get(segment_id)
+            if vector is not None and speaker:
+                owned.setdefault(str(speaker), []).append(vector)
+
+        resolved: dict[str, np.ndarray] = {}
+        for speaker, members in owned.items():
+            centroid = _centroid(members)
+            if centroid is not None:
+                resolved[speaker] = centroid
+        return resolved
+
+    def overlaps(
+        self,
+        segment_ids: Sequence[int],
+        regions: Sequence[tuple[float, float]],
+        labels: Mapping[int, str],
+        samples: np.ndarray,
+        sample_rate: int,
+    ) -> dict[int, bool]:
+        """Flag the segments that carry a second voice.
+
+        Supervised by the diarization labels: the labels already say who the
+        speakers are, so each window is compared against a speaker *centroid*
+        (the mean of that speaker's own windows) rather than against other
+        windows. Averaging is what cancels the per-window noise that makes
+        window-to-window comparison useless on this embedder. A segment is
+        flagged only when a consecutive run of its windows fits *another*
+        speaker's centroid better than its own, **and** its own speaker still
+        owns the majority of the segment - a segment whose windows all match
+        another voice is a mislabelled segment, which is the diarization stage's
+        problem, not an overlap. A one-voice job cannot be flagged: with no
+        second centroid, no window can match one.
+
+        This is deliberately conservative. A false "overlap" sends a listener
+        hunting a defect that is not there, and an interruption shorter than
+        about a window is missed rather than guessed.
+
+        Args:
+            segment_ids: Ids in the same order as ``regions``.
+            regions: ``(start, end)`` seconds per segment.
+            labels: Segment id to the speaker the diarization assigned it.
+            samples: The speech stem the regions index into.
+            sample_rate: Its rate.
+
+        Returns:
+            Segment id to flag; a segment that cannot be scored is ``False``.
+
+        Raises:
+            ValueError: If ``segment_ids`` and ``regions`` differ in length.
+        """
+        if len(segment_ids) != len(regions):
+            raise ValueError("segment_ids and regions must be the same length")
+
+        flags = {segment_id: False for segment_id in segment_ids}
+        speakers = {str(label) for label in labels.values() if label}
+        if len(speakers) < 2:
+            # No second voice to find, so nothing can be flagged. This is why a
+            # noisy solo recording can never be mistaken for an overlap.
+            return flags
+
+        bounds: list[tuple[int, float, float]] = []
+        for index, (start, end) in enumerate(regions):
+            if not labels.get(segment_ids[index]):
+                continue
+            for window_start, window_end in _window_bounds(start, end):
+                bounds.append((index, window_start, window_end))
+        if not bounds:
+            return flags
+
+        embeddings = self.embedder.embed(
+            samples, sample_rate, [(start, end) for _index, start, end in bounds]
+        )
+        if len(embeddings) != len(bounds):
+            raise ValueError("embedder returned a different number of vectors")
+
+        vectors = [_as_vector(value) for value in embeddings]
+
+        # One centroid per speaker, from every window that speaker owns.
+        owned: dict[str, list[np.ndarray]] = {}
+        for (index, _start, _end), vector in zip(bounds, vectors):
+            if vector is None:
+                continue
+            owned.setdefault(str(labels[segment_ids[index]]), []).append(vector)
+        centroids: dict[str, np.ndarray | None] = {
+            speaker: _centroid(members) for speaker, members in owned.items()
+        }
+
+        per_segment: dict[int, list[tuple[float, float, bool | None]]] = {}
+        for position, (index, start, end) in enumerate(bounds):
+            own = str(labels[segment_ids[index]])
+            vector = vectors[position]
+            if vector is None or centroids.get(own) is None:
+                state: bool | None = None
+            else:
+                state = _best_speaker(vector, centroids) == own
+            per_segment.setdefault(index, []).append((start, end, state))
+
+        for index, windows in per_segment.items():
+            scored = [own for _start, _end, own in windows if own is not None]
+            if not scored:
+                continue
+            own_count = sum(1 for own in scored if own)
+            # Another voice owns the majority: a labelling problem, not an overlap.
+            if own_count * 2 <= len(scored):
+                continue
+            if _longest_other_span(windows) >= MIN_OVERLAP_S:
+                flags[segment_ids[index]] = True
+        return flags
 
 
 class FunASREmbedder:

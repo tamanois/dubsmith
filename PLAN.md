@@ -20,7 +20,7 @@
 | Translation (OpenAI-compatible) | ✅ | `pipeline/translate.py` |
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
 | Speaker diarization (P1) | ✅ | `pipeline/diarize.py` |
-| Overlap flagging (P1) | ✅ | `pipeline/diarize.py`, `pipeline/orchestrate.py` |
+| Overlap detection + separation (P1) | ✅ | `pipeline/diarize.py`, `pipeline/overlap_separation.py`, `pipeline/orchestrate.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
 | Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
@@ -669,12 +669,81 @@ listener hunting a defect that is not there. Frame-level accuracy would need a
 dedicated overlap model (pyannote's `OverlappedSpeechDetection`), rejected here for
 the same reason D12 rejected pyannote for diarization.
 
-**Separating the speech remains P1's open item.** The planned route is
-MossFormer2/SepFormer, gated on these flags so separation only runs on the
-segments that need it, with each separated stream re-transcribed (the second
-voice's words are not in Whisper's one-utterance output) and re-synthesised in its
-own voice. The flags are the seam that makes that stage affordable, which is why
-it landed first.
+**Correction: this section described code that did not exist yet.** The constants
+and the `overlaps` method were never committed. `_stage_overlap` called
+`getattr(labeler, "overlaps", None)`, the real `EmbeddingDiarizer` had no such
+method, so on real runs the stage returned `{}` and never wrote `02c_overlap.json`
+at all. Only the *test fake* implemented `overlaps`, which is why the suite stayed
+green while the feature was absent. It is now implemented as described above, with
+the algorithm unit-tested against a scripted embedder (no model needed) and its
+constants exported (`OVERLAP_WINDOW_S` 2.5, `OVERLAP_HOP_S` 1.25, `MIN_OVERLAP_S`
+0.6). The 1-of-16 figure above is the design target to re-confirm on a real run, not
+a shipped measurement.
+
+**Re-confirmed on a real run (2026-09-27), and the answer is 0 of 16.** On
+`input/louisavy.mp4` the detector finds 2 speakers (9 / 7 segments) and flags
+**none**. Instrumenting every segment shows why: for all 16, every 2.5 s window
+matched its *own* speaker's centroid (`other-span` 0.00 everywhere), so no window
+preferred the other voice. The clip's interruptions are shorter than the window,
+which is the documented sensitivity limit rather than a bug. Consequence: on this
+clip the separation stage has nothing to act on, so `--overlap separate` is a
+no-op here. The stage itself was exercised on a crafted clip with one genuine
+flag: with the real SepFormer both separated streams matched the **dominant**
+speaker better than the other (0.67 / 0.53 vs 0.56 / 0.49), so `assign_streams`
+returned `None` and the line was left whole — the false-positive guard working as
+designed, but the happy path (a real overlap split into two voices) is still
+unvalidated on real audio.
+
+### P1c — Overlapping-speech separation (IMPLEMENTED)
+
+**The gap.** A flagged line was dubbed in one voice: the second voice was lost.
+
+**Backend, chosen after the plan's premise failed.** The roadmap said MossFormer2
+was "already reachable through the optional `funasr` dependency". It is not, in
+this environment. funasr 1.4.16 registers **no** separation model, its
+`funasr.bin.ss_inference_launch` is absent, and `funasr/models/mossformer/e2e_ss.py`
+cannot even be imported (`funasr.models.base_model` is missing). ModelScope (already
+a dev dependency) registers only **8 kHz** separation, and its `SeparationPipeline`
+imports that same missing funasr launcher. The only 16 kHz, two-speaker option is
+**SpeechBrain's SepFormer** (`speechbrain/sepformer-whamr16k`), so `speechbrain`
+joins `funasr` and `demucs` as an *optional* dependency: missing it degrades to
+`--overlap dominant` with a warning rather than failing a job.
+
+**Design.** `pipeline/overlap_separation.py` wraps the checkpoint behind a
+`SpeakerSeparator` protocol (`NullSpeakerSeparator` when absent). The stage runs
+only on the flagged segments and before the ASR model is released:
+
+1. separate the segment into two streams; embed each and match it to a speaker
+   against the diarization **centroids** — the same averaging that makes detection
+   stable;
+2. require the streams to be *distinguishable*: the second stream must fit another
+   speaker better than the dominant one, or the segment is left alone. That is what
+   stops a false-positive flag from splitting a one-person line;
+3. re-transcribe each stream (batched into one Whisper load) and build one line per
+   voice with absolute timings.
+
+Those lines then flow through the existing translate / synthesise / mix path. The
+dominant line reuses its parent's segment id, so donor, timing and report keys stay
+stable; the second voice becomes an `overlay` line with a fresh id. `build_timeline`
+places overlay lines **at their true time** and sums them instead of pushing them
+later — the simultaneity is the point — while their own fit gets no gap spill, so
+they cannot desync the following line. Donor selection and the source subtitles keep
+using the original ASR segments, so a donor is never taken from a filtered stream.
+
+**Artifacts and reporting.** `02d_overlap_segments.json` holds the per-voice lines
+(`{parent_id, speaker, start, end, text}`, plus `separated` and `mode`). The report's
+`overlap` record gains `mode: "separate"`, `separated` and `lines` when the split
+happened, and stays `mode: "dominant"` when it did not — including when the backend
+is missing, so a report never claims a voice it did not recover.
+
+**Limitations, stated plainly.** SepFormer is a fixed two-speaker model, so a third
+voice on the same instant is not recovered. Its output is 16 kHz, so re-transcription
+is narrow-band; the separated streams are never mixed into the dub (that is always
+synthesised TTS). The stage is best-effort: any failure leaves the line exactly as
+the dominant-only path would have produced it.
+
+**Supersedes the roadmap's backend choice** (funasr/MossFormer2) for the reason
+above; see D15.
 
 ### P3d — Room matching: the dub sounds laid over the picture (IMPLEMENTED)
 
@@ -924,9 +993,10 @@ voice timbre**, ideally with the **target language's accent**.
 | D12 | Diarization | **Embed and cluster ASR segments** with `funasr` + ERes2NetV2 (`iic/speech_eres2netv2_sv_zh-cn_16k-common`), `--speaker-threshold 0.40` | Measured against the repo's two-person clip rather than assumed: reusing the Qwen3-TTS cloning encoder was **refuted** (all pairs 0.963–0.991, no merge gap) and `wespeaker` is not on PyPI. ERes2NetV2 separates the same clip at 0.341–0.874 with a merge plateau (flat to 0.379, then 0.468), so a constant threshold is defensible. Embedding the existing segments avoids a second segmentation pass, which is what keeps the labels aligned with the text instead of re-cutting lines |
 | D13 | Multi-speaker voices | **Per-speaker donor, and one blend clip per voice** in `reference-accent` mode; `donor.json` is the voice bible, with the dominant speaker also mirrored flat | A shared blend clip cannot serve two voices — its codes and embedding describe one speaker, which is exactly what makes it stable, and exactly what makes it wrong for the second voice. Keeping the dominant speaker's fields at the top level of `donor` means single-speaker jobs, `audit_timbre.py` and the existing docs are unchanged; `report.json → speakers` stays `null` for one voice rather than becoming a one-entry map |
 | D14 | Diarization dependency | **Optional**, degrading to one voice with a warning | `funasr` pulls ~30 transitive packages; a user who wants a single-voice dub should not need them. Same pattern as Demucs and `flash-attn`: the feature is available, its absence is survivable and loud. `--diarizer none` is authoritative so an explicit request to keep one voice is never second-guessed |
-| D15 | Overlap detection | **Compare long (2.5 s) windows against speaker centroids, supervised by the labels**; report and keep the dominant speaker (v1) | The first design — re-cluster short windows — was **refuted by measurement**: 1 s windows split one speaker's own voice by up to 1.08 cosine distance versus 0.34 between speakers, and it flagged 14 of 16 real segments. Same-speaker spread falls with window length (0.88 at 1.5 s → 0.63 at 2.5 s) and so does the flip rate, so 2.5 s is the shortest trustworthy window. Comparing against a centroid rather than another window is what cancels the remaining noise, and being supervised by the labels makes a one-voice job structurally unflaggable. The cost is sensitivity — sub-window interruptions are missed — which is documented rather than hidden; pyannote's overlap model is the upgrade path if frame-level accuracy is ever needed |
+| D15 | Overlap detection | **Compare long (2.5 s) windows against speaker centroids, supervised by the labels**; report and keep the dominant speaker (v1) | The first design — re-cluster short windows — was **refuted by measurement**: 1 s windows split one speaker's own voice by up to 1.08 cosine distance versus 0.34 between speakers, and it flagged 14 of 16 real segments. Same-speaker spread falls with window length (0.88 at 1.5 s → 0.63 at 2.5 s) and so does the flip rate, so 2.5 s is the shortest trustworthy window. Comparing against a centroid rather than another window is what cancels the remaining noise, and being supervised by the labels makes a one-voice job structurally unflaggable. The cost is sensitivity — sub-window interruptions are missed — which is documented rather than hidden; pyannote's overlap model is the upgrade path if frame-level accuracy is ever needed. **Extended by P1c/D18**: `--overlap separate` splits a flagged segment with SepFormer, re-transcribes each stream and dubs both voices in parallel |
 | D16 | Room matching | **Post-synthesis, derived from the speech stem, off by default** — `--room match` applies a measured RT60 convolution plus a room-tone floor and a shallower duck; without a stem it degrades to dry with `room.applied: false` | The room lives in the *speech* stem (voice + reverb tail + the room tone it masked), which the pipeline previously discarded, so recovering it needs no extra model and no new dependency. Adding it after synthesis keeps it clear of the voice-cloning tuning in P3b/P3c. A dry voice-over is correct for narrated content, so it stays the default rather than being silently replaced |
 | D17 | Quality gate | **A separate, non-blocking executable** (`audit_qc.py`) reading `report.json`, exiting non-zero on failure, and reporting `skip` (never `pass`) when a gate cannot run; the measurement core is shared with `audit_timbre.py` in `pipeline/audit.py` | A gate is only useful if it can fail without destroying work, and if "not measured" cannot be mistaken for "healthy". Sharing one implementation of the language-matched measurement is what stops the two CLIs from disagreeing about the same job |
+| D18 | Overlap separation | **SpeechBrain SepFormer (16 kHz) behind an optional `--overlap separate`**, placed simultaneously with the dominant line; the default stays `dominant` | The plan's "no new dependency via funasr" premise was **refuted by inspection**: funasr 1.4.16 registers no separation model and lacks `ss_inference_launch`, and ModelScope ships 8 kHz checkpoints only. SepFormer 16 kHz is the one self-contained two-speaker model at that rate, so `speechbrain` becomes an optional dependency like `funasr`/`demucs`. Separation runs only on flagged segments, and a segment whose streams cannot be matched to distinct speakers keeps the dominant-only treatment, so the stage cannot make a job worse. The default stays `dominant` until a bake-off shows separation is reliably better |
 
 ---
 
@@ -942,13 +1012,12 @@ voice timbre**, ideally with the **target language's accent**.
 - Accent handling: `preserve` (default), `speaker-only`, or `reference-accent`
   (borrow a native clip's pronunciation while keeping the voice's timbre).
 - Overlong lines repaired by re-wording rather than by cutting speech (`--refine`).
+- Overlapping-speech separation: a segment carrying two voices is split with
+  SepFormer and both voices are dubbed (`--overlap separate`).
 - Audio re-timed to the source timeline (no lip sync).
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
-- Overlapping-speech separation: overlapping speech is *detected and reported*
-  (P1b), but the second voice is still not dubbed — the line is attributed to its
-  dominant speaker (P1 sub-item, see §4).
 - Fully automatic native accent: `reference-accent` needs a supplied clip, so an
   unattended native-accent path via voice conversion is still P2.
 - Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
@@ -979,6 +1048,11 @@ video.mp4
    │     against the speaker centroids; a long run fitting another voice is marked
    ▼
 02c_overlap.json             # {overlapped_ids, segments, seconds, speech_ratio}
+   │  ④c separate overlap — --overlap separate only: split each flagged segment
+   │     with SepFormer, match each stream to a speaker by its centroid, and
+   │     re-transcribe it (the second voice is not in Whisper's single output)
+   ▼
+02d_overlap_segments.json    # [{parent_id, speaker, start, end, text}]
    │  ⑤ LLM translation (OpenAI-compatible), chunked; optional word budget
    ▼
 03_script.json               # [{id, start, end, source, target}]
@@ -1183,7 +1257,7 @@ python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
 | Phase | Focus | Key additions | Complexity |
 |-------|-------|---------------|------------|
 | **P0** | MVP (this doc §3) | Single-speaker dub, French, no lip sync | — |
-| **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**, overlap **flagged**; remaining: overlapping-speech separation | M |
+| **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**, overlap detection **done**, overlapping-speech separation **done** | M |
 | **P2** | Native accent | Supplied-clip accent **done**; remaining: VoiceDesign anchor + voice conversion, per-speaker knob | M |
 | **P3** | Quality & timing | Isochrony loop, room matching (P3d) and the automated QC gate (P3e) **done**; remaining: the model bake-off harness | M |
 | **P4** | Lip sync | LatentSync/MuseTalk, gated on face visibility | L |
@@ -1202,21 +1276,22 @@ python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
   was unnecessary: `donor.json` already answers "which voice, and why".
 - **Per-speaker cloning**: ✅ **done** — one prompt per speaker, lines batched
   within a speaker, and one blend clip per voice in `reference-accent` mode.
-- **Overlap**: ✅ **flagging done** (P1b) — each segment is re-embedded in 2.5 s
-  windows and compared against the speakers the labels establish, so a segment
-  carrying two voices is recorded in `02c_overlap.json` and `report.json →
-  overlap` instead of being silently attributed to one person. **Remaining**:
-  separate the speech and dub both voices — MossFormer2/SepFormer, gated on these
-  flags (MossFormer2 is already reachable through the optional `funasr`
-  dependency, so this adds no new package).
+- **Overlap**: ✅ **done** — each segment is re-embedded in 2.5 s windows and
+  compared against the speakers the labels establish, so a segment carrying two
+  voices is recorded in `02c_overlap.json` and `report.json → overlap` instead of
+  being silently attributed to one person (P1b). With `--overlap separate` the
+  flagged segment is split into one stream per voice with SpeechBrain's 16 kHz
+  SepFormer, each stream is re-transcribed and matched to a speaker, and both
+  voices are translated, synthesised and placed simultaneously (P1c). Without the
+  optional backend, `--overlap separate` warns and behaves as `--overlap
+  dominant`.
 - **Background bed**: ✅ **done** — `pipeline/separation.py` splits dialogue from
   music/SFX with Demucs, and `pipeline/mixing.py` mixes the dub back over the bed,
   ducked 6 dB under dialogue with 150 ms ramps (`--keep-background`, default on).
 - **Output**: multi-voice dub with preserved background.
 
-**The remaining P1 work is separating overlapping speech**, which is a capability
-gap rather than a missing measurement: overlap is now detected and reported (P1b),
-but a flagged line is still dubbed in the voice of its dominant speaker.
+**P1 is complete**: overlapping speech is detected (P1b) *and*, with `--overlap
+separate`, split so both voices are dubbed (P1c).
 
 ### P2 — Native target accent (nice-to-have per D1)
 
