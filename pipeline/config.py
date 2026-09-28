@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,14 +19,25 @@ from .mixing import (
 )
 
 __all__ = [
+    "ACCELERATORS",
+    "DTYPE_ALIASES",
+    "DeviceInfo",
     "LANGUAGE_ALIASES",
     "SUPPORTED_LANGUAGES",
+    "available_accelerators",
+    "normalize_dtype",
     "normalize_language",
     "normalize_loudness_policy",
+    "pick_dtype",
+    "preferred_dtype",
+    "probe_device",
+    "release_gpu_memory",
+    "resolve_device",
+    "supports_bf16",
+    "supports_fp16",
     "JobConfig",
     "Settings",
     "read_env_file",
-    "resolve_device",
 ]
 
 
@@ -280,6 +293,10 @@ class JobConfig(BaseModel):
 
     output_dir: Path = Path("output")
     device: str = "auto"
+    #: torch dtype for the TTS checkpoint. ``auto`` reads the device's capability:
+    #: bfloat16 on Ampere and newer, float16 on older accelerators, float32 on
+    #: CPU. An explicit value is honoured unless the device cannot run it.
+    dtype: str = "auto"
     whisper_model: str = "large-v3"
     llm_model: str | None = None  # overrides Settings.llm_model
 
@@ -584,6 +601,11 @@ class JobConfig(BaseModel):
                 f"Unknown room mode {value!r}. Use: off or match"
             ) from None
 
+    @field_validator("dtype")
+    @classmethod
+    def _check_dtype(cls, value: str) -> str:
+        return normalize_dtype(value)
+
     @field_validator("target_language")
     @classmethod
     def _check_target(cls, value: str) -> str:
@@ -744,24 +766,292 @@ class JobConfig(BaseModel):
 # Device helpers
 # --------------------------------------------------------------------------- #
 
+_LOGGER = logging.getLogger(__name__)
 
-def resolve_device(requested: str = "auto") -> str:
-    """Resolve ``auto`` to the best available torch device.
+#: Accelerator families this pipeline can talk to.
+ACCELERATORS: tuple[str, ...] = ("cuda", "rocm", "xpu", "mps")
 
-    Kept dependency-light by importing torch lazily; returns ``"cpu"`` when torch
-    is unavailable or reports no CUDA device.
+#: Where bfloat16 starts being supported natively. Below these, float16 is the
+#: right choice and float32 the safe fallback: bfloat16 on a Pascal or Volta card
+#: is unsupported or emulated at a fraction of the speed, which is exactly the
+#: "works on my GPU, not on yours" failure this table exists to prevent.
+_BF16_MIN_CAPABILITY: dict[str, tuple[int, int]] = {"cuda": (8, 0), "rocm": (9, 4)}
+_FP16_MIN_CAPABILITY: dict[str, tuple[int, int]] = {"cuda": (7, 0), "rocm": (7, 0)}
+
+#: Accepted spellings of a dtype, for ``--dtype`` and for ``JobConfig.dtype``.
+DTYPE_ALIASES: dict[str, str] = {
+    "auto": "auto",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "full": "fp32",
+}
+
+#: Canonical dtype name -> ``torch`` attribute.
+_DTYPE_ATTRIBUTES: dict[str, str] = {
+    "bf16": "bfloat16",
+    "fp16": "float16",
+    "fp32": "float32",
+}
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    """What a device request resolves to, and what that hardware supports."""
+
+    kind: str
+    index: int | None = None
+    name: str = ""
+    total_memory: int | None = None
+    capability: tuple[int, int] | None = None
+    requested: str = "auto"
+
+    @property
+    def is_accelerated(self) -> bool:
+        return self.kind in ACCELERATORS
+
+    @property
+    def label(self) -> str:
+        """The string to hand to a backend, e.g. ``cuda``, ``cuda:1``, ``cpu``.
+
+        ROCm is reported as ``cuda`` because AMD cards answer to the CUDA API;
+        ``torch.device("rocm")`` does not exist.
+        """
+        if self.kind == "rocm":
+            return "cuda" if self.index is None else f"cuda:{self.index}"
+        if self.kind in {"cuda", "xpu"}:
+            return self.kind if self.index is None else f"{self.kind}:{self.index}"
+        return self.kind
+
+    @property
+    def supports_bf16(self) -> bool:
+        return supports_bf16(self)
+
+    @property
+    def supports_fp16(self) -> bool:
+        return supports_fp16(self)
+
+
+def _import_torch() -> Any | None:
+    """Import torch, or ``None`` when it is missing.
+
+    Isolated so tests can substitute a fake module and exercise every hardware
+    profile - Pascal, Ampere, ROCm, Metal, XPU - without owning any of it.
     """
-    if requested and requested != "auto":
-        return requested
     try:
         import torch
     except ImportError:  # pragma: no cover - torch is a hard runtime dep
-        return "cpu"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+        return None
+    return torch
+
+
+def _auto_kind(torch: Any | None) -> str:
+    """The best device *every* stage can use: CUDA/ROCm, otherwise CPU.
+
+    Metal and XPU are deliberately not chosen here. Speech recognition runs on
+    CTranslate2, which offers only CUDA and CPU, so an ``auto`` that picked Metal
+    would break a Mac that works today. ``--device mps`` is still honoured when
+    asked for, and :func:`available_accelerators` reports what is present.
+    """
+    if torch is not None and torch.cuda.is_available():
+        return "rocm" if getattr(torch.version, "hip", None) else "cuda"
+    return "cpu"
+
+
+def _split_requested(requested: str, torch: Any | None) -> tuple[str, int | None]:
+    """Split ``cuda:1`` into ``("cuda", 1)``; unknown names pass through."""
+    text = (requested or "auto").strip().lower()
+    base, _, suffix = text.partition(":")
+    index: int | None = None
+    if suffix:
+        if not suffix.isdigit():
+            return text, None
+        index = int(suffix)
+    if base == "auto":
+        return _auto_kind(torch), None
+    if base == "cuda" and torch is not None and getattr(torch.version, "hip", None):
+        return "rocm", index
+    return base, index
+
+
+def _describe(
+    torch: Any | None, kind: str, index: int | None, requested: str
+) -> DeviceInfo:
+    """Fill in the name, memory and compute capability for ``kind``."""
+    if torch is None:
+        return DeviceInfo(kind="cpu", requested=requested)
+
+    probe_index = 0 if index is None else index
+    name = ""
+    memory: int | None = None
+    capability: tuple[int, int] | None = None
+
+    if kind in {"cuda", "rocm"}:
+        try:
+            name = str(torch.cuda.get_device_name(probe_index))
+            memory = int(torch.cuda.get_device_properties(probe_index).total_memory)
+            raw = torch.cuda.get_device_capability(probe_index)
+            capability = tuple(int(part) for part in raw) if raw else None
+        except Exception:  # a probe must never fail the run it describes
+            _LOGGER.debug("Could not describe %s:%s", kind, probe_index, exc_info=True)
+    elif kind == "xpu":
+        try:
+            name = str(torch.xpu.get_device_name(probe_index))
+            properties = torch.xpu.get_device_properties(probe_index)
+            memory = int(getattr(properties, "total_memory", 0)) or None
+        except Exception:
+            _LOGGER.debug("Could not describe xpu:%s", probe_index, exc_info=True)
+    elif kind == "mps":
+        name = "Apple Silicon (Metal)"
+    elif kind == "cpu":
+        import platform
+
+        name = platform.processor() or platform.machine()
+
+    return DeviceInfo(
+        kind=kind,
+        index=index,
+        name=name,
+        total_memory=memory,
+        capability=capability,
+        requested=requested,
+    )
+
+
+def probe_device(requested: str = "auto") -> DeviceInfo:
+    """Resolve ``requested`` and describe the hardware behind it.
+
+    Never raises: an unparseable request or an absent device produces a report
+    that says so, because this is used for diagnostics as well as dispatch.
+    """
+    torch = _import_torch()
+    if torch is None:
+        return DeviceInfo(kind="cpu", requested=requested)
+    kind, index = _split_requested(requested, torch)
+    return _describe(torch, kind, index, requested)
+
+
+def available_accelerators() -> tuple[str, ...]:
+    """Every accelerator torch can use right now, most capable first."""
+    torch = _import_torch()
+    if torch is None:
+        return ()
+    found: list[str] = []
+    if torch.cuda.is_available():
+        found.append("rocm" if getattr(torch.version, "hip", None) else "cuda")
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        found.append("xpu")
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        found.append("mps")
+    return tuple(found)
+
+
+def supports_bf16(info: DeviceInfo) -> bool:
+    """Whether the hardware does bfloat16 natively rather than emulated."""
+    if info.kind == "xpu":
+        return True
+    if info.kind == "mps":
+        # Supported on recent macOS only; float16 is the safe choice everywhere.
+        return False
+    minimum = _BF16_MIN_CAPABILITY.get(info.kind)
+    if minimum is None or info.capability is None:
+        return False
+    return info.capability >= minimum
+
+
+def supports_fp16(info: DeviceInfo) -> bool:
+    """Whether float16 is both supported and worth using on this device."""
+    if info.kind in {"xpu", "mps"}:
+        return True
+    minimum = _FP16_MIN_CAPABILITY.get(info.kind)
+    if minimum is None or info.capability is None:
+        return False
+    return info.capability >= minimum
+
+
+def preferred_dtype(info: DeviceInfo) -> str:
+    """The canonical dtype name to use on ``info`` when the user has no opinion."""
+    if supports_bf16(info):
+        return "bf16"
+    if supports_fp16(info):
+        return "fp16"
+    return "fp32"
+
+
+def normalize_dtype(value: str | None) -> str:
+    """Canonicalise a dtype spelling, raising ``ConfigError`` for nonsense."""
+    key = str(value or "auto").strip().lower()
+    try:
+        return DTYPE_ALIASES[key]
+    except KeyError:
+        raise ConfigError(
+            f"Unknown dtype {value!r}. Use: auto, bf16, fp16 or fp32"
+        ) from None
+
+
+def _dtype_usable(info: DeviceInfo, name: str) -> bool:
+    """Whether an *explicitly requested* dtype can run on ``info``."""
+    if not info.is_accelerated:
+        return False  # CPU half-precision is slow and patchy; no reason to allow it
+    if name == "bf16":
+        return supports_bf16(info)
+    return True  # float16 is available on every accelerator family
+
+
+def pick_dtype(device: str = "auto", requested: str = "auto") -> Any:
+    """The torch dtype to load weights with on ``device``.
+
+    Capability-aware by default. An explicit ``requested`` dtype is honoured
+    unless the device cannot run it (bfloat16 on a pre-Ampere card, or any
+    half-precision on CPU), in which case it degrades to the best the device does
+    support and says so in the log rather than failing the job.
+    """
+    torch = _import_torch()
+    if torch is None:  # pragma: no cover - torch is a hard runtime dep
+        raise ConfigError("torch is not installed, so no dtype can be selected")
+
+    want = normalize_dtype(requested)
+    info = probe_device(device)
+    if want == "auto":
+        want = preferred_dtype(info)
+    elif want != "fp32" and not _dtype_usable(info, want):
+        fallback = preferred_dtype(info)
+        _LOGGER.warning(
+            "dtype %s is not usable on %s (%s); using %s instead.",
+            want,
+            info.label,
+            info.kind,
+            fallback,
+        )
+        want = fallback
+    return getattr(torch, _DTYPE_ATTRIBUTES[want])
+
+
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve a device string for the model backends.
+
+    ``auto`` picks a device *every* stage supports - CUDA (including ROCm) when
+    one is present, otherwise CPU. Metal and XPU are reported by
+    :func:`probe_device` and usable through an explicit ``--device``, but are not
+    chosen automatically because CTranslate2, which speech recognition runs on,
+    offers only CUDA and CPU.
+
+    An explicit request is returned unchanged, so ``cuda:1`` stays ``cuda:1``
+    instead of being silently narrowed to the default device.
+    """
+    if requested and requested != "auto":
+        return requested
+    return probe_device("auto").label
 
 
 def release_gpu_memory() -> bool:
-    """Return cached GPU memory to the driver; ``True`` if anything was released.
+    """Return cached accelerator memory to the driver; ``True`` if anything was.
 
     Each heavy stage loads its own multi-GB model (Whisper ~3 GB, Qwen3-TTS
     ~3.5 GB). When a stage's model goes out of scope, PyTorch keeps the blocks in
@@ -769,18 +1059,35 @@ def release_gpu_memory() -> bool:
     though the previous model is already gone. Calling this between stages makes
     that memory available again.
 
-    Cheap and safe to call anywhere: it is a no-op without CUDA.
+    Cheap and safe to call anywhere: a no-op when no accelerator is present.
     """
-    try:
-        import torch
-    except ImportError:  # pragma: no cover - torch is a hard runtime dep
-        return False
-    if not torch.cuda.is_available():
+    torch = _import_torch()
+    if torch is None:  # pragma: no cover - torch is a hard runtime dep
         return False
 
     import gc
 
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    return True
+    released = False
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        released = True
+
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        empty = getattr(xpu, "empty_cache", None)
+        if callable(empty):
+            empty()
+            released = True
+
+    mps = getattr(torch, "mps", None)
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps_backend is not None and mps_backend.is_available():
+        empty = getattr(mps, "empty_cache", None)
+        if callable(empty):
+            empty()
+            released = True
+
+    return released

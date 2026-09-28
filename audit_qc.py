@@ -13,7 +13,7 @@ also makes it usable in CI, or by hand, on any completed job folder.
 Usage:
     python audit_qc.py output/<job>
 
-    # Also measure speaker timbre (needs the GPU and the TTS checkpoint).
+    # Also measure speaker timbre (needs the TTS checkpoint).
     python audit_qc.py output/<job> --timbre
 
     # Machine-readable, for a script or a bake-off harness.
@@ -57,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--timbre",
         action="store_true",
         help=(
-            "Also measure speaker timbre per line. Needs a GPU and the TTS "
-            "checkpoint; without it the timbre gate is reported as skipped."
+            "Also measure speaker timbre per line. Needs the TTS checkpoint; "
+            "without it the timbre gate is reported as skipped."
         ),
     )
     parser.add_argument(
@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"Models directory. (default: {DEFAULT_MODEL_DIR})",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Device for the timbre measurement. `auto` picks the GPU when one is "
+            "available; `cpu` measures on the CPU, which is slower but works when "
+            "the GPUs are busy with something else. (default: auto)"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -155,7 +164,7 @@ def thresholds_from(args: argparse.Namespace) -> QCThresholds:
     )
 
 
-def _load_engine(models_dir: Path | None):
+def _load_engine(models_dir: Path | None, device: str = "auto"):
     """Load the TTS engine, imported lazily so a cheap run stays cheap."""
     from pipeline.tts import TTSEngine
 
@@ -166,7 +175,7 @@ def _load_engine(models_dir: Path | None):
             "--timbre to check the cheap gates only."
         )
     print(f"Loading {resolved.name} ...", file=sys.stderr, flush=True)
-    return TTSEngine(resolved, device="auto")
+    return TTSEngine(resolved, device=device)
 
 
 def print_report(payload: dict) -> None:
@@ -186,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = None
     if args.timbre:
         try:
-            engine = _load_engine(args.models_dir)
+            engine = _load_engine(args.models_dir, args.device)
         except DubbingError as exc:
             print(str(exc), file=sys.stderr)
             return _EXIT_UNUSABLE

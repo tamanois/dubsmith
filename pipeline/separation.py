@@ -190,12 +190,19 @@ class DemucsSeparator:
         return speech, background
 
     def _device(self) -> str:
-        """Resolve the torch device, preferring CUDA when available."""
-        import torch
+        """The torch device for Demucs, with the GPU index preserved.
 
+        Narrowing ``cuda:1`` to ``cuda`` would put the model on the first GPU,
+        colliding with whatever else is resident there - which is the whole point
+        of pinning a device on a multi-GPU box.
+        """
         if self.device and self.device != "auto":
-            return "cuda" if str(self.device).startswith("cuda") else self.device
-        return "cuda" if torch.cuda.is_available() else "cpu"
+            return str(self.device)
+        # Imported locally: config.py imports this module for its defaults, so a
+        # top-level import would cycle.
+        from .config import resolve_device
+
+        return resolve_device("auto")
 
 
 def _fit_length(values: np.ndarray, size: int) -> np.ndarray:

@@ -26,6 +26,7 @@ __all__ = [
     "Word",
     "Segment",
     "Transcript",
+    "asr_device",
     "resolve_compute_type",
     "build_transcript",
     "transcribe",
@@ -91,6 +92,20 @@ class Transcript(BaseModel):
     def is_empty(self) -> bool:
         """True when nothing usable was recognised."""
         return not self.segments
+
+
+def asr_device(device: str) -> str:
+    """Map a device request to one CTranslate2 understands.
+
+    CTranslate2, which faster-whisper runs on, offers CUDA and CPU only, and wants
+    the bare ``"cuda"`` rather than ``"cuda:0"``. Metal and XPU therefore degrade
+    to CPU instead of failing after the weights have loaded, which is what an
+    explicit ``--device mps`` used to do.
+    """
+    from .config import resolve_device
+
+    resolved = str(resolve_device(device)).lower()
+    return "cuda" if resolved.startswith(("cuda", "rocm")) else "cpu"
 
 
 def resolve_compute_type(device: str) -> str:
@@ -366,11 +381,8 @@ def transcribe(
             "faster-whisper is not installed. Run: pip install -r requirements.txt"
         ) from exc
 
-    from .config import resolve_device
-
-    resolved_device = resolve_device(device)
-    # CTranslate2 accepts "cuda" plus a device index, not "cuda:0".
-    ct2_device = "cuda" if resolved_device.startswith("cuda") else resolved_device
+    # CTranslate2 understands CUDA and CPU only, and wants the bare "cuda".
+    ct2_device = asr_device(device)
 
     def run(target_device: str) -> Transcript:
         model = _load_whisper(model_dir, target_device, compute_type)
@@ -453,10 +465,7 @@ def transcribe_many(
             "faster-whisper is not installed. Run: pip install -r requirements.txt"
         ) from exc
 
-    from .config import resolve_device
-
-    resolved_device = resolve_device(device)
-    ct2_device = "cuda" if resolved_device.startswith("cuda") else resolved_device
+    ct2_device = asr_device(device)
     paths = [Path(path) for path in audio_paths]
 
     def run(target_device: str) -> list[Transcript]:

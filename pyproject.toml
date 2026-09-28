@@ -1,3 +1,69 @@
+[build-system]
+# 77 is where PEP 639 SPDX license metadata landed; without it the license field
+# below is rejected rather than read.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Named `qwen-tts-dub`, not `qwen-tts`: that name belongs to the TTS checkpoint's
+# own package, which is a *dependency* here.
+name = "qwen-tts-dub"
+# Single-sourced from pipeline/__init__.py so the CLI, the package metadata and
+# `dub.py --version` cannot disagree.
+dynamic = ["version"]
+description = "Dub a video into another language while keeping each speaker's own voice timbre."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["dubbing", "translation", "tts", "voice-cloning", "whisper"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+dependencies = [
+    "numpy==1.26.4",
+    "typing_extensions",
+    "torch>=2.1.0",
+    "soundfile",
+    "librosa",
+    "pydantic>=2.0",
+    "qwen-tts",
+    "faster-whisper",
+    "pyloudnorm",
+    "openai",
+]
+
+[project.optional-dependencies]
+# Every one of these degrades gracefully when absent, so they are extras rather
+# than requirements: a single-voice dub of an audio file needs none of them.
+background = ["demucs"]
+diarization = ["funasr", "modelscope"]
+separation = ["speechbrain"]
+# GPU speech recognition: CTranslate2 links against CUDA 12 while recent torch
+# wheels ship CUDA 13, and these wheels supply the missing libcublas/libcudnn.
+# The pipeline preloads them itself, so no LD_LIBRARY_PATH is needed.
+gpu-asr = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
+full = ["demucs", "funasr", "modelscope", "speechbrain"]
+dev = ["pytest>=8.0", "funasr", "modelscope"]
+
+[project.scripts]
+dub = "dub:main"
+dub-audit-qc = "audit_qc:main"
+dub-audit-timbre = "audit_timbre:main"
+
+[tool.setuptools]
+# Flat modules: the CLI entry points plus the importable pipeline package.
+py-modules = ["dub", "audit_qc", "audit_timbre"]
+packages = ["pipeline"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pipeline.__version__" }
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

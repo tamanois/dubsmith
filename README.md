@@ -1,24 +1,41 @@
-# AI Video Dubbing — MVP
+# AI Video Dubbing
 
-Dub a **single-speaker** video into another language while keeping the speaker's
-**own voice timbre**. Runs entirely on local, open models; no cloud required.
+Dub a video into another language while keeping each speaker's **own voice
+**timbre**. Runs entirely on local, open models; no cloud required.
 
 See [`PLAN.md`](PLAN.md) for the full vision, roadmap (P1–P6) and design
 decisions, and [`AGENTS.md`](AGENTS.md) for the project context.
 
 ---
 
-## MVP scope
+## What it does
 
 | | |
 |---|---|
 | **Input** | One video, or one audio file |
-| **Speakers** | Single speaker (multi-speaker is roadmap P1) |
+| **Speakers** | One or several: speakers are found automatically and each is cloned from their own voice. `--diarizer none` forces a single voice |
 | **Source language** | One language, auto-detected (multi-language is P5) |
 | **Target language** | English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
 | **Voice** | Cloned from the source speaker, with three accent modes (see [Accent modes](#accent-modes)) |
 | **Output** | Dubbed video/audio + source & translated SRT subtitles, original music/ambience preserved |
-| **Not included** | Lip sync (P4), multi-speaker diarization (P1) |
+| **Not included** | Lip sync (P4); a fully automatic native accent still needs a supplied reference clip (P2) |
+
+---
+
+## Hardware requirements
+
+| | |
+|---|---|
+| **Disk** | ~6.5 GB of model weights (`models/` is gitignored), plus your media |
+| **GPU** | Optional, but strongly recommended. ~12 GB VRAM runs the default path comfortably: the TTS checkpoint is ~3.5 GB in bfloat16 and Whisper large-v3 ~3 GB |
+| **CPU only** | Works end to end and produces the same *result*. Measured on a 12-core box: a 22 s clip dubs in **2:10** (`preserve`) or **5:18** (`reference-accent`), with every quality gate passing. Synthesis is ~4.3× realtime in float32, so the real constraint is **RAM** (12.7–17.2 GB peak), not patience |
+| **Python** | 3.10 or newer |
+
+The precision follows the hardware rather than the device name — bfloat16 on
+Ampere and newer, float16 on older accelerators (Turing, Volta), float32 on CPU.
+Run `python dub.py info` on unfamiliar hardware before a long job: it reports the
+accelerator, the device and precision the pipeline would pick, which optional
+packages are installed, and which models are present.
 
 ---
 
@@ -55,7 +72,26 @@ Python **3.10+** is required (developed and tested on 3.10.12).
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install .              # or: pip install -r requirements.txt
+```
+
+The package installs a `dub` command, so `python dub.py --target fr` and
+`dub --target fr` are the same thing. Optional features are extras:
+
+```bash
+pip install ".[background]"    # Demucs: keep the original music and ambience
+pip install ".[diarization]"   # funasr: clone each speaker from their own voice
+pip install ".[separation]"    # SpeechBrain: split overlapping speakers
+pip install ".[full]"          # all of the above
+```
+
+Every one of those degrades gracefully when absent, so a first dub needs none of
+them. On a **CPU-only machine**, install the CPU torch wheel first — the default
+wheel is several gigabytes of CUDA you cannot use:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install .
 ```
 
 > If dependency resolution is awkward, install the two pins first — this is what
@@ -65,8 +101,11 @@ pip install -r requirements.txt
 > pip install -r requirements.txt
 > ```
 
-**GPU is optional.** With CUDA the pipeline uses `cuda` + `float16`; without it,
-everything still runs on CPU (`int8` ASR, `float32` TTS) — just much slower.
+**GPU is optional.** With CUDA or ROCm the pipeline runs there; without one
+everything still runs on CPU, just much slower. Speech recognition always uses
+CTranslate2, which offers CUDA and CPU only — so on Apple Silicon ASR runs on the
+CPU while the other stages can use Metal if you ask for it. See
+[Devices and precision](#devices-and-precision).
 
 Python packages installed by `requirements.txt`:
 
@@ -129,6 +168,46 @@ llama-server -m /path/to/model.gguf --port 8080
 ```
 
 Real environment variables always take precedence over `.env`.
+
+---
+
+## Devices and precision
+
+```bash
+python dub.py info                     # what would this machine use, and why?
+python dub.py --video talk.mp4 --target fr --device cpu    # force CPU
+python dub.py --video talk.mp4 --target fr --dtype fp16    # force a precision
+```
+
+`--device` accepts `auto` (the default), `cpu`, `cuda`, `cuda:N` for a specific
+GPU, and `mps` or `xpu` on Apple and Intel hardware. `--dtype` accepts `auto`
+(the default), `bf16`, `fp16` or `fp32`.
+
+The rules, and the reasoning behind them:
+
+| Situation | What happens |
+|---|---|
+| CUDA or ROCm GPU present | `auto` uses it. `cuda:1` is honoured exactly, so a second GPU can be pinned |
+| No GPU | `auto` uses the CPU. Everything works; it is just much slower |
+| Apple Silicon | `auto` uses the CPU, because faster-whisper runs on CTranslate2, which has no Metal backend. `--device mps` still puts the *other* stages on the GPU, and ASR quietly stays on the CPU |
+| Ampere or newer NVIDIA (sm_80+) | bfloat16 |
+| Turing or Volta (sm_70–sm_75) | float16 — bfloat16 is unsupported on these cards, and choosing it was a real failure on the second-hand GPUs people actually own |
+| Pascal or older (sm_61 and below) | float32 — emulated float16 is lossy |
+| CPU | float32 |
+| ROCm | float16, or bfloat16 on CDNA2 and newer |
+| Intel XPU | bfloat16 |
+
+If you ask for a precision the device cannot run, the pipeline uses the best it
+can and says so in the log rather than failing the job. `report.json` → `device`
+records what was actually used, so a run on unfamiliar hardware is diagnosable
+from the report alone.
+
+**Changing the precision does not measurably change the voice.** Measured on three
+sentences with one reference clip: float16 versus bfloat16 scored 0.9902 (median) on
+the checkpoint's own speaker encoder, against 0.9898 and 0.9935 for two draws at the
+*same* precision. The cross-precision difference is smaller than the run-to-run
+sampling spread, so forcing `--dtype fp16` on a pre-Ampere card is a throughput
+choice rather than a quality one.
 
 ---
 
@@ -211,9 +290,10 @@ Every option is described in [Options in full](#options-in-full);
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate   # one-time
-pip install -r requirements.txt                      # runtime dependencies
-pip install -r requirements-dev.txt                  # + pytest
+pip install .                                        # runtime dependencies
+pip install -r requirements-dev.txt                  # + pytest and the optional backends
 
+python dub.py info                                   # what will this machine use?
 python dub.py models --download all                  # ~6.5 GB of weights
 python dub.py models --list                          # what is present already?
 ```
@@ -665,8 +745,9 @@ a space.
 **Models and hardware**
 
 | Option | Default | What it achieves ||---|---|---|
-| `--device DEVICE` | `auto` | `auto`, `cuda:0`, or `cpu`. `cpu` is much slower but proves the GPU is not the problem. |
-| `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate. |
+| `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps`, or `xpu`. `cuda:1` pins a specific GPU. `cpu` is much slower but proves the GPU is not the problem. See [Devices and precision](#devices-and-precision) |
+| `--dtype DTYPE` | `auto` | Precision for the voice-cloning checkpoint: `auto`, `bf16`, `fp16`, or `fp32`. `auto` reads the device's capability. An explicit value is honoured unless the device cannot run it |
+| `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate — the main lever on a CPU-only machine. |
 | `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
 | `MODELS_DIR` (env) | `models` | Where weights live. Set in `.env`; the download command also takes `--models-dir`. |
 
@@ -919,7 +1000,7 @@ python -m pytest
 ```
 
 ```
-756 passed
+825 passed
 ```
 
 Run a single area while iterating:
@@ -942,6 +1023,7 @@ checkpoint, because it loads the same model the pipeline does:
 
 ```bash
 python audit_timbre.py "output/<input-stem>"
+python audit_timbre.py "output/<input-stem>" --device cpu   # when the GPUs are busy
 ```
 
 It reports, per line, `cos(line, reference) − cos(line, accent)` where both
@@ -979,8 +1061,9 @@ lose the work. Exit status is `0` when every gate passes, `1` when one fails, an
 `2` when the job could not be checked at all, which makes it usable in CI.
 
 ```bash
-python audit_qc.py "output/<input-stem>"              # cheap gates, no GPU
+python audit_qc.py "output/<input-stem>"              # cheap gates, no model
 python audit_qc.py "output/<input-stem>" --timbre      # adds the per-line timbre gate
+python audit_qc.py "output/<input-stem>" --timbre --device cpu   # measure on the CPU
 python audit_qc.py "output/<input-stem>" --json        # machine-readable
 ```
 
@@ -1017,7 +1100,11 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | `--accent-audio requires --accent-text` | Transcribe the accent clip; the codes cannot be aligned without it |
 | `does not support voice cloning` | Pointed at a CustomVoice/VoiceDesign checkpoint; use `tts_base` |
 | `Unsupported language 'xx'` | Use one of the ten supported languages |
-| CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it) |
+| CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it). On a multi-GPU box, `--device cuda:1` pins the run to the other card |
+| An unexpected amount of VRAM is in use | `--device cuda:1` now genuinely uses the second GPU; the log line and `report.json` → `device` both report the card that was used |
+| `dtype fp16 is not usable on cpu (cpu); using fp32 instead` | Informational, not an error: half-precision on a CPU is slow and patchy, so float32 is used. Drop `--dtype` to let the capability decide |
+| The GPU is not being used at all | Run `python dub.py info` — it reports the accelerator, the device it would pick, and the precision. If it says `cpu`, torch either sees no GPU or the wrong wheel is installed (see Prerequisites §2 and §3) |
+| Speech recognition is on the CPU when a GPU exists | CTranslate2 links against a specific CUDA major. Run `python dub.py info` and check the `asr device` line; Prerequisites §3 has the fix |
 | Dub sounds rushed or slow | Check `report.json` → `clamped_segments`; tighten the translation |
 | Some words are cut off | `report.json` → `trimmed_segments`: the translation is too long for its slot. Check `worst_line_deleted_ratio` too — a small total can hide one badly damaged line. Leave the length repair on (it is on by default), shorten the translation, or lower `--min-stretch` |
 | A line lost a lot of words despite a low `trimmed_seconds_total` | Look at `worst_line_deleted_ratio` and `lines_over_10pct_deleted`: damage is usually concentrated in one or two lines, not spread evenly |
@@ -1044,6 +1131,8 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
 | `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
 | The dub is rushed, or words are missing | The reference clip's pacing is being imitated, and a slow reference lengthens every line. Use a faster-paced reference — see [Reference pacing](#reference-pacing) |
+| `audit_qc.py` reports `SKIP timbre — no accent clip to measure against` | Expected for a `preserve` job: nothing was borrowed, so "did the line follow the accent voice?" has no answer. Pass `--accent <clip>` to force one. The other three gates still report, and the exit code stays 0 |
+| The timbre audit fails while the GPUs are busy | Pass `--device cpu` to `audit_qc.py` or `audit_timbre.py`. The measurement is slower there but identical |
 
 Logs are written to stderr and include a job id. Set `LOG_JSON=1` for
 machine-readable logs.
@@ -1053,11 +1142,12 @@ machine-readable logs.
 ## Project layout
 
 ```
-dub.py                     CLI entry point
-audit_timbre.py            per-line speaker-timbre audit (needs the GPU)
+dub.py                     CLI entry point (`dub`, `dub info`, `dub models`)
+audit_timbre.py            per-line speaker-timbre audit (--device cpu works)
 audit_qc.py                automated quality gate for a finished job
+LICENSE                    Apache-2.0
 pipeline/
-├── config.py              job + settings models, language normalisation
+├── config.py              job + settings models, device capability, languages
 ├── errors.py              domain exception hierarchy
 ├── logging_utils.py       job-scoped structured logging
 ├── models.py              model registry, download, path resolution
@@ -1073,10 +1163,12 @@ pipeline/
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (756 tests)
+tests/                     pytest suite (825 tests, no GPU or models needed)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
+pyproject.toml             packaging, entry points, optional extras, pytest config
+.github/workflows/ci.yml   test suite on a CPU-only runner
 PLAN.md                    roadmap: MVP + P1–P6
 .agents/technical-guidelines.md   engineering standards
 ```
@@ -1088,6 +1180,15 @@ PLAN.md                    roadmap: MVP + P1–P6
 - **Voice cloning requires consent.** Clone only voices you have permission to
   use. Voice is biometric data under GDPR, and synthetic-dubbing disclosure is
   increasingly required by platforms. A consent gate is planned for P6.
+- **Licence**: this project is Apache-2.0 (see `LICENSE`).
+- **Hardware portability is deliberate, and tested without the hardware.** The
+  dtype follows the GPU's compute capability rather than its name (bfloat16 is
+  unsupported on Pascal and Volta, and choosing it unconditionally was the most
+  likely "works for me, not for you" failure). `--device cuda:N` is honoured
+  exactly, so a second GPU can be pinned. Metal and XPU are usable but never
+  chosen automatically, because speech recognition runs on CTranslate2. The rules
+  are covered by `tests/test_device.py` against fake hardware profiles, so a
+  regression is caught on a CPU-only CI runner.
 - **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
   Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
 - **Multi-speaker dubbing attributes speakers per segment**, not per word, so

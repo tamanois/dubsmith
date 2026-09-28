@@ -25,7 +25,9 @@ from . import media, subtitles
 from .asr import (
     Segment,
     Transcript,
+    asr_device,
     load_transcript,
+    resolve_compute_type,
     save_transcript,
     transcribe,
     transcribe_many,
@@ -35,6 +37,7 @@ from .config import (
     Settings,
     language_code_for_name,
     normalize_loudness_policy,
+    probe_device,
     release_gpu_memory,
 )
 from .diarize import NullDiarizer, assign_streams, detect_diarizer, single_speaker_labels
@@ -51,7 +54,7 @@ from .translate import (
     TranslationRequest,
     Translator,
 )
-from .tts import DonorClip, TTSEngine, select_donor
+from .tts import DonorClip, TTSEngine, resolve_dtype, select_donor
 
 __all__ = ["Pipeline", "JobResult", "Manifest"]
 
@@ -373,9 +376,20 @@ class Pipeline:
     def _resolve_tts(self) -> TTSEngine:
         if self._tts is None:
             model_dir = resolve_model("tts_base", self.settings.models_dir)
+            info = probe_device(self.job.device)
+            dtype = resolve_dtype(self.job.device, self.job.dtype)
+            # Logged because "which device did it actually use?" is the first
+            # question on unfamiliar hardware, and the answer decides the runtime.
+            self.log.info(
+                "Synthesising on %s (%s) with %s.",
+                info.label,
+                info.name or info.kind,
+                str(dtype).replace("torch.", ""),
+            )
             self._tts = TTSEngine(
                 model_dir,
                 device=self.job.device,
+                dtype=dtype,
                 x_vector_only=self.job.accent_mode == "speaker-only",
             )
         return self._tts
@@ -2103,6 +2117,29 @@ class Pipeline:
             return float(fallback)
         return float(source)
 
+    def _device_info(self) -> dict[str, Any]:
+        """Which device and precision this run actually used.
+
+        The dtype is resolved exactly as the engine resolves it, so the report
+        cannot claim a precision the synthesis did not use. Recorded because a
+        run on unfamiliar hardware has to be diagnosable from the report alone.
+        """
+        info = probe_device(self.job.device)
+        return {
+            "requested": self.job.device,
+            "resolved": info.label,
+            "kind": info.kind,
+            "name": info.name,
+            "total_memory": info.total_memory,
+            "capability": list(info.capability) if info.capability else None,
+            "dtype": str(resolve_dtype(self.job.device, self.job.dtype)).replace(
+                "torch.", ""
+            ),
+            # Speech recognition runs on CTranslate2, which accepts CUDA and CPU
+            # only, whatever device the torch stages were given.
+            "asr_compute_type": resolve_compute_type(asr_device(self.job.device)),
+        }
+
     def _build_report(
         self,
         timeline: Timeline,
@@ -2176,6 +2213,8 @@ class Pipeline:
             "background_preserved": has_background,
             "duck_db": effective_duck,
             "accent_mode": self.job.accent_mode,
+            #: Which device and precision the models ran on.
+            "device": self._device_info(),
             "donor": self._donor_info(),
             #: Which voices were found and how much each of them said. ``None``
             #: when the video has one speaker, so single-speaker reports are

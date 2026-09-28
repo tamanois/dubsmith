@@ -109,6 +109,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=f"Models directory. (default: {DEFAULT_MODEL_DIR})",
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Device for the speaker encoder. `auto` picks the GPU when one is "
+            "available; `cpu` is slower but works when the GPUs are busy. "
+            "(default: auto)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     model_dir = args.models_dir or DEFAULT_MODEL_DIR
@@ -117,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(f"Loading {model_dir.name} ...", flush=True)
-    engine = TTSEngine(model_dir, device="auto")
+    engine = TTSEngine(model_dir, device=args.device)
 
     results = []
     for job in args.jobs:

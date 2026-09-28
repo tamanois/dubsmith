@@ -60,6 +60,7 @@ __all__ = [
     "audit",
     "audit_job",
     "accent_path_for",
+    "timbre_available",
     "GateResult",
     "QCThresholds",
     "evaluate",
@@ -482,12 +483,28 @@ def _loudness_gate(report: Mapping[str, Any], limits: QCThresholds) -> GateResul
     )
 
 
+def timbre_available(job_dir: Path, accent: Path | None = None) -> bool:
+    """Whether per-line timbre can be measured for this job at all.
+
+    The measurement needs the clip the pronunciation was borrowed from. A
+    ``preserve`` job never had one, so asking whether its lines followed the
+    accent voice is not a failure - it is a question with no answer, which the
+    gate reports as *skipped* rather than aborting the whole check.
+    """
+    chosen = accent or accent_path_for(job_dir)
+    return chosen is not None and Path(chosen).is_file()
+
+
 def _timbre_gate(
-    timbre: Sequence[Mapping[str, Any]] | None, limits: QCThresholds
+    timbre: Sequence[Mapping[str, Any]] | None,
+    limits: QCThresholds,
+    reason: str | None = None,
 ) -> GateResult:
     """Gate on lines that followed the accent voice instead of the speaker's."""
     if timbre is None:
-        return GateResult("timbre", "skip", "not measured; pass --timbre to run it")
+        return GateResult(
+            "timbre", "skip", reason or "not measured; pass --timbre to run it"
+        )
 
     rows = 0
     collapsed = 0
@@ -519,6 +536,7 @@ def evaluate(
     *,
     timbre: Sequence[Mapping[str, Any]] | None = None,
     thresholds: QCThresholds | None = None,
+    timbre_reason: str | None = None,
 ) -> list[GateResult]:
     """Check a job's report against the quality thresholds.
 
@@ -529,6 +547,9 @@ def evaluate(
             than as a pass.
         thresholds: Limits to apply; the defaults are the roadmap's acceptance
             levels.
+        timbre_reason: Why the timbre gate did not run, when the caller knows - for
+            instance a job with no accent clip to measure against. Without it the
+            skip reads as "not requested", which would be wrong.
 
     Returns:
         One :class:`GateResult` per gate, in a stable order.
@@ -538,7 +559,7 @@ def evaluate(
         _sync_gate(report, limits),
         _truncation_gate(report, limits),
         _loudness_gate(report, limits),
-        _timbre_gate(timbre, limits),
+        _timbre_gate(timbre, limits, timbre_reason),
     ]
 
 
@@ -582,7 +603,10 @@ def qc(
 
     The cheap gates read ``report.json`` alone, so they need no model and no GPU.
     The timbre gate only runs when an ``engine`` is supplied, because it needs the
-    checkpoint's speaker encoder; without one it is reported as skipped.
+    checkpoint's speaker encoder; without one it is reported as skipped. Supplying
+    an engine for a job that has no accent clip is also a skip, not an error: there
+    is nothing to measure the lines against, so "skipped" is the honest answer and
+    the other gates still report.
 
     Args:
         job_dir: The job folder to check.
@@ -598,11 +622,18 @@ def qc(
         AuditError: When the report or a required clip is missing.
     """
     report = _read_report(job_dir)
-    timbre = (
-        audit_job(job_dir, engine, accent=accent, reference=reference)
-        if engine is not None
-        else None
+    timbre = None
+    reason = None
+    if engine is not None:
+        if timbre_available(job_dir, accent):
+            timbre = audit_job(job_dir, engine, accent=accent, reference=reference)
+        else:
+            reason = (
+                "no accent clip to measure against; needs a reference-accent job "
+                "or --accent"
+            )
+    payload = summarize(
+        evaluate(report, timbre=timbre, thresholds=thresholds, timbre_reason=reason)
     )
-    payload = summarize(evaluate(report, timbre=timbre, thresholds=thresholds))
     payload["job_dir"] = str(job_dir)
     return payload

@@ -2,6 +2,18 @@
 #
 #   pip install -r requirements.txt
 #
+# Versions are pinned to the combination this project is verified against, so a
+# fresh install matches the tested environment instead of drifting.
+#
+# torch is pinned as a *floor*, not an exact version, on purpose: which wheel is
+# correct depends on your hardware, and `requirements.lock` style freezes would
+# drag CUDA wheels onto a CPU-only machine. Pick the index that matches:
+#
+#   GPU (CUDA)   pip install -r requirements.txt
+#   CPU only     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#                pip install -r requirements.txt
+#   AMD (ROCm)   see https://pytorch.org/get-started/locally/
+#
 # Install numpy and typing_extensions FIRST if your environment struggles to
 # resolve them together with torch (see packages.md).
 #
@@ -9,23 +21,23 @@
 # See README.md -> "Prerequisites" for the copy-paste install commands.
 
 numpy==1.26.4
-typing_extensions
+typing_extensions==4.16.0
 
-# Deep-learning runtime
+# Deep-learning runtime. Any 2.1+ release works; see the index note above.
 torch>=2.1.0
 
 # Audio + media
-soundfile
-librosa
+soundfile==0.14.0
+librosa==0.11.0
 
 # Validation
-pydantic>=2.0
+pydantic==2.13.5
 
 # Pipeline stages
-qwen_tts                # voice cloning / TTS (Qwen3-TTS)
-faster-whisper          # ASR (ships its own Silero VAD, no extra dependency)
-pyloudnorm              # EBU R128 loudness measurement + normalisation
-openai                  # OpenAI-compatible client used for translation
+qwen-tts==0.1.1        # voice cloning / TTS (Qwen3-TTS)
+faster-whisper==1.2.1  # ASR (ships its own Silero VAD, no extra dependency)
+pyloudnorm==0.2.0      # EBU R128 loudness measurement + normalisation
+openai==3.19.0         # OpenAI-compatible client used for translation
 
 # Optional: multi-speaker dubbing. Provides the speaker-verification model
 # (ERes2NetV2, ~30 MB, cached under ~/.cache/modelscope) used to tell voices
@@ -54,7 +66,10 @@ openai                  # OpenAI-compatible client used for translation
 # the pipeline still runs: `--overlap separate` warns and behaves as `--overlap
 # dominant`. The checkpoint (~30 MB) downloads on first use into
 # ~/.cache/speechbrain.
-speechbrain
+#
+# Optional, like demucs and funasr: uncomment, or install the packaged extra.
+#   pip install "qwen-tts-dub[separation]"
+#speechbrain
 
 # Optional: CUDA 12 runtime libraries for **GPU speech recognition**.
 # CTranslate2 (used by faster-whisper) links against CUDA 12 specifically, while

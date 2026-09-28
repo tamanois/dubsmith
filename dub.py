@@ -22,10 +22,20 @@ from __future__ import annotations
 
 import argparse
 import sys
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Sequence
 
-from pipeline.config import SUPPORTED_LANGUAGES, JobConfig, Settings
+from pipeline import __version__
+from pipeline.asr import asr_device, resolve_compute_type
+from pipeline.config import (
+    SUPPORTED_LANGUAGES,
+    JobConfig,
+    Settings,
+    available_accelerators,
+    pick_dtype,
+    probe_device,
+)
 from pipeline.errors import DubbingError, ModelNotFoundError
 from pipeline.logging_utils import setup_logging
 from pipeline.mixing import (
@@ -38,6 +48,22 @@ from pipeline.orchestrate import Pipeline
 
 _PROG = "dub.py"
 _STOP = 0
+
+#: Optional dependencies and what each one unlocks. Reported by ``dub.py info``
+#: because a missing one degrades one feature rather than failing a run.
+_OPTIONAL_DEPENDENCIES: tuple[tuple[str, str], ...] = (
+    ("demucs", "keep the original music and ambience (--no-background disables)"),
+    ("funasr", "multi-speaker dubbing (--diarizer none disables)"),
+    ("speechbrain", "overlapping-speech separation (--overlap separate)"),
+)
+
+#: System binaries the media layer looks for. Only ffmpeg is ever required.
+_SYSTEM_BINARIES: tuple[tuple[str, str], ...] = (
+    ("ffmpeg", "required for video input and muxing"),
+    ("ffprobe", "required for video input"),
+    ("rubberband", "best-quality time stretching"),
+    ("sox", "alternative time stretching"),
+)
 
 
 def build_models_parser() -> argparse.ArgumentParser:
@@ -68,8 +94,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description=(
-            "Dub a single-speaker video (or audio file) into a target language using "
-            "the speaker's own voice timbre."
+            "Dub a video (or audio file) into a target language using each "
+            "speaker's own voice timbre. Run 'info' first on unfamiliar hardware."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -101,7 +127,18 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, or cpu.")
+    parser.add_argument("--device", default="auto", help="auto, cuda:0, cuda:1, mps, or cpu.")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help=(
+            "Precision for the voice-cloning checkpoint. 'auto' reads the "
+            "device's capability: bf16 on Ampere and newer, fp16 on older "
+            "accelerators, fp32 on CPU. An explicit value is honoured unless "
+            "the device cannot run it."
+        ),
+    )
     parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
     parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
     parser.add_argument(
@@ -398,6 +435,12 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
     )
     parser.add_argument("--force", action="store_true", help="Ignore cached stages.")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{_PROG} {__version__}",
+        help="Show the program version and exit.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
     return parser
 
@@ -405,6 +448,141 @@ def build_dub_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+
+
+def build_info_parser() -> argparse.ArgumentParser:
+    """Parser for the ``info`` subcommand."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_PROG} info",
+        description=(
+            "Report the environment: accelerators, the device and precision the "
+            "pipeline would pick, optional packages, system binaries and models."
+        ),
+    )
+    parser.add_argument("--device", default="auto", help="Device to report on.")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="dtype to report on (default: auto).",
+    )
+    parser.add_argument(
+        "--models-dir", type=Path, default=None, help="Override the models directory."
+    )
+    return parser
+
+
+def _module_available(name: str) -> bool:
+    """True when an optional dependency can be imported."""
+    try:
+        return find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken installs
+        return False
+
+
+def _torch_version() -> str:
+    """torch's version, tagged with the CUDA or ROCm build it was compiled for."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a hard runtime dep
+        return "not installed"
+
+    version = getattr(torch, "version", None)
+    hip = getattr(version, "hip", None)
+    cuda = getattr(version, "cuda", None)
+    if hip:
+        return f"{torch.__version__}  (ROCm {hip})"
+    if cuda:
+        return f"{torch.__version__}  (CUDA {cuda})"
+    return f"{torch.__version__}  (CPU build)"
+
+
+def _dtype_label(device: str, requested: str) -> str:
+    """The dtype the TTS checkpoint would load with, as plain text."""
+    name = str(pick_dtype(device, requested)).replace("torch.", "")
+    return name if requested == "auto" else f"{name}  (requested: {requested})"
+
+
+def render_environment(
+    models_dir: Path | str, *, device: str = "auto", dtype: str = "auto"
+) -> str:
+    """The text printed by ``dub.py info``.
+
+    Returned rather than printed so it is testable and can be pasted whole into a
+    bug report. The first question on unfamiliar hardware is "what did it pick, and
+    why?", and every answer belongs here.
+    """
+    import platform
+    import shutil
+
+    info = probe_device(device)
+    lines: list[str] = [
+        f"python           {platform.python_version()}  (>=3.10 required)",
+        f"platform         {platform.system()} {platform.machine()}",
+        f"torch            {_torch_version()}",
+    ]
+
+    accelerators = available_accelerators()
+    lines.append(
+        "accelerators     " + (", ".join(accelerators) if accelerators else "none")
+    )
+
+    if info.is_accelerated:
+        memory = (
+            f"{info.total_memory / 1024 ** 3:.1f} GiB"
+            if info.total_memory
+            else "memory unknown"
+        )
+        capability = ""
+        if info.capability:
+            capability = f"  sm_{info.capability[0]}{info.capability[1]}"
+        lines.append(f"device           {info.label}  {info.name}  {memory}{capability}")
+        lines.append(
+            "                 bf16: "
+            + ("yes" if info.supports_bf16 else "no")
+            + "   fp16: "
+            + ("yes" if info.supports_fp16 else "no")
+        )
+    else:
+        lines.append(f"device           cpu  {info.name}")
+
+    lines.append(f"resolved         {info.label}   (requested: {info.requested})")
+    lines.append(f"tts dtype        {_dtype_label(device, dtype)}")
+    lines.append(
+        f"asr device       {asr_device(device)}  "
+        f"(compute type {resolve_compute_type(asr_device(device))})"
+    )
+
+    lines.append("")
+    lines.append("optional packages")
+    for name, purpose in _OPTIONAL_DEPENDENCIES:
+        mark = "yes" if _module_available(name) else "no "
+        lines.append(f"  {name:<14}{mark}  {purpose}")
+
+    lines.append("")
+    lines.append("system binaries")
+    for name, purpose in _SYSTEM_BINARIES:
+        lines.append(f"  {name:<14}{shutil.which(name) or 'MISSING'}  ({purpose})")
+
+    lines.append("")
+    lines.append(f"models directory {Path(models_dir).resolve()}")
+    for spec, present in registry_status(models_dir):
+        required = "  (required)" if spec.name in MVP_REQUIRED else ""
+        state = "present" if present else "missing"
+        lines.append(f"  {spec.name:<18}{state}{required}")
+
+    lines.append("")
+    lines.append("Missing a model?  python dub.py models --download all")
+    return "\n".join(lines)
+
+
+def cmd_info(argv: Sequence[str]) -> int:
+    """Handle ``dub.py info``."""
+    args = build_info_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    print(render_environment(models_dir, device=args.device, dtype=args.dtype))
+    return _STOP
 
 
 def cmd_models(argv: Sequence[str]) -> int:
@@ -465,6 +643,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         ref_text=args.ref_text,
         output_dir=args.output_dir,
         device=args.device,
+        dtype=args.dtype,
         whisper_model=args.whisper_model,
         llm_model=args.llm_model,
         min_stretch=args.min_stretch,
@@ -520,6 +699,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args and args[0] in {"models", "download-models"}:
         handler = cmd_models
+        payload = args[1:]
+    elif args and args[0] == "info":
+        handler = cmd_info
         payload = args[1:]
     else:
         handler = cmd_dub

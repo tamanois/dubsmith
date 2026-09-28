@@ -1,7 +1,7 @@
-"""Local video dubbing pipeline (MVP).
+"""Local video dubbing pipeline.
 
-Turns a single-speaker video into a dub in a target language using the speaker's
-own voice timbre. See ``PLAN.md`` for scope and roadmap.
+Turns a video into a dub in a target language, cloning each speaker's own voice
+timbre. See ``PLAN.md`` for scope and roadmap.
 
 Module map:
     config      -- job/settings models and language normalisation

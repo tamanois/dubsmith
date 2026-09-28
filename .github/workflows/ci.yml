@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push makes an older run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The documented floor, plus a current release: the suite must not quietly
+        # start depending on newer stdlib behaviour than requires-python promises.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # The suite runs without a GPU, so the CPU wheel is both sufficient and
+      # several gigabytes smaller than the CUDA build.
+      - name: Install CPU PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # Deliberately the *runtime* requirements: the optional backends (demucs,
+      # funasr, speechbrain) are exercised through injected fakes and
+      # `pytest.importorskip`, which is exactly how a user without them runs.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pytest>=8.0"
+
+      # `-o addopts=""` clears the `-q` in pyproject.toml, which would otherwise
+      # hide the collected/passed counts from the log.
+      - name: Run the test suite
+        run: pytest -o addopts=""

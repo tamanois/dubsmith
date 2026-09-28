@@ -423,6 +423,29 @@ class TestAudioJob:
         pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
         assert pipeline.run().report["accent_mode"] == "preserve"
 
+    def test_the_device_and_precision_are_recorded(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        """A run on unfamiliar hardware must be diagnosable from the report alone."""
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript, device="cpu")
+        device = pipeline.run().report["device"]
+
+        assert set(device) == {
+            "requested",
+            "resolved",
+            "kind",
+            "name",
+            "total_memory",
+            "capability",
+            "dtype",
+            "asr_compute_type",
+        }
+        assert device["requested"] == "cpu"
+        assert device["resolved"] == "cpu"
+        # CPU always runs float32, whatever precision was asked for.
+        assert device["dtype"] == "float32"
+        assert device["asr_compute_type"] == "int8"
+
     def test_subtitles_can_be_disabled(self, tmp_path: Path, simple_transcript: Transcript) -> None:
         pipeline, _, _, _ = make_pipeline(
             tmp_path, simple_transcript, keep_subtitles=False

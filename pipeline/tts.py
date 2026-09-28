@@ -26,7 +26,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .asr import Segment
-from .config import release_gpu_memory
+from .config import pick_dtype, release_gpu_memory
 from .errors import DependencyError, TTSError
 
 _LOGGER = logging.getLogger(__name__)
@@ -210,11 +210,18 @@ def select_donor(
     )
 
 
-def resolve_dtype(device: str) -> Any:
-    """bfloat16 on CUDA, float32 on CPU (CPU bfloat16 is slow and patchy)."""
-    import torch
+def resolve_dtype(device: str, requested: str = "auto") -> Any:
+    """The torch dtype to load the checkpoint with on ``device``.
 
-    return torch.bfloat16 if str(device).lower().startswith("cuda") else torch.float32
+    Capability-aware: bfloat16 only where the hardware has it (Ampere and newer
+    on CUDA, CDNA on ROCm), float16 on older accelerators, float32 on CPU. The
+    previous behaviour picked bfloat16 for *any* CUDA device, which is unsupported
+    on Pascal and Volta cards - the most likely "other GPU" a user has.
+
+    ``requested`` is an explicit ``--dtype``; it is honoured unless the device
+    cannot run it, in which case it degrades and logs why.
+    """
+    return pick_dtype(device, requested)
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:

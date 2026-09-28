@@ -25,7 +25,8 @@
 | Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
 | Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
-| Tests | ✅ 756 passing | `tests/` |
+| Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
+| Tests | ✅ 825 passing | `tests/` |
 
 Verification performed:
 
@@ -957,9 +958,115 @@ heard was probably the *floor* carrying the original voice — the other thing t
 change removes. Both mechanisms are now gone from the default path, but only an ear
 can confirm it, which is why the tail is opt-in rather than re-tuned by guesswork.
 
-**Status: fixed, 756 tests pass, re-verified end to end** (`RT60 1.65s measured,
+**Status: fixed, 825 tests pass, re-verified end to end** (`RT60 1.65s measured,
 room tone -30.0 dB, duck 3.0 dB, reverb off`). `--room match` now means the two
 steps the plan always said were "worth doing regardless of whether step 3 follows".
+
+### P7 — Portability and distribution (IMPLEMENTED)
+
+**The gap.** The pipeline worked end to end on the author's box, and nowhere else
+was proven. Three things blocked a second user, and only one of them was code: no
+`LICENSE`, so the project was not legally usable at all; no packaging, so it could
+not be installed or version-reported; and a device layer that asked a single
+binary question (`cuda` or not) and answered it with a hardcoded `bfloat16`.
+
+**Three real defects, each of which hits "another GPU" and not this one.**
+
+| Defect | Effect | Fix |
+|---|---|---|
+| `resolve_dtype` returned bfloat16 for *any* `cuda*` device | Unsupported or emulated-slow on Pascal (6.1) and Volta/Turing (7.0–7.5) — exactly the second-hand cards a "runs on consumer hardware" project attracts | Capability-gated: bfloat16 from sm_80, float16 from sm_70, float32 below. ROCm uses CDNA (9.4) as its bfloat16 line |
+| `DemucsSeparator._device` collapsed `cuda:N` to `cuda` | `--device cuda:1` silently ran Demucs on GPU 0, colliding with whatever else was resident — the second GPU was unusable | The index is preserved; `auto` resolves through the probe |
+| ASR passed the raw device string to CTranslate2 | `--device mps` failed *after* the weights loaded, because CTranslate2 has no Metal backend | New `asr.asr_device` maps cuda/rocm to `cuda` and everything else to `cpu`, so a Metal user gets a working dub instead of a traceback |
+
+**A capability layer instead of string matching.** `pipeline/config.py` now has
+`DeviceInfo` (`kind`, `index`, `name`, `total_memory`, `capability`),
+`probe_device`, `available_accelerators`, `supports_bf16` / `supports_fp16`,
+`preferred_dtype` and `pick_dtype`. Every previous `startswith("cuda")` is now a
+question asked of that probe, and `release_gpu_memory` returns the caching
+allocator on Metal and XPU too, not only CUDA. `pipeline.tts.resolve_dtype`
+delegates to it, so the engine and the report cannot disagree about the precision.
+
+**`auto` is deliberately conservative, and that is a decision rather than an
+omission.** It picks a device *every* stage can use — CUDA/ROCm when present, else
+CPU. It does not pick Metal or XPU even when they are available, because
+faster-whisper runs on CTranslate2, which offers only CUDA and CPU: an `auto` that
+chose Metal would break a Mac that works today. Explicit `--device mps` is still
+honoured, and `dub.py info` reports what is present so the choice is discoverable.
+Per-stage device resolution is the fuller fix, and is not built.
+
+**`dub.py info`.** One command answering the only question a user on unfamiliar
+hardware can ask: Python and torch versions (with the CUDA/ROCm build tag), the
+accelerators present, the resolved device with its memory and compute capability,
+the bf16/fp16 flags, the dtype and ASR compute type that *would* be chosen, which
+optional packages import, which system binaries are on `PATH`, and which models are
+present. It loads no model, so it is safe to run first — and it is what makes a bug
+report answerable.
+
+**`--dtype`, and why it is fingerprinted.** `--dtype {auto,bf16,fp16,fp32}`
+overrides the automatic choice; an unusable request degrades to the best the device
+supports and says so at warning level rather than failing the job. `dtype` is a
+`JobConfig` field, so it is part of the job fingerprint: a run at one precision
+cannot silently reuse clips synthesised at another. Adding the field changes every
+existing fingerprint, so the first run after this re-does each stage once — the same
+one-off cost documented for P3b.
+
+**Distribution.** `LICENSE` (Apache-2.0, matching the Qwen3-TTS and Whisper
+weights). `pyproject.toml` gains `[project]`, a version single-sourced from
+`pipeline.__version__`, `requires-python = ">=3.10"`, PEP 639 SPDX licence
+metadata, console scripts (`dub`, `dub-audit-qc`, `dub-audit-timbre`) and the
+optional backends as extras (`background`, `diarization`, `separation`, `gpu-asr`,
+`full`, `dev`) — so `pip install .` is a real install, and the graceful degradation
+the code always had is finally visible in the metadata. Dependencies are pinned to
+the verified combination; `torch` stays a floor with the CPU index documented,
+because freezing it would drag CUDA wheels onto a CPU-only machine. `speechbrain`
+moved from a hard requirement to the `separation` extra, matching how the code
+already treated it (D18). CI runs the whole suite on a CPU-only runner for Python
+3.10 and 3.12.
+
+**A deliberate omission: no lock file.** A `pip freeze` lock generated on this box
+contains the CUDA wheels, which is the opposite of portable. Pinning the direct
+dependencies while documenting the torch index achieves the actual goal — a
+reproducible install — without freezing one machine's hardware into the
+requirements.
+
+**Cost.** One dependency-free probe per run (a `torch` import plus, on CUDA, three
+cheap queries), one new `report.json` key, and a one-off full cache invalidation
+from the new `dtype` field.
+
+**Verified.** 825 tests pass (69 new). `tests/test_device.py` exercises Pascal,
+Volta, Ampere, CDNA, Metal, XPU and CPU, plus a broken probe and a missing torch,
+against a fake `torch` module — so the hardware rules are checked on a CPU-only
+runner rather than asserted. `tests/test_cli_smoke.py` covers the command surface:
+`models --list`, `--version`, `info`, `--dtype` reaching the config, and dtype
+invalidating the fingerprint. The metadata and wheel were built directly and
+checked (`Name: qwen-tts-dub`, `Version: 0.1.0`, three console scripts, `pipeline/`
+and the three CLI modules present, `LICENSE` included) with deprecation warnings
+promoted to errors.
+
+**Deviations from the plan, both deliberate.** The distribution is named
+`qwen-tts-dub`, not `qwen-tts`: that name belongs to the TTS checkpoint's own
+package, which is a dependency here. And the lock file was dropped, for the reason
+above.
+
+#### Two audit defects the first CPU runs exposed
+
+Running the gate on a real CPU job found two problems no unit test had. Both are in
+the audit tools rather than the pipeline, and both only show up when the tool is
+used the way a second person would use it:
+
+1. **The audit CLIs could not be pointed at a device.** `audit_timbre.py` and
+   `audit_qc.py --timbre` both hardcoded `device="auto"`, so on a machine whose
+   GPUs were already occupied the audit simply failed — which was exactly the
+   situation the measurement was wanted in. Both now accept `--device`.
+2. **`audit_qc.py --timbre` aborted a `preserve` job instead of skipping it.** A
+   `preserve` job never borrowed an accent, so there is no clip to measure the
+   lines against; `audit_job` raised and the process exited 2. That contradicts the
+   gate's own contract — *a gate that cannot run is `skip`, never `pass`* — and
+   made a mixed batch of jobs uncheckable. `qc()` now consults the new
+   `timbre_available()` first and reports `skip` **with the reason**, so the other
+   three gates still report and the exit code stays 0. `audit_job` still raises,
+   because a dedicated single-job tool asking an unanswerable question should say
+   so; only the gate degrades.
 
 ### Still open (verified against the code, 2026-09-28)
 
@@ -977,6 +1084,10 @@ above is not read as "finished".
   run against the real SepFormer; a genuine two-voice split is covered by fakes, and
   the detector flags 0/16 on `input/louisavy.mp4` (interruptions shorter than the
   2.5 s window).
+- **The §3.6 hardware matrix has one real gap: a second physical machine.** The CPU
+  rows and both GPU precisions are measured and all four runs pass `audit_qc.py`,
+  but every one of them ran on this box, so a driver- or vendor-level difference is
+  still unexercised.
 
 **Code (small and self-contained)**
 
@@ -996,10 +1107,12 @@ above is not read as "finished".
 
 **Engineering standards** (`.agents/technical-guidelines.md`, tracked separately)
 
-- No `mypy --strict`, Black or Ruff: `pyproject.toml` holds only pytest settings and
-  `requirements-dev.txt` only `pytest`, `funasr`, `modelscope`.
-- No coverage measurement (so the >85% target is unverified), no CI, no `Dockerfile`,
-  no `scripts/`.
+- No `mypy --strict`, Black or Ruff: `pyproject.toml` carries packaging metadata and
+  pytest settings, and `requirements-dev.txt` only `pytest`, `funasr`, `modelscope`.
+- No coverage measurement, so the >85% target is unverified. CI now exists
+  (`.github/workflows/ci.yml`: Python 3.10 and 3.12 on a CPU-only runner) and runs
+  the whole suite, but it does not measure coverage.
+- No `Dockerfile`, no `scripts/`.
 - No real tiny-fixture integration test; every heavy part is faked.
 - `structlog`/`Loguru` are not used (stdlib logging), but every record already carries
   a `job_id` via `pipeline/logging_utils.py`.
@@ -1040,6 +1153,8 @@ voice timbre**, ideally with the **target language's accent**.
 | D16 | Room matching | **Post-synthesis, derived from the speech stem, off by default** — `--room match` applies a measured RT60 convolution plus a room-tone floor and a shallower duck; without a stem it degrades to dry with `room.applied: false` | The room lives in the *speech* stem (voice + reverb tail + the room tone it masked), which the pipeline previously discarded, so recovering it needs no extra model and no new dependency. Adding it after synthesis keeps it clear of the voice-cloning tuning in P3b/P3c. A dry voice-over is correct for narrated content, so it stays the default rather than being silently replaced |
 | D17 | Quality gate | **A separate, non-blocking executable** (`audit_qc.py`) reading `report.json`, exiting non-zero on failure, and reporting `skip` (never `pass`) when a gate cannot run; the measurement core is shared with `audit_timbre.py` in `pipeline/audit.py` | A gate is only useful if it can fail without destroying work, and if "not measured" cannot be mistaken for "healthy". Sharing one implementation of the language-matched measurement is what stops the two CLIs from disagreeing about the same job |
 | D18 | Overlap separation | **SpeechBrain SepFormer (16 kHz) behind an optional `--overlap separate`**, placed simultaneously with the dominant line; the default stays `dominant` | The plan's "no new dependency via funasr" premise was **refuted by inspection**: funasr 1.4.16 registers no separation model and lacks `ss_inference_launch`, and ModelScope ships 8 kHz checkpoints only. SepFormer 16 kHz is the one self-contained two-speaker model at that rate, so `speechbrain` becomes an optional dependency like `funasr`/`demucs`. Separation runs only on flagged segments, and a segment whose streams cannot be matched to distinct speakers keeps the dominant-only treatment, so the stage cannot make a job worse. The default stays `dominant` until a bake-off shows separation is reliably better |
+| D19 | Device portability | **Capability-probed, with a conservative `auto`**: bfloat16 only at CUDA sm_80+ (ROCm 9.4+), float16 at sm_70+, float32 otherwise; `cuda:N` honoured exactly; `auto` picks only what *every* stage supports (CUDA/ROCm, else CPU); Metal and XPU reachable via an explicit `--device` and reported by `dub.py info` | The old rule asked one binary question and answered it with bfloat16, which is unsupported on the Pascal and Volta cards a "consumer hardware" project attracts most. Metal is excluded from `auto` because faster-whisper runs on CTranslate2, which has no Metal backend: choosing it automatically would break a Mac that works today. The rules are unit-tested against fake hardware profiles, so a CPU-only CI runner still proves them |
+| D20 | Distribution | **Apache-2.0, pip-installable, optional backends as extras, CI on a CPU-only runner**; direct dependencies pinned but **no lock file** | An unlicensed repository is not usable by anyone, whatever the code does. Extras make the degradation the pipeline already had (`demucs`, `funasr`, `speechbrain` are all optional by design) visible in the metadata. A `pip freeze` lock built on this box would freeze CUDA wheels into the requirements, which is the opposite of portable — pinning the direct dependencies and documenting the torch index gets the reproducibility without the trap |
 
 ---
 
@@ -1225,7 +1340,8 @@ loudness_target: null            # match-source when null | lufs
 target_lufs: null
 
 # Models, device and output
-device: auto                     # auto | cuda:N | cpu
+device: auto                     # auto | cpu | cuda | cuda:N | mps | xpu
+dtype: auto                      # auto | bf16 | fp16 | fp32
 whisper_model: large-v3
 llm_model: null                  # overrides LLM_MODEL for this run
 keep_subtitles: true
@@ -1238,7 +1354,7 @@ force: false                     # ignore the stage cache
 ```text
 qwen-tts/
 ├── dub.py                    # CLI entrypoint (argparse) + model downloads
-├── audit_timbre.py           # per-line speaker-timbre audit (needs the GPU)
+├── audit_timbre.py           # per-line speaker-timbre audit (--device cpu works)
 ├── audit_qc.py               # automated quality gate for a finished job
 ├── main.py, clone.py         # scratch experiments, not part of the pipeline
 ├── pipeline/
@@ -1284,16 +1400,108 @@ enforced; that gap sits outside this roadmap and is tracked separately.
 - Handles a ≤ 10-minute video on one RTX 3060 without OOM — ⚠️ **unverified**.
   The longest real run is 4:47, and it still hit `CUDACachingAllocator` OOM
   retries during synthesis, which the batch-halving fallback absorbed.
+- Runs on hardware other than the author's — **verified on CPU and on the
+  float16 path**. The device *rules* are proven for every profile
+  (`tests/test_device.py`, fake hardware), and there are now four real end-to-end
+  runs through `audit_qc.py`, all passing: two on CPU (float32) and two on the GPU
+  (float16 and bfloat16, same clip). No second *physical* machine has been used, so
+  a driver- or vendor-level difference is still unexercised.
+
+#### Hardware matrix
+
+Each row is one real end-to-end run whose output was put through `audit_qc.py`. A
+cell that has not been run is `unverified`, never assumed.
+
+| Hardware | Runs end to end | Sync (`shifted_segments`) | Truncation (`worst_line_deleted_ratio`) | Loudness (dB vs source) | Timbre | Wall clock | Peak memory |
+|---|---|---|---|---|---|---|---|
+| RTX 3060, bfloat16, CUDA | ✅ 4:47 TED + 60 s clip | 0.000 s | 0% with `--refine` | −0.0 | 0 lines closer to accent | 2× realtime | ⚠️ OOM retries |
+| 12-core CPU, float32, `preserve` | ✅ 22.1 s clip (`change-the-world.mp4`) | 0; 1.84 s spilled into pauses, 0.00 s trimmed | 0.0%; 0 lines over 10% | −0.0 | n/a — needs a `reference-accent` job | **2:10** (130 s), 0.17× realtime | **12.7 GB** RSS |
+| 12-core CPU, float32, `reference-accent` | ✅ same clip, accent clip + transcript | 0; 0.00 s overrun, 0.00 s trimmed | 0.0%; 0 lines over 10% | +0.08 | **0 of 5** lines closer to the accent voice; margin median +0.0513 on a ±0.056 scale | **5:18** (318 s), 0.07× realtime | **17.2 GB** RSS |
+| Pre-Ampere GPU, **emulated**: 3060 pinned to `--dtype fp16 --device cuda:0`, `reference-accent` | ✅ same 22.1 s clip, accent clip + transcript | 0; 0.00 s overrun, 0.00 s trimmed | 0.0%; 0 lines over 10% | +0.05 | **0 of 5** lines closer to the accent voice; margin median +0.0444 on a ±0.044 scale | **1:03** (63 s) | 8.7 GB |
+| RTX 3060, bfloat16, `reference-accent` (control for the row above) | ✅ same clip, same accent | 0; 0.00 s | 0.0%; 0 lines over 10% | −0.0 | **0 of 5** closer to the accent; margin median +0.0330 on a ±0.030 scale | **0:54** (54 s) | 8.7 GB |
+
+**The float16 row is an emulation, not a pre-Ampere card.** `--dtype fp16` on the
+3060 exercises the same code path a Turing or Volta card would take — the dtype is
+accepted, recorded and used — but it cannot reproduce a driver difference, a
+missing kernel, or an older CUDA runtime. That residue is what "no second physical
+machine" still means.
+
+**Emulating it surfaced a zero-cost bonus check: `--device cuda:0` works.** Both
+GPU runs pinned GPU 0 explicitly and `report.json` → `device.resolved` reads
+`cuda:0`, so the index survives all the way through — including into Demucs, which
+is where it used to be silently dropped (P7). Verified on real hardware rather than
+by unit test.
+
+#### Does the precision move the voice? Measured, not assumed
+
+This was flagged in P7 as needing an A/B before it could be trusted. Two full runs
+are **not** that A/B: they differ in translation too (`speech_rate_wps` 4.17 vs
+4.57), so the margin difference between them is not attributable to the dtype. The
+controlled test holds the text, the reference clip and the draw count fixed and
+changes only the precision:
+
+| Comparison | min | median | max |
+|---|---|---|---|
+| fp16 vs fp16 — two draws (noise floor) | 0.9823 | 0.9898 | 0.9928 |
+| bf16 vs bf16 — two draws (noise floor) | 0.9893 | 0.9935 | 0.9948 |
+| **fp16 vs bf16 — the question** | 0.9819 | **0.9902** | 0.9942 |
+| fp16 vs bf16, second draws | 0.9876 | 0.9928 | 0.9944 |
+
+Three French sentences, one reference clip, two draws per precision, scored with the
+checkpoint's own speaker encoder. **Cross-dtype similarity sits inside the
+same-dtype run-to-run spread**, so the precision does not measurably move the voice:
+the sampling variance that already exists between two draws at *one* precision is as
+large as the difference between precisions. This is the same shape of evidence as
+the P3b lesson about the encoder's noise band — a difference is only a difference if
+it exceeds the floor.
+
+Small print: three sentences, one speaker, one reference. Enough to justify not
+treating fp16 as a quality risk; not enough to claim a general law.
+
+**What the CPU runs establish.** Both went through `audit_qc.py` at exit 0. The
+`preserve` run passed sync, truncation and loudness with timbre skipped (there is
+no accent clip to measure against); the `reference-accent` run passed all four
+gates including timbre, with `donor_ratio` 0.9682 reached in the first blend pass.
+`--refine` fired in the `preserve` run (2 offenders, 2 improved, 1.70 s recovered)
+and was not needed in the accent run. `report.json` → `device` correctly recorded
+`cpu` / `float32` / `int8` in both, which is the P7 report block working on a real
+run rather than in a unit test.
+
+**The cost is where you would not expect it.** CPU TTS is ~4.3× realtime measured
+on a single line (3.92 s of audio in 16.8 s, float32, after a 9.9 s model load) —
+not the two orders of magnitude the prerequisites first assumed, and that number
+has been corrected in the README. The binding constraint is **memory**, not speed:
+17.2 GB peak for the accent run, because the blend stage holds the checkpoint plus
+its own renders. The blend is also 68% of the accent run (217.0 s of 318 s,
+against 60.9 s of per-line synthesis), which matches the earlier note that the
+blend dominates on short clips.
+
+Stage split, `preserve` / `reference-accent`, in seconds: separate 9.9 / 9.5,
+transcribe 14.3 / 13.4, diarize 7.8 / 6.6, translate 7.4 / 7.3, blend — / 217.0,
+synthesize 88.0 / 60.9, mix 0.7 / 0.4.
 
 ### 3.7 Prerequisites to install
 
 ```
 ffmpeg                      # system binary, required for video in/out
 rubberband                  # optional system binary; sox or librosa otherwise
-python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
-                                            # pydantic, qwen_tts, faster-whisper,
-                                            # pyloudnorm, openai
+python -m pip install .     # numpy, torch, soundfile, librosa, pydantic,
+                            # qwen-tts, faster-whisper, pyloudnorm, openai
+python dub.py info          # what will this machine actually use?
 ```
+
+CPU-only machine: install the CPU torch wheel first, or the default wheel pulls
+several gigabytes of CUDA that cannot be used.
+
+```
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install .
+```
+
+Optional backends are extras: `pip install ".[background]"` (Demucs, keeps music
+and ambience), `".[diarization]"` (funasr, per-speaker voices), `".[separation]"`
+(SpeechBrain, splits overlapping speakers), `".[gpu-asr]"` (CUDA 12 runtime for
+faster-whisper), or `".[full]"` for all of them.
 
 ---
 
@@ -1310,6 +1518,7 @@ python -m pip install -r requirements.txt   # numpy, torch, soundfile, librosa,
 | **P4** | Lip sync | LatentSync/MuseTalk, gated on face visibility | L |
 | **P5** | Multi-source-language | Per-utterance LID, per-segment source language | S–M |
 | **P6** | Service-ification | FastAPI + Celery/Redis, model residency, consent gate | L |
+| **P7** | Portability & distribution | Device capability probing, `dub.py info`, `--dtype`, packaging + console scripts, CI, Apache-2.0 licence | S–M |
 
 ### P1 — Multi-speaker & background preservation
 

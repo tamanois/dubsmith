@@ -847,15 +847,29 @@ class TestBlendIteration:
 
 
 class TestResolveDtype:
-    def test_cuda_uses_bfloat16(self) -> None:
-        import torch
+    """The dtype must follow the device's *capability*, not just its name.
 
-        assert resolve_dtype('cuda:0') == torch.bfloat16
+    "bfloat16 for anything starting with cuda" was the old rule, and bfloat16 is
+    unsupported on the Pascal and Volta cards a user is most likely to have.
+    Exhaustive coverage of the capability rules lives in ``test_device.py``; these
+    pin the delegation from the engine.
+    """
 
-    def test_cpu_uses_float32(self) -> None:
-        import torch
+    def test_modern_cuda_uses_bfloat16(self, torch_profile: Any) -> None:
+        torch_profile(kind="cuda", capability=(8, 6))
+        assert resolve_dtype("cuda:0") == "bfloat16"
 
-        assert resolve_dtype("cpu") == torch.float32
+    def test_an_older_cuda_card_falls_back_to_float16(self, torch_profile: Any) -> None:
+        torch_profile(kind="cuda", capability=(7, 5))
+        assert resolve_dtype("cuda:0") == "float16"
+
+    def test_a_pascal_card_uses_float32(self, torch_profile: Any) -> None:
+        torch_profile(kind="cuda", capability=(6, 1))
+        assert resolve_dtype("cuda:0") == "float32"
+
+    def test_cpu_uses_float32(self, torch_profile: Any) -> None:
+        torch_profile(kind="cpu")
+        assert resolve_dtype("cpu") == "float32"
 
 
 class TestOutOfMemoryHandling:

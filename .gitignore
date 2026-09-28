@@ -9,8 +9,9 @@
 models/
 .venv
 
-# Job artifacts (dubbed video, subtitles, reports, manifests)
-output/
+# Job artifacts (dubbed video, subtitles, reports, manifests). The glob covers
+# ad-hoc roots such as `output_cpu/` used for hardware comparisons.
+output*/
 input/
 
 # Local configuration: may contain API keys
@@ -21,3 +22,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .stretch_tmp/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/

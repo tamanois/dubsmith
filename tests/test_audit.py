@@ -29,6 +29,7 @@ from pipeline.audit import (
     speaker_labels,
     speaker_order,
     summarize,
+    timbre_available,
 )
 from pipeline.errors import AuditError
 
@@ -318,6 +319,14 @@ class TestEvaluate:
         results = evaluate(clean_report(), timbre=timbre)
         assert gate(results, "timbre").status == "skip"
 
+    def test_a_skip_can_say_why_it_did_not_run(self) -> None:
+        """"Not requested" and "impossible" are different answers."""
+        results = evaluate(clean_report(), timbre_reason="no accent clip to measure")
+
+        result = gate(results, "timbre")
+        assert result.status == "skip"
+        assert result.detail == "no accent clip to measure"
+
 
 class TestSummarize:
     def test_shape_and_pass_flag(self) -> None:
@@ -363,7 +372,30 @@ class TestQc:
         assert payload["passed"] is False
         assert payload["failed"] == ["timbre"]
 
-    def test_missing_report_is_an_error(self, tmp_path: Path) -> None:
+    def test_a_job_with_no_accent_clip_skips_timbre_rather_than_failing(
+        self, tmp_path: Path
+    ) -> None:
+        """A `preserve` job never borrowed an accent, so there is nothing to
+        measure against. That is a skip, not a reason to reject the whole run."""
+        write_report(tmp_path)  # no donor.json -> no accent clip recorded
+
+        payload = qc(tmp_path, engine=FakeEncoder())
+
+        assert payload["passed"] is True
+        assert payload["skipped"] == ["timbre"]
+        detail = next(g["detail"] for g in payload["gates"] if g["name"] == "timbre")
+        assert "no accent clip" in detail
+
+    def test_the_other_gates_still_report_when_timbre_cannot_run(
+        self, tmp_path: Path
+    ) -> None:
+        write_report(tmp_path, shifted_segments=2)
+        payload = qc(tmp_path, engine=FakeEncoder())
+
+        assert payload["failed"] == ["sync"]
+        assert payload["skipped"] == ["timbre"]
+
+    def test_a_missing_report_is_an_error(self, tmp_path: Path) -> None:
         with pytest.raises(AuditError, match="has no report.json"):
             qc(tmp_path)
 
@@ -376,6 +408,36 @@ class TestQc:
         (tmp_path / "report.json").write_text("[1, 2]", encoding="utf-8")
         with pytest.raises(AuditError, match="does not contain a job report"):
             qc(tmp_path)
+
+
+class TestTimbreAvailability:
+    """Whether the timbre measurement is answerable at all for a job."""
+
+    def test_a_preserve_job_has_nothing_to_measure_against(self, tmp_path: Path) -> None:
+        write_report(tmp_path)
+        assert timbre_available(tmp_path) is False
+
+    def test_a_recorded_accent_clip_makes_it_available(self, tmp_path: Path) -> None:
+        write_report(tmp_path)
+        accent = write_wav(tmp_path / "accent.wav", amplitude=0.2)
+        donor = tmp_path / DONOR_NAME
+        donor.parent.mkdir(parents=True, exist_ok=True)
+        donor.write_text(json.dumps({"accent": {"path": str(accent)}}), encoding="utf-8")
+        assert timbre_available(tmp_path) is True
+
+    def test_an_explicit_clip_is_honoured(self, tmp_path: Path) -> None:
+        write_report(tmp_path)
+        assert timbre_available(tmp_path, write_wav(tmp_path / "a.wav")) is True
+
+    def test_a_recorded_but_missing_file_is_not_available(self, tmp_path: Path) -> None:
+        write_report(tmp_path)
+        donor = tmp_path / DONOR_NAME
+        donor.parent.mkdir(parents=True, exist_ok=True)
+        donor.write_text(
+            json.dumps({"accent": {"path": str(tmp_path / "gone.wav")}}),
+            encoding="utf-8",
+        )
+        assert timbre_available(tmp_path) is False
 
 
 class TestQcCli:
