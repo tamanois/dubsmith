@@ -190,12 +190,17 @@ class FakeTranslator:
 class FakeTTSEngine:
     """Mimics TTSEngine's surface without loading a model."""
 
+    #: Words per second the delivery-rate probe reports. Scripted rather than
+    #: derived, so a probe never consumes a row of the synth script.
+    delivery_rate: float = 4.0
+
     def __init__(self, sample_rate: int = 24_000) -> None:
         self.sample_rate = sample_rate
         self.batch_size = 8
         self.prompt_kind: str | None = None
         self.prompt_calls = 0
         self.synth_calls = 0
+        self.rate_calls = 0
         self.hybrid: dict[str, Any] | None = None
         #: Every prompt built, in order, so the two-stage sequence is assertable.
         self.prompt_history: list[str] = []
@@ -206,6 +211,10 @@ class FakeTTSEngine:
         self.blend_takes: int | None = None
         self.blend_iters: int | None = None
         self.blend_target_ratio: float | None = None
+
+    def measure_delivery_rate(self, text: str, *, language: str) -> float:
+        self.rate_calls += 1
+        return self.delivery_rate
 
     def prepare_prompt(self, donor: Any) -> None:
         self.prompt_kind = "donor"
@@ -1472,9 +1481,11 @@ class TestLengthRepair:
         pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [1.8]])
         report = pipeline.run().report
         assert report["trimmed_seconds_total"] == 0.0
-        assert report["refine"]["seconds_recovered"] > 0.4
+        assert report["refine"]["seconds_recovered"] > 0.1
 
-    def test_without_refine_the_line_is_trimmed_as_before(self, tmp_path: Path) -> None:
+    def test_without_refine_the_residue_beyond_the_floor_is_trimmed(
+        self, tmp_path: Path
+    ) -> None:
         pipeline, translator, tts, _ = refine_pipeline(
             tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
         )
@@ -1483,8 +1494,10 @@ class TestLengthRepair:
         assert translator.shorten_calls == 0
         assert tts.synth_calls == 1
         assert report["refine"]["attempted"] is False
-        # The old behaviour: the surplus beyond slot + gap is cut.
-        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+        # 3.5s compressed to the 0.75 floor is 2.625s, and the line may use 2.5s:
+        # only the 0.125s beyond that is cut. The floor is what limits the damage.
+        assert report["trimmed_seconds_total"] == pytest.approx(0.125, abs=0.01)
+        assert report["worst_line_deleted_ratio"] == pytest.approx(0.048, abs=0.01)
 
     def test_lines_that_fit_are_byte_identical_with_and_without_refine(
         self, tmp_path: Path
@@ -1517,15 +1530,15 @@ class TestLengthRepair:
             pipeline.job_dir / "04_dubbed" / "seg_0000.wav"
         )
         assert len(samples) / rate == pytest.approx(3.5, abs=0.02)
-        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+        assert report["trimmed_seconds_total"] == pytest.approx(0.125, abs=0.01)
 
     def test_a_partial_improvement_is_kept(self, tmp_path: Path) -> None:
-        # 3.5s -> 3.0s still overflows (2.55s > 2.5s) but by less, so it is kept.
-        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[3.5, 1.0], [3.0]])
+        # 4.0s -> 3.6s still overflows (2.7s > 2.5s) but by less, so it is kept.
+        pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[4.0, 1.0], [3.6]])
         report = pipeline.run().report
 
         assert report["refine"]["improved"] == 1
-        assert 0.0 < report["trimmed_seconds_total"] < 0.475
+        assert 0.0 < report["trimmed_seconds_total"] < 0.5
 
     def test_a_failing_rewrite_is_not_fatal(self, tmp_path: Path) -> None:
         translator = ShorteningTranslator(fail=True)
@@ -1536,7 +1549,7 @@ class TestLengthRepair:
 
         assert report["refine"]["attempted"] is True
         assert report["refine"]["improved"] == 0
-        assert report["trimmed_seconds_total"] == pytest.approx(0.475, abs=0.01)
+        assert report["trimmed_seconds_total"] == pytest.approx(0.125, abs=0.01)
 
     def test_a_translator_without_rewriting_is_handled(self, tmp_path: Path) -> None:
         pipeline, _, _, _ = refine_pipeline(
@@ -1571,10 +1584,12 @@ class TestLengthRepair:
         pipeline.run()
 
         request = translator.requested[0]
-        assert request.spoken_seconds == pytest.approx(2.98, abs=0.02)
+        # The slot would need 2.0/3.5 = 0.57, under the floor, so the floor is what
+        # the line gets, and the gap has no room to help: 3.5 * 0.75 = 2.625s.
+        assert request.spoken_seconds == pytest.approx(2.625, abs=0.02)
         assert request.available_seconds == pytest.approx(2.5, abs=0.02)
-        # 7 words in "[French] A long English sentence." scaled by 2.5/2.98
-        assert 0 < request.max_words <= 7
+        # 7 words in "[French] A long English sentence." scaled by 2.5/2.625
+        assert 0 < request.max_words <= 6
 
 
 class TestTimingDirectionSplit:
@@ -1597,9 +1612,23 @@ class TestTimingDirectionSplit:
             tmp_path, rows=[[3.5, 1.0], [1.8]], refine=False
         )
         report = pipeline.run().report
-        # 0.475s cut from a 2.98s line.
-        assert report["worst_line_deleted_ratio"] == pytest.approx(0.16, abs=0.02)
-        assert report["lines_over_10pct_deleted"] == 1
+        # 0.125s cut from a 2.625s line, and no line loses a tenth of itself.
+        assert report["worst_line_deleted_ratio"] == pytest.approx(0.048, abs=0.01)
+        assert report["lines_over_10pct_deleted"] == 0
+        # The floor is what could not absorb it, so the text, not the tempo, owes.
+        assert report["needed_below_floor_segments"] == 1
+        assert report["compress_floor"] == pytest.approx(0.75)
+
+    def test_the_lower_floor_absorbs_what_used_to_be_cut(self, tmp_path: Path) -> None:
+        """2.5s of speech in a 2.0s slot + 0.5s gap needs 0.80: inside the floor."""
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[2.5, 1.0], [1.8]], refine=False
+        )
+        report = pipeline.run().report
+
+        assert report["trimmed_seconds_total"] == 0.0
+        assert report["accelerated_segments"] == 1
+        assert report["needed_below_floor_segments"] == 0
 
     def test_a_clean_run_reports_no_damage(self, tmp_path: Path) -> None:
         pipeline, _, _, _ = refine_pipeline(tmp_path, rows=[[1.9, 2.0], [1.8]])
@@ -1625,4 +1654,8 @@ class TestTimingDirectionSplit:
         )
         assert payload[0]["synth_seconds"] == pytest.approx(3.5, abs=0.02)
         assert payload[0]["deficit"] == 0.0
+        # 2.5s available for 3.5s of speech: the floor is applied, not 0.71.
+        assert payload[0]["needed_ratio"] == pytest.approx(0.714, abs=0.01)
+        assert payload[0]["ratio"] == pytest.approx(0.75, abs=0.001)
+        assert "silence_trimmed" in payload[0]
         assert payload[1]["deficit"] > 0.5

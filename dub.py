@@ -29,6 +29,7 @@ from typing import Sequence
 from pipeline import __version__
 from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
+    DEFAULT_BUDGET_SPEEDUP,
     DEFAULT_MIN_SPEAKER_S,
     SUPPORTED_LANGUAGES,
     JobConfig,
@@ -219,11 +220,11 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-stretch",
         type=float,
-        default=0.85,
+        default=0.75,
         help=(
-            "Maximum compression applied to fit a line into its slot (lower = allow "
-            "faster speech). Lines still too long are allowed to overrun rather "
-            "than being cut."
+            "Compression floor: how much faster than natural a line may be played "
+            "to fit its slot (lower = allow faster speech). Past it the wording has "
+            "to give instead, because the alternative is deleting words."
         ),
     )
     parser.add_argument(
@@ -510,8 +511,20 @@ def build_dub_parser() -> argparse.ArgumentParser:
         choices=["off", "words"],
         help=(
             "'words' (default) also tells the translator how many words fit each "
-            "slot, measured from a target-language reference (the accent anchor or "
-            "clip); 'off' sends only the duration."
+            "line, measured from the voice that will speak it (a probe render per "
+            "speaker); 'off' sends only the duration and tends to lose the ends of "
+            "sentences."
+        ),
+    )
+    parser.add_argument(
+        "--budget-speedup",
+        dest="budget_speedup",
+        type=float,
+        default=DEFAULT_BUDGET_SPEEDUP,
+        help=(
+            "Tempo the word budget spends on every line: the ceiling becomes "
+            "words a line may hold at speedup times natural pace. Keep it above "
+            "--min-stretch so only the stubborn lines reach the floor."
         ),
     )
     parser.add_argument(
@@ -831,6 +844,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         refine_max_passes=args.refine_max_passes,
         refine_threshold=args.refine_threshold,
         length_budget=args.length_budget,
+        budget_speedup=args.budget_speedup,
         keep_subtitles=not args.no_subtitles,
         force=args.force,
     )

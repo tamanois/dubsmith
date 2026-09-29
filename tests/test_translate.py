@@ -339,6 +339,22 @@ class TestWordBudget:
         )
         assert '"seconds": 2.0' in messages[1]["content"]
 
+    def test_a_budget_replaces_the_proportional_hint(self) -> None:
+        """The two length rules disagree, so only one of them may be sent."""
+        unbudgeted = build_messages(
+            [TranslationRequest(id=0, text="a", duration=2.0)],
+            source_language="en",
+            target_language="French",
+        )
+        budgeted = build_messages(
+            [TranslationRequest(id=0, text="a", duration=2.0, max_words=5)],
+            source_language="en",
+            target_language="French",
+        )
+        assert "within roughly" in unbudgeted[0]["content"]
+        assert "within roughly" not in budgeted[0]["content"]
+        assert "hard ceiling" in budgeted[0]["content"]
+
 
 class TestShortenCalls:
     """The shorten backend reuses the same transport and repair path."""

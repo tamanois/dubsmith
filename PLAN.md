@@ -27,10 +27,23 @@
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 930 passing | `tests/` |
+| Tests | ✅ 975 passing | `tests/` |
 
 Verification performed:
 
+- **Never lose a word** (2026-09-29, `input/louisavy-11m.mp4`, 11 min, 2 voices,
+  English → French, `native`): speech deleted **40.63 s → 6.74 s**, lines that lost
+  speech 179 → 52, lines losing >10% 135 → 34, `shifted_segments` 0 → 0, and the
+  synthesis stage 699 s → 497 s. The delivery-rate probe measured the cloned
+  voices at 3.52 / 3.60 words/s against the accent clip's 2.97, which is the
+  ~20% the word ceiling had been under-estimating; translations then landed on
+  the ceiling (words ÷ ceiling: median 1.00, mean 0.95, against 1.5–1.8× before),
+  the pre-synthesis check reworded 41 of 152 remaining offenders (985 of 1100
+  words kept), and clipping dead air off the synthesised lines recovered 31.6 s
+  that had been charged to the compression budget. ASR re-segmented between the
+  two runs (489 vs 471 lines), so the deltas are indicative, not controlled. The
+  residual 6.74 s sits entirely in lines whose *source* slot is impossible
+  (`needed_ratio` from 0.15): id 211 is four words in 0.16 s.
 - Full pytest suite green (no GPU, models or ffmpeg needed — heavy parts are faked).
 - **Blend strength A/B** (2026-09-29, `input/veo-studio-creation.mp4`, 8 s, 2 lines,
   same 4.7 s donor, `native` unless stated): a human accent clip clears a
@@ -227,7 +240,9 @@ gaps.
 Known cost: the accent clip's *pacing* rides along with its accent. A slow
 reference lengthens every line, which means more compression and more trimming —
 the same coupling documented for `--ref-audio`. Mitigation is a naturally-paced
-accent clip; the structural fix is P3's length feedback loop.
+accent clip; the structural fix — sizing each line's word ceiling from the voice
+that will speak it rather than from the clip — is in place (see the rate probe in
+the pipeline diagram and §0's "never lose a word" entry).
 
 **Confirmed by the user on the same video, with a faster accent clip.** Swapping
 the slow personal recording for a 14.8 s narrated news clip (~3.6 words/s, and an
@@ -311,6 +326,69 @@ stage went from 56 s to 73 s. Caveat: the two runs segmented slightly differentl
 within-run repair statistics and the worst-line ratio are the clean evidence. The
 rewrites were inspected by hand and preserve meaning, e.g. #39 went from 21 to 14
 words with the same content.
+
+#### P3 follow-up — fix the ceiling, then enforce it (2026-09-29)
+
+The repair above worked on the *symptom*: it rewrote lines after synthesising them
+and then re-synthesised the rewrites. On the 11-minute job it still left 40.6 s of
+deleted speech, so the mechanism was measured rather than guessed:
+
+- **The ceiling was wrong.** It was derived from the accent clip's own reading rate
+  (2.97 words/s on `models/anchors/fr.wav`), but the clone speaks faster: 3.65
+  words/s measured on that job. A ceiling a fifth too tight is one the model
+  ignores, and it did — the translations came out 1.5–1.8× the ceiling.
+- **Two length rules were being sent at once.** `SYSTEM_PROMPT` rule 3 asked for the
+  *source's* length (±20%), which a fast source speaker makes unachievable for a
+  slower target voice; rule 7 gave the ceiling. The model followed rule 3.
+- **Then the answer arrived too late.** Overflow was only measured after synthesis,
+  so 192 lines were spoken twice to recover 26.5 s.
+- **Dead air was charged to the budget.** A synthesised clip often opens with 0.1–0.35 s
+  of digital silence (`0.5 s` on one measured line); placed at the slot start it is
+  audible dead air, and the mixer compressed real speech to pay for it (0.82 where
+  the speech alone needed 0.97).
+- **`min_stretch` was doing two jobs.** At 0.85 it was both "how far may a line be
+  compressed" and "where does the trimming start", so the 40.6 s that a lower floor
+  could absorb was simply cut. No single line needed more than 0.73 and none lost
+  more than 1 s — the losses were small and numerous.
+
+What shipped (all default-on, each measured):
+
+1. **Rate probe** (`03a_rate.json`, stage `rate-probe`): one 40-word render per
+   cloned voice, timed, *before* translating. `_stage_blend` moved ahead of
+   `_stage_translate` so the probe renders through the real clone prompt; both
+   stages share one model load, and `_ensure_speaker_prompt` stops the synthesis
+   from rebuilding a prompt the probe just primed.
+2. **One length rule**: with a budget present, rule 3 *becomes* the ceiling rule.
+   Ceiling = `window * delivery_wps / budget_speedup`, where the window is the slot
+   plus the pause before the next line and `budget_speedup` (0.85) is the tempo the
+   budget is willing to spend on every line.
+3. **Pre-synthesis check** (`03d_prefit.json`, stage `prefit`): one batched
+   `shorten()` call for everything over budget, adopting a rewrite only when it is
+   measurably shorter. `03_script.json` keeps the model's own wording for
+   provenance; `_spoken_overrides()` merges the pre-fit and measured rewrites, the
+   latter winning, and the subtitles follow.
+4. **Compression floor** 0.75 (`JobConfig.min_stretch`, `DEFAULT_BUDGET_SPEEDUP` for
+   the budget tempo) and `fit_ratio()`: compress toward the slot, spend the
+   following pause before going below the floor, and never compress a line more
+   than it needs. One rule, shared by `fit_line`, the repair's predictor and the
+   report, so they cannot disagree.
+5. **Dead-air trimming** (`timing.trim_silence`, applied before fitting in the mix
+   and before measuring in the repair): relative to each clip's own peak, with a
+   50 ms guard and a floor on how much may be removed.
+6. **Reporting**: `delivery_wps`, `budget_wps`, `compress_floor`,
+   `accelerated_segments`, `needed_below_floor_segments`, `needed_ratio_min`,
+   `silence_trimmed_*`, `worst_trimmed_lines`, a `prefit` block, and `needed_ratio`
+   per line in `timing.json`. A mix that loses speech now logs a WARNING naming the
+   five worst ids instead of only reporting a total.
+7. **Shift guard** (`SHIFT_FLAG_GUARD_S`): a line fitted to end exactly on the next
+   one's start can land a sample past it; that is rounding, not desync, and calling
+   it a shift would fail the QC gate on arithmetic.
+
+Verified on the 11-minute job (numbers in §0). The remaining 6.74 s is confined to
+lines whose source slot is impossible — `needed_ratio` down to 0.15, e.g. four
+words in 0.16 s because Whisper squeezed that stretch of speech. Neither tempo nor
+wording can fix those; the candidates are a bounded late shift (desync) or
+upstream re-segmentation of over-packed regions. Not taken.
 
 Deviations from the original plan (deliberate, documented):
 - **`silero-vad` dependency dropped.** faster-whisper bundles an ONNX Silero VAD
@@ -1320,23 +1398,34 @@ video.mp4
    │     re-transcribe it (the second voice is not in Whisper's single output)
    ▼
 02d_overlap_segments.json    # [{parent_id, speaker, start, end, text}]
-   │  ⑤ LLM translation (OpenAI-compatible), chunked; optional word budget
-   ▼
-03_script.json               # [{id, start, end, source, target}]
-   │  ⑥ blend — reference-accent only: accent codes + each speaker's embedding
+   │  ⑤ blend — reference-accent only: accent codes + each speaker's embedding
    │     rendered once per voice, then re-iterated toward that speaker until
    │     `donor_ratio` reaches --blend-ratio (see P3c)
    ▼
 04_dubbed/reference_blend[_<speaker>].wav
+   │  ⑤b rate probe — one render per cloned voice of the accent text, timed to
+   │     get the words per second that voice actually speaks. Every translation
+   │     is sized by it, so it has to run before translating
+   ▼
+03a_rate.json                # {speaker: words per second}
+   │  ⑥ LLM translation (OpenAI-compatible), chunked, one word ceiling per line
+   ▼
+03_script.json               # [{id, start, end, source, target}]
+   │  ⑥b pre-fit check — lines whose translation cannot fit their window are
+   │     reworded *before* synthesis, so nothing is ever spoken twice
+   ▼
+03d_prefit.json              # offenders, improved, words kept, the rewrites
    │  ⑦ Qwen3-TTS Base: one clone prompt per speaker, that speaker's lines
-   │     synthesised as a batch; overlong lines re-worded and re-synthesised
-   │     (--refine), each in its own voice
+   │     synthesised as a batch; overlong lines that survived the pre-fit check
+   │     are re-worded and re-synthesised (--refine), each in its own voice
    ▼
 04_dubbed/seg_*.wav
-   │  ⑧ fit each line to its slot (rubberband → sox → librosa), place on the
-   │     timeline, duck the bed under dialogue, match EBU R128 loudness
-   │     (`--room match` also convolves the source's measured decay and adds a
-   │     room-tone floor, before the bed is ducked more gently)
+   │  ⑧ drop each line's dead air, fit it to its window (rubberband → sox →
+   │     librosa) compressing to the floor and spending the following pause
+   │     before more tempo, place on the timeline, duck the bed under dialogue,
+   │     match EBU R128 loudness (`--room match` also convolves the source's
+   │     measured decay and adds a room-tone floor, before the bed is ducked
+   │     more gently)
    ▼
 timing.json, 05_mix.wav, 05_room.json (with --room match), dub.wav
    │  ⑨ ffmpeg: mux the dub back onto the video (stream copied); write SRTs
@@ -1420,9 +1509,10 @@ overlap: dominant                # dominant | separate (--overlap)
 overlap_separator: auto          # auto | sepformer | none
 
 # Timing
-min_stretch: 0.85
+min_stretch: 0.75                # compression floor: past it the wording gives, not the audio
 max_stretch: 1.18
 length_budget: words             # off | words
+budget_speedup: 0.85             # tempo the per-line word ceiling is willing to spend
 
 # Length repair
 refine: true

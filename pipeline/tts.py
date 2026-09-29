@@ -993,6 +993,33 @@ class TTSEngine:
             pending = pending[len(batch) :]
         return results
 
+    def measure_delivery_rate(self, text: str, *, language: str) -> float:
+        """Words per second this voice delivers ``text`` at, measured on the spot.
+
+        The word budget that sizes every translation has to come from the voice
+        that will speak it, and the honest way to get it is to render something
+        and time it: the reference clip's *own* pace reads about 20% slower than
+        the clone's delivery (2.97 against 3.65 words/s measured on a real job),
+        which made the ceiling a third too tight and the model ignored it. One line
+        of text is the whole cost.
+
+        Args:
+            text: Target-language text to read. The caller caps its length.
+            language: Canonical language name, as for :meth:`synthesize`.
+
+        Returns:
+            Words per second, or ``0.0`` when nothing usable came back.
+        """
+        words = len(text.split())
+        if words == 0:
+            return 0.0
+        rendered = self.synthesize([text], language=language)
+        samples = rendered[0] if rendered else None
+        if samples is None or not np.asarray(samples).size:
+            return 0.0
+        seconds = len(np.asarray(samples).reshape(-1)) / float(self.sample_rate)
+        return words / seconds if seconds > 0 else 0.0
+
     def _take_batch(
         self, pending: Sequence[tuple[int, str]]
     ) -> list[tuple[int, str]]:

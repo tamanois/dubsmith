@@ -33,8 +33,11 @@ __all__ = [
     "LENGTH_TOLERANCE",
 ]
 
-#: How much longer/shorter a dub line may be than the original slot. Mirrors the
-#: timing stage's clamp so the two stages agree on what "fits" means.
+#: How much longer/shorter a dub line may be than the original, used **only** when
+#: no word budget is available. It deliberately does not mirror the timing stage's
+#: floor: that floor is a fraction of the line's own *spoken* length, whereas this
+#: compares the translation against the source - which a source speaker talking at
+#: 4.2 words/s makes unachievable for a French voice delivering 3.65.
 LENGTH_TOLERANCE = 0.2
 
 _CONTEXT_LINES = 3
@@ -47,22 +50,34 @@ Rules:
 1. Reply with ONLY a JSON object of the form \
 {{"translations":[{{"id":<int>,"text":"<translation>"}}]}}.
 2. Include every requested id exactly once, in the same order. Never invent ids.
-3. Keep each translation close in spoken length to its original (within roughly \
-{percent}%). Say the same thing in fewer words rather than translating literally.
+3. {length_rule}
 4. Preserve register and tone, and use natural spoken {target} rather than \
 written style. Match the formality implied by the source.
 5. Keep proper nouns, numbers, units, and acronyms unchanged.
 6. Never add notes, explanations, transliterations, or the untranslated source.
 """
 
+#: Rule 3 when no word budget is available: a proportional hint measured against
+#: the original's own length. Only ever right when the source speaker and the
+#: target voice speak at comparable rates.
+LENGTH_RULE_PROPORTIONAL = (
+    "Keep each translation close in spoken length to its original (within roughly "
+    "{percent}%). Say the same thing in fewer words rather than translating "
+    "literally."
+)
 
-#: Appended to the system prompt only when a word budget is actually supplied,
-#: so a run with budgets disabled sends a byte-identical prompt to a run made
-#: before budgets existed.
-WORD_BUDGET_RULE = """
-7. Each line carries "max_words": the most words that fit its slot when spoken. \
-Treat it as a hard ceiling, but do not pad a line to reach it: if the same \
-meaning fits in fewer words, use fewer."""
+#: Rule 3 when each line carries ``max_words``. The ceiling *replaces* the
+#: proportional hint rather than joining it, because the two disagree - the ceiling
+#: comes from how fast this voice speaks in this slot, the hint from the source's
+#: length - and the model resolves that argument in favour of whichever it is told
+#: first. Measured on a real job the translations came out 1.5-1.8x the ceiling.
+LENGTH_RULE_BUDGETED = (
+    'Respect each line\'s "max_words": the most words that fit its slot when '
+    "spoken, and a hard ceiling rather than a target. It matters more than "
+    "matching the original's length: if the meaning needs more words, drop the "
+    "least important detail instead of exceeding it, and never pad a shorter line "
+    "to reach it."
+)
 
 
 class TranslationRequest(BaseModel):
@@ -142,6 +157,11 @@ def build_messages(
 ) -> list[dict[str, str]]:
     """Build the chat messages for one batch.
 
+    Length is governed by exactly one rule: the per-line word ceiling when any
+    request carries one, and a proportional hint against the original otherwise.
+    Sending both was the bug - the model followed the hint and overran the ceiling
+    by a wide margin, which the mixer could only answer by deleting words.
+
     Args:
         requests: Lines to translate in this batch.
         source_language: Source language name, or ``None`` when auto-detected.
@@ -157,13 +177,17 @@ def build_messages(
         f"The source language is {source_language}." if source_language else
         "Detect the source language from the lines themselves."
     )
+    budgeted = any(request.max_words for request in requests)
+    length_rule = (
+        LENGTH_RULE_BUDGETED
+        if budgeted
+        else LENGTH_RULE_PROPORTIONAL.format(percent=int(LENGTH_TOLERANCE * 100))
+    )
     system = SYSTEM_PROMPT.format(
         target=target_language,
         source_clause=source_clause,
-        percent=int(LENGTH_TOLERANCE * 100),
+        length_rule=length_rule,
     )
-    if any(request.max_words for request in requests):
-        system += WORD_BUDGET_RULE
 
     parts: list[str] = []
     if context:

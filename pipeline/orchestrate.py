@@ -23,6 +23,7 @@ import numpy as np
 
 from . import media, subtitles
 from .anchors import (
+    ANCHOR_TEXT,
     AnchorSpec,
     ensure_anchor,
     measure_gender,
@@ -55,7 +56,15 @@ from .models import anchors_dir, resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
 from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
 from .separation import NullSeparator, detect_separator
-from .timing import Placement, Timeline, build_timeline, detect_stretcher, fit_line
+from .timing import (
+    Placement,
+    Timeline,
+    build_timeline,
+    detect_stretcher,
+    fit_line,
+    fit_ratio,
+    trim_silence,
+)
 from .translate import (
     OpenAICompatTranslator,
     ShortenRequest,
@@ -79,11 +88,20 @@ _BACKGROUND_NAME = "01c_background.wav"
 _SEPARATION_MARKER = "01b_separation.done"
 _TRANSCRIPT_NAME = "02_transcript.json"
 _SCRIPT_NAME = "03_script.json"
+#: Words per second the cloned voice measured, per speaker. Written before the
+#: script because the word budget every translation is given comes from it.
+_RATE_NAME = "03a_rate.json"
+#: Words of accent text the probe reads. A sentence or two is enough to measure a
+#: rate; reading a whole narration would cost seconds of GPU for no more accuracy.
+_RATE_PROBE_WORDS = 40
 #: Lines the length repair rewrote, and what it achieved. Written next to the
 #: script so a cached run can still report them.
 _SPOKEN_NAME = "03b_spoken.json"
 _REFINE_NAME = "03c_refine.json"
 _DUBBED_DIR = "04_dubbed"
+#: Lines the pre-synthesis word check had to reword, and what it achieved. Written
+#: before synthesis so a cached run can still report what was spoken.
+_PREFIT_NAME = "03d_prefit.json"
 _DONE_MARKER = ".done"
 _DONOR_NAME = "04_dubbed/donor.json"
 #: The one-off clip the two-stage ``reference-accent`` path clones every line
@@ -155,6 +173,53 @@ def _blend_paths(job_dir: Path, speakers: Sequence[str]) -> dict[str, Path]:
     }
 
 
+def _gap_seconds(segments: Sequence[Segment], index: int) -> float:
+    """Silence between a line and the next one; 0 when they touch or overlap.
+
+    An overlay line shares its slot with the dominant line and the last line has
+    nothing after it to protect, so neither may use a gap.
+    """
+    segment = segments[index]
+    if segment.overlay or index + 1 >= len(segments):
+        return 0.0
+    return max(0.0, segments[index + 1].start - segment.end)
+
+
+def _available_seconds(segments: Sequence[Segment], index: int) -> float:
+    """Time a line may actually use: its slot plus the gap before the next one.
+
+    The single definition of "how long is this line allowed to be". The mix stage,
+    the length repair and the report all go through it so they cannot disagree
+    about which lines are overlong.
+    """
+    return segments[index].duration + _gap_seconds(segments, index)
+
+
+def _budget_words(available: float, words_per_second: float, speedup: float) -> int:
+    """Most words a line may be given, for a window and a measured delivery rate.
+
+    ``speedup`` is the tempo the budget is willing to spend on every line, so a
+    line the model fills exactly still fits with room to spare. Never 0: an
+    empty line is a missing line.
+    """
+    if available <= 0.0 or words_per_second <= 0.0 or speedup <= 0.0:
+        return 0
+    return max(1, int(round(available * words_per_second / speedup)))
+
+
+def _probe_text(accent: tuple[Any, str] | None, language: str) -> str:
+    """Text to measure a voice's delivery rate with: the accent's own, capped.
+
+    Reusing the accent text measures the exact material the voice borrows its
+    rhythm from - the generated anchor in ``native`` mode, the supplied clip's
+    transcript in ``reference-accent`` - so the probe adds no new content to a
+    job. The per-language anchor text is the fallback when no accent text exists.
+    """
+    text = (accent[1] if accent is not None else "") or ""
+    words = text.split() or ANCHOR_TEXT.get(language, "").split()
+    return " ".join(words[:_RATE_PROBE_WORDS])
+
+
 def _load_placements(path: Path) -> list[Placement]:
     """Re-read placement records so a cached mix still produces a full report."""
     if not path.is_file():
@@ -175,6 +240,8 @@ def _load_placements(path: Path) -> list[Placement]:
             trimmed=item.get("trimmed", 0.0),
             synth_seconds=item.get("synth_seconds", 0.0),
             deficit=item.get("deficit", 0.0),
+            needed_ratio=item.get("needed_ratio", 0.0),
+            silence_trimmed=item.get("silence_trimmed", 0.0),
         )
         for item in payload
     ]
@@ -307,6 +374,10 @@ class Pipeline:
         self._primary_accent: tuple[Any, str] | None = None
         #: Name of the speaker that :attr:`_primary_accent` belongs to.
         self._primary_speaker_name: str | None = None
+        #: Whose clone prompt the engine currently holds, so a speaker who is
+        #: already loaded is not rebuilt. The rate probe primes every voice and the
+        #: synthesis that follows starts on the voice it left off on.
+        self._primed_speaker: str | None = None
         #: Donor per speaker and its report record, resolved once and shared by the
         #: blend and synthesis stages. ``None`` until either of them needs it.
         self._donors_resolved: (
@@ -361,12 +432,24 @@ class Pipeline:
             # cloning checkpoints are never resident together.
             accents = self._stage_accent_anchor(source_audio, transcript)
             release_gpu_memory()
-            script = self._stage_translate(transcript, lines)
             # Rendered before synthesis so every line is cloned from one clip
             # whose speech codes and speaker embedding agree - one clip per voice.
             blends = self._stage_blend(source_audio, transcript, accents)
+            # How fast the cloned voice actually speaks. Measured from the voice
+            # itself, because every translation is sized by it: the accent clip's
+            # own rate reads ~20% below what the clone delivers (2.97 against 3.65
+            # measured), and a ceiling that tight is one the model ignores. The
+            # blend and the probe both need the base checkpoint, so they run back
+            # to back and it loads once.
+            rates = self._stage_rate_probe(source_audio, transcript, accents, blends)
+            script = self._stage_translate(transcript, lines, rates)
+            # What will actually be spoken: the script, minus the lines whose
+            # translation cannot fit even at the compression floor. Checked here
+            # rather than after synthesis, because a line that has to be reworded
+            # should never be synthesised twice.
+            fitted = self._stage_prefit(lines, script, rates)
             dubbed = self._stage_synthesize(
-                source_audio, transcript, lines, script, tmp_dir, blends
+                source_audio, transcript, lines, fitted, tmp_dir, blends
             )
             release_gpu_memory()
             timeline = self._stage_mix(audio_path, transcript, lines, dubbed, tmp_dir)
@@ -798,15 +881,17 @@ class Pipeline:
                 continue
         return ids
 
-    def _spoken_overrides(self) -> dict[int, str]:
-        """Lines the length repair rewrote, so subtitles match what is heard."""
-        path = self.job_dir / _SPOKEN_NAME
+    @staticmethod
+    def _read_id_text(path: Path, *, nested: str | None = None) -> dict[int, str]:
+        """Read a ``{id: text}`` sidecar, optionally nested under one key."""
         if not path.is_file():
             return {}
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload: Any = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
+        if nested is not None:
+            payload = payload.get(nested) if isinstance(payload, dict) else None
         if not isinstance(payload, dict):
             return {}
         overrides: dict[int, str] = {}
@@ -816,6 +901,49 @@ class Pipeline:
             except (TypeError, ValueError):
                 continue
         return overrides
+
+    def _prefit_overrides(self) -> dict[int, str]:
+        """The pre-synthesis rewrites, i.e. the wording that was actually spoken."""
+        return self._read_id_text(self.job_dir / _PREFIT_NAME, nested="lines")
+
+    def _spoken_overrides(self) -> dict[int, str]:
+        """Lines that were rewritten, so subtitles match what is heard.
+
+        Two passes can rewrite a line: the pre-synthesis word check and the measured
+        repair that follows it. The repair wins where both touched the same line,
+        because it was written against real audio rather than a prediction.
+        """
+        overrides = self._prefit_overrides()
+        overrides.update(self._read_id_text(self.job_dir / _SPOKEN_NAME))
+        return overrides
+
+    def _prefit_stats(self) -> dict[str, Any]:
+        """What the pre-synthesis word check did, or zeros when it could not run."""
+        default: dict[str, Any] = {
+            "attempted": False,
+            "offenders": 0,
+            "improved": 0,
+            "llm_calls": 0,
+            "words_before": 0,
+            "words_after": 0,
+            "words_kept": 1.0,
+        }
+        path = self.job_dir / _PREFIT_NAME
+        if not path.is_file():
+            return default
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return default
+        if not isinstance(payload, dict):
+            return default
+        stats = {**default, **payload}
+        before = stats.get("words_before") or 0
+        stats["words_kept"] = (
+            round(stats.get("words_after", 0) / before, 3) if before else 1.0
+        )
+        stats.pop("lines", None)
+        return stats
 
     def _refine_stats(self) -> dict[str, Any]:
         """What the length repair achieved, or zeros when it did not run."""
@@ -1253,18 +1381,107 @@ class Pipeline:
         result = self._stage("overlap-separate", [out], build)
         return self._overlap_lines() if result is None else result
 
-    def _reference_speech_rate(self) -> float | None:
-        """Words per second of the target language, measured from a reference clip.
+    def _probe_rates(self) -> dict[str, float]:
+        """Re-read the delivery-rate probe, so a cached run reports its own numbers."""
+        path = self.job_dir / _RATE_NAME
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {str(name): float(value) for name, value in payload.items()}
 
-        A model cannot judge how long a sentence takes to say, but it can count
-        words, so converting the slot into a word ceiling makes the budget
-        actionable. The rate has to come from *target-language* speech: the
-        auto-selected donor is the source speaker, whose rate describes the source
-        language and would size the translation wrongly.
+    def _stage_rate_probe(
+        self,
+        audio_path: Path,
+        transcript: Transcript,
+        accents: Mapping[str, tuple[Any, str]],
+        blends: Mapping[str, Path],
+    ) -> dict[str, float]:
+        """Measure how fast the cloned voice speaks, in words per second.
+
+        The word budget decides whether a translation can fit at all, so it has to
+        be sized from the voice that will speak it. The accent clip's own rate is
+        not that number: measured on a real job the clip read 2.97 words/s while
+        the clone delivered 3.65, and a ceiling a third too tight is one the model
+        simply ignores. One probe render per speaker buys the measurement; it is a
+        single line of the accent text, so it is noise beside the job it sizes.
+        """
+        out = self.job_dir / _RATE_NAME
+        speakers = self._speaker_order(transcript.segments)
+
+        def build() -> dict[str, float]:
+            engine = self._resolve_tts()
+            donors = self._resolve_donors(audio_path, transcript)
+            measured: dict[str, float] = {}
+            #: One prompt is one voice, so one measurement serves every speaker who
+            #: shares it - a pinned reference voice is measured once, not once per
+            #: speaker.
+            by_prompt: dict[str, float] = {}
+            for name in speakers:
+                key = self._prompt_key(name, blends)
+                if key in by_prompt:
+                    measured[name] = by_prompt[key]
+                    continue
+                text = _probe_text(accents.get(name), self.job.target_language)
+                if not text:
+                    self.log.warning(
+                        "No %s text to probe the delivery rate with; the word "
+                        "budget falls back to the accent clip's own rate.",
+                        self.job.target_language,
+                    )
+                    continue
+                # The prompt *is* the voice, so the probe has to be rendered
+                # through the same one the lines will be.
+                self._ensure_speaker_prompt(engine, name, donors.get(name), blends)
+                rate = engine.measure_delivery_rate(
+                    text, language=self.job.target_language
+                )
+                if rate <= 0:
+                    self.log.warning("Rate probe for %s produced no audio.", name)
+                    continue
+                by_prompt[key] = measured[name] = round(rate, 3)
+                self.log.info(
+                    "Delivery rate for %s: %.2f words/s (%.1fs of probe audio).",
+                    name,
+                    rate,
+                    len(text.split()) / rate,
+                )
+            out.write_text(json.dumps(measured, indent=2), encoding="utf-8")
+            return measured
+
+        result = self._stage("rate-probe", [out], build)
+        return self._probe_rates() if result is None else result
+
+    def _delivery_rate(
+        self, rates: Mapping[str, float], speaker: str | None = None
+    ) -> float | None:
+        """Words per second the target voice speaks, for one line's budget.
+
+        Prefers the probe's measurement for the speaker who owns the line. A
+        speaker the probe skipped takes the slowest measured voice, so a line is
+        never budgeted for a faster delivery than its own. Only when no probe ran
+        at all does it fall back to the accent clip's rate, which is what this
+        used to rely on and is a measured ~20% under-estimate.
         """
         if self.job.length_budget != "words":
             return None
+        if speaker is not None and rates.get(speaker):
+            return float(rates[speaker])
+        if rates:
+            return float(min(rates.values()))
+        return self._clip_speech_rate()
 
+    def _clip_speech_rate(self) -> float | None:
+        """Words per second read off a reference clip, the pre-probe fallback.
+
+        Cheap (no synthesis) but it describes the *clip*, not the clone: the model
+        reads a passage at its own pace, so the two disagree. Kept as the fallback
+        for the one case the probe cannot cover - no target-language text to read.
+        """
         if self.job.accent_mode == "native":
             # The generated anchor is target-language speech, so it sizes the
             # budget exactly as a supplied accent clip would.
@@ -1298,34 +1515,47 @@ class Pipeline:
         rate = len(text.split()) / seconds if seconds > 0 else 0.0
         if rate <= 0:
             return None
-        self.log.info("Reference speaking rate: %.2f words/s (from %s)", rate, clip)
+        self.log.info("Clip speaking rate: %.2f words/s (from %s)", rate, clip)
         return rate
 
     def _stage_translate(
-        self, transcript: Transcript, lines: Sequence[Segment]
+        self,
+        transcript: Transcript,
+        lines: Sequence[Segment],
+        rates: Mapping[str, float] | None = None,
     ) -> dict[int, str]:
         """Translate every line to the target language.
 
         ``lines`` may include separated overlap lines, so the second voice's words
-        are translated too.
+        are translated too. ``rates`` is the delivery-rate probe, which is what
+        turns a line's window into a word ceiling its slot can actually hold.
         """
         out = self.job_dir / _SCRIPT_NAME
 
         def build() -> dict[int, str]:
-            rate = self._reference_speech_rate()
-            requests = [
-                TranslationRequest(
-                    id=segment.id,
-                    text=segment.text,
-                    duration=segment.duration,
-                    # Only set when a rate is known; leaving it None keeps the
-                    # prompt identical to a run made before budgets existed.
-                    max_words=(
-                        max(1, int(round(segment.duration * rate))) if rate else None
-                    ),
+            requests = []
+            for index, segment in enumerate(lines):
+                rate = self._delivery_rate(rates or {}, self._speaker_of(segment))
+                requests.append(
+                    TranslationRequest(
+                        id=segment.id,
+                        text=segment.text,
+                        duration=segment.duration,
+                        # The ceiling covers the gap before the next line as well
+                        # as the slot, because the mixer may spill into it. Left
+                        # ``None`` when no rate is known, which keeps the prompt
+                        # identical to a run made before budgets existed.
+                        max_words=(
+                            _budget_words(
+                                _available_seconds(lines, index),
+                                rate,
+                                self.job.budget_speedup,
+                            )
+                            if rate
+                            else None
+                        ),
+                    )
                 )
-                for segment in lines
-            ]
             translations = self._resolve_translator().translate(
                 requests,
                 source_language=transcript.language,
@@ -1362,6 +1592,127 @@ class Pipeline:
             return result
         payload = json.loads(out.read_text(encoding="utf-8"))
         return {line["id"]: line["target"] for line in payload["lines"]}
+
+    def _stage_prefit(
+        self,
+        lines: Sequence[Segment],
+        script: dict[int, str],
+        rates: Mapping[str, float],
+    ) -> dict[int, str]:
+        """Rewrite the lines that cannot fit their window, before synthesising them.
+
+        The mixer may compress a line to the floor and spill it into the gap before
+        the next one, and no further: past that, words are deleted. The only honest
+        answer left is a shorter sentence, and asking for it here - with the word
+        ceiling and the predicted spoken length, no audio needed - is what keeps the
+        mixer from ever having to choose. The measured repair after synthesis stays
+        as the second pass, because it can see what was really spoken.
+
+        Returns:
+            The script with the accepted rewrites applied.
+        """
+        out = self.job_dir / _PREFIT_NAME
+
+        def build() -> dict[int, str]:
+            # A copy: ``03_script.json`` is the translation as delivered by the
+            # model, and the caller keeps using that dict for provenance.
+            fitted = dict(script)
+            stats: dict[str, Any] = {
+                "attempted": False,
+                "offenders": 0,
+                "improved": 0,
+                "llm_calls": 0,
+                "words_before": 0,
+                "words_after": 0,
+            }
+            translator = self._resolve_translator()
+            requests: list[ShortenRequest] = []
+            for index, segment in enumerate(lines):
+                rate = self._delivery_rate(rates, self._speaker_of(segment))
+                if not rate:
+                    continue
+                window = _available_seconds(lines, index)
+                text = fitted.get(segment.id, "")
+                words = len(text.split())
+                budget = _budget_words(window, rate, self.job.budget_speedup)
+                if not text.strip() or words <= budget:
+                    continue
+                requests.append(
+                    ShortenRequest(
+                        id=segment.id,
+                        text=text,
+                        source=segment.text,
+                        # Predicted, not measured: nothing has been spoken yet.
+                        spoken_seconds=round(words / rate, 2),
+                        available_seconds=round(window, 2),
+                        max_words=budget,
+                    )
+                )
+            stats["offenders"] = len(requests)
+            stats["words_before"] = sum(len(r.text.split()) for r in requests)
+            stats["words_after"] = stats["words_before"]
+
+            if requests and callable(getattr(translator, "shorten", None)):
+                stats["attempted"] = True
+                try:
+                    rewritten = translator.shorten(
+                        requests, target_language=self.job.target_language
+                    )
+                    stats["llm_calls"] = 1
+                except Exception as exc:  # noqa: BLE001 - best effort, as after synth
+                    self.log.warning(
+                        "Could not reword %d overlong line(s) before synthesis "
+                        "(%s). They are synthesised as translated and repaired "
+                        "afterwards if possible.",
+                        len(requests),
+                        exc,
+                    )
+                    rewritten = {}
+                for request in requests:
+                    candidate = str(rewritten.get(request.id) or "").strip()
+                    before = len(request.text.split())
+                    after = len(candidate.split())
+                    # A rewrite is only ever adopted when it measurably helps: a
+                    # "shorter" line that is not shorter is a worse translation.
+                    if not candidate or after >= before:
+                        continue
+                    fitted[request.id] = candidate
+                    stats["improved"] += 1
+                    stats["words_after"] -= before - after
+            elif requests:
+                self.log.info(
+                    "Translator %s cannot reword lines, so the pre-synthesis check "
+                    "is skipped; %d line(s) may lose their ending.",
+                    type(translator).__name__,
+                    len(requests),
+                )
+
+            payload = dict(stats)
+            payload["lines"] = {
+                str(request.id): fitted[request.id]
+                for request in requests
+                if fitted.get(request.id) != request.text
+            }
+            out.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            if stats["attempted"]:
+                self.log.info(
+                    "Pre-fit: reworded %d of %d overlong line(s) (%d of %d words "
+                    "kept) before synthesis.",
+                    stats["improved"],
+                    stats["offenders"],
+                    stats["words_after"],
+                    stats["words_before"],
+                )
+            return fitted
+
+        result = self._stage("prefit", [out], build)
+        if result is not None:
+            return result
+        fitted = dict(script)
+        fitted.update(self._prefit_overrides())
+        return fitted
 
     # -- accent source ----------------------------------------------------- #
 
@@ -1753,6 +2104,35 @@ class Pipeline:
 
     # -- per-speaker synthesis --------------------------------------------- #
 
+    def _prompt_key(self, name: str, blends: Mapping[str, Path]) -> str:
+        """Identity of the prompt a speaker needs, for the loaded-prompt cache.
+
+        A pinned reference voice is one prompt for every speaker, so it is keyed by
+        something other than the speaker's name - otherwise ``SPK_1`` would look
+        like a different voice than ``SPK_0`` and rebuild the identical prompt.
+        """
+        return "*shared*" if self._prompt_is_shared(blends) else name
+
+    def _ensure_speaker_prompt(
+        self,
+        engine: TTSEngine,
+        name: str,
+        donor_entry: tuple[DonorClip | None, dict[str, Any]] | None,
+        blends: Mapping[str, Path],
+    ) -> None:
+        """Build ``name``'s clone prompt unless that voice is already loaded.
+
+        Switching speakers means rebuilding the prompt, because the prompt *is* the
+        voice - but building the same one twice in a row costs a reference encode
+        for nothing, and the rate probe hands the speaker it primed straight to the
+        synthesis that follows it.
+        """
+        key = self._prompt_key(name, blends)
+        if self._primed_speaker == key:
+            return
+        self._prepare_speaker_prompt(engine, name, donor_entry, blends)
+        self._primed_speaker = key
+
     def _prepare_speaker_prompt(
         self,
         engine: TTSEngine,
@@ -1827,8 +2207,9 @@ class Pipeline:
             ]
             if not prompt_ready or not shared:
                 # The prompt *is* the voice, so it has to match the group about to
-                # be synthesised.
-                self._prepare_speaker_prompt(engine, name, donors.get(name), blends)
+                # be synthesised - but rebuilding it for the speaker the rate probe
+                # just primed would be pure waste.
+                self._ensure_speaker_prompt(engine, name, donors.get(name), blends)
                 prompt_ready = True
             wavs = engine.synthesize(
                 [texts.get(segment.id, "") for segment in owned],
@@ -1914,21 +2295,26 @@ class Pipeline:
     def _overflow_seconds(self, raw_seconds: float, index: int) -> float:
         """How far a line of ``raw_seconds`` would overflow its window.
 
-        Mirrors the mix stage exactly: the stretch clamp is applied first, then
-        the line may spill into the pause before the next utterance. Only what
-        exceeds *that* has to be cut, so only that is worth repairing. The final
-        line has no successor to protect, so it may run freely.
+        Mirrors the mix stage exactly - both go through ``fit_ratio`` - so what
+        this predicts is what the mixer will actually have to trim. The final line
+        has no successor to protect, so it may run freely.
         """
         segments = self._segments_for_refine
-        slot = segments[index].duration
+        segment = segments[index]
+        slot = segment.duration
         if slot <= 0 or raw_seconds <= 0:
             return 0.0
-        ratio = min(self.job.max_stretch, max(self.job.min_stretch, slot / raw_seconds))
-        stretched = raw_seconds * ratio
-        if index + 1 >= len(segments):
+        if index + 1 >= len(segments) and not segment.overlay:
             return 0.0
-        allowed = slot + max(0.0, segments[index + 1].start - segments[index].end)
-        return stretched - allowed
+        window = _available_seconds(segments, index)
+        ratio = fit_ratio(
+            slot,
+            window,
+            raw_seconds,
+            min_ratio=self.job.min_stretch,
+            max_ratio=self.job.max_stretch,
+        )
+        return raw_seconds * ratio - window
 
     def _refine_overlong(
         self,
@@ -1982,12 +2368,18 @@ class Pipeline:
         sample_rate = engine.sample_rate
         spoken: dict[int, str] = {}
 
+        def spoken_seconds_of(wav: np.ndarray | None) -> float:
+            """Duration the mixer will see: silence at the ends is not speech."""
+            if wav is None or not np.asarray(wav).size:
+                return 0.0
+            return len(trim_silence(wav, sample_rate)) / float(sample_rate)
+
         for _pass in range(self.job.refine_max_passes):
             offenders: list[tuple[int, float]] = []
             for index, wav in enumerate(wavs):
-                if wav is None or not np.asarray(wav).size:
+                raw = spoken_seconds_of(wav)
+                if raw <= 0.0:
                     continue
-                raw = len(np.asarray(wav).reshape(-1)) / float(sample_rate)
                 overflow = self._overflow_seconds(raw, index)
                 if overflow > self.job.refine_threshold:
                     offenders.append((index, overflow))
@@ -2005,9 +2397,13 @@ class Pipeline:
                 # cannot shorten an already-shortened line.
                 current = spoken.get(segment.id) or script.get(segment.id, "")
                 words = max(1, len(current.split()))
-                raw = len(np.asarray(wavs[index]).reshape(-1)) / float(sample_rate)
-                ratio = min(
-                    self.job.max_stretch, max(self.job.min_stretch, segment.duration / raw)
+                raw = spoken_seconds_of(wavs[index])
+                ratio = fit_ratio(
+                    segment.duration,
+                    _available_seconds(segments, index),
+                    raw,
+                    min_ratio=self.job.min_stretch,
+                    max_ratio=self.job.max_stretch,
                 )
                 allowed = max(0.0, raw * ratio - self._overflow_seconds(raw, index))
                 ceiling = max(1, int(words * (allowed / (raw * ratio))))
@@ -2058,7 +2454,7 @@ class Pipeline:
             ):
                 if wav is None or not np.asarray(wav).size:
                     continue
-                new_raw = len(np.asarray(wav).reshape(-1)) / float(sample_rate)
+                new_raw = spoken_seconds_of(wav)
                 new_overflow = self._overflow_seconds(new_raw, index)
                 if new_overflow >= overflow - 1e-3:
                     # No measurable gain: keep what we already had.
@@ -2107,6 +2503,8 @@ class Pipeline:
             trimmed: dict[int, float] = {}
             synth_seconds: dict[int, float] = {}
             deficits: dict[int, float] = {}
+            needed: dict[int, float] = {}
+            silence_trimmed: dict[int, float] = {}
             segments = lines
 
             for index, segment in enumerate(segments):
@@ -2116,18 +2514,28 @@ class Pipeline:
                     samples, sr = media.load_audio(path)
                     if sr != sample_rate:
                         samples = media.resample(samples, sr, sample_rate)
-                    synth = samples
+                    # Dead air at the ends is not speech: it must not be paid for
+                    # with tempo (or with reworded text), and left in place it is
+                    # silence inside a slot whose first word should be at its start.
+                    synth = trim_silence(samples, sample_rate)
+                    silence_trimmed[segment.id] = max(
+                        0.0,
+                        (len(np.asarray(samples).reshape(-1)) - len(synth))
+                        / float(sample_rate),
+                    )
 
                 # A line may spill into the silence before the next utterance:
                 # that costs nothing (nobody is talking) and avoids cutting
-                # words. Anything beyond it would push the next line late, so the
-                # residue is trimmed. The last line may run freely. An overlay line
-                # shares its slot with the dominant line, so it must not spill.
+                # words - and the gap is spent before tempo, so the mixer speeds
+                # speech up only as far as it must. Anything beyond the gap would
+                # push the next line late, so the residue is trimmed. The last
+                # line may run freely. An overlay line shares its slot with the
+                # dominant line, so it must not spill.
+                window = _available_seconds(segments, index)
                 if segment.overlay:
                     max_overrun: float | None = 0.0
                 elif index + 1 < len(segments):
-                    gap = max(0.0, segments[index + 1].start - segment.end)
-                    max_overrun = gap
+                    max_overrun = _gap_seconds(segments, index)
                 else:
                     max_overrun = None
 
@@ -2139,6 +2547,7 @@ class Pipeline:
                     min_ratio=self.job.min_stretch,
                     max_ratio=self.job.max_stretch,
                     max_overrun=max_overrun,
+                    available=window,
                 )
                 ratios[segment.id] = ratio
                 kept = len(fitted) / float(sample_rate)
@@ -2151,10 +2560,16 @@ class Pipeline:
                     )
                     synth_seconds[segment.id] = len(synth) / float(sample_rate)
                     deficits[segment.id] = max(0.0, segment.duration - stretched)
+                    needed[segment.id] = (
+                        window / synth_seconds[segment.id]
+                        if synth_seconds[segment.id] > 0
+                        else 1.0
+                    )
                 else:
                     trimmed[segment.id] = 0.0
                     synth_seconds[segment.id] = 0.0
                     deficits[segment.id] = 0.0
+                    needed[segment.id] = 1.0
 
                 items.append((segment.id, segment.start, fitted))
 
@@ -2171,6 +2586,10 @@ class Pipeline:
                 placement.trimmed = trimmed.get(placement.segment_id, 0.0)
                 placement.synth_seconds = synth_seconds.get(placement.segment_id, 0.0)
                 placement.deficit = deficits.get(placement.segment_id, 0.0)
+                placement.needed_ratio = needed.get(placement.segment_id, 0.0)
+                placement.silence_trimmed = silence_trimmed.get(
+                    placement.segment_id, 0.0
+                )
 
             notable = sum(1 for value in overruns.values() if value > 0.01)
             if notable:
@@ -2180,6 +2599,26 @@ class Pipeline:
                     notable,
                     sum(overruns.values()),
                     sum(trimmed.values()),
+                )
+
+            # Speech is only deleted when nothing else can absorb it, so when it
+            # happens it is worth naming: the ids lead straight to the lines whose
+            # translation is longer than the floor allows.
+            dropped = sorted(
+                (p for p in timeline.placements if p.trimmed > 0.01),
+                key=lambda p: p.trimmed,
+                reverse=True,
+            )
+            if dropped:
+                self.log.warning(
+                    "%d line(s) lost speech (floor %.2f): %s",
+                    len(dropped),
+                    self.job.min_stretch,
+                    ", ".join(
+                        f"id {p.segment_id} -{p.trimmed:.2f}s "
+                        f"(needed {p.needed_ratio:.2f})"
+                        for p in dropped[:5]
+                    ),
                 )
 
             regions = [(p.start, p.end) for p in timeline.placements]
@@ -2227,6 +2666,8 @@ class Pipeline:
                             "placed_start": round(p.start, 3),
                             "placed_end": round(p.end, 3),
                             "ratio": round(p.ratio, 4),
+                            "needed_ratio": round(p.needed_ratio, 4),
+                            "silence_trimmed": round(p.silence_trimmed, 3),
                             "overrun": round(p.overrun, 3),
                             "trimmed": round(p.trimmed, 3),
                             "synth_seconds": round(p.synth_seconds, 3),
@@ -2426,6 +2867,9 @@ class Pipeline:
         overruns = [p.overrun for p in timeline.placements]
         trimmed = [p.trimmed for p in timeline.placements]
         deficits = [p.deficit for p in timeline.placements]
+        silence = [p.silence_trimmed for p in timeline.placements]
+        rates = self._probe_rates()
+        speedup = self.job.budget_speedup
 
         # A line's translation was too long for its slot when it overran, and too
         # short when it left silence. The two are very different failures — an
@@ -2444,7 +2888,7 @@ class Pipeline:
             len((self._spoken_overrides().get(p.segment_id) or script.get(p.segment_id) or "").split())
             for p in timeline.placements
         )
-        spoken_total = sum(p.synth_seconds for p in timeline.placements)
+        spoken_total = sum(spoken_seconds(p) for p in timeline.placements)
         report = {
             "job_id": self.job_id,
             "input": str(self.input_path),
@@ -2480,6 +2924,15 @@ class Pipeline:
             #: that quietly retried around an out-of-memory error shows up here
             #: rather than only in the allocator's own log lines.
             "tts": self._tts_stats(),
+            #: How fast each cloned voice actually spoke, measured by the rate
+            #: probe, and the ceiling that measurement produced. This pair decides
+            #: whether a translation can fit at all; both are empty when there was
+            #: no target-language text to probe with.
+            "delivery_wps": rates,
+            "budget_wps": {
+                name: round(rate / speedup, 2) for name, rate in rates.items()
+            },
+            "budget_speedup": speedup,
             "donor": self._donor_info(),
             #: Which voices were found and how much each of them said. ``None``
             #: when the video has one speaker, so single-speaker reports are
@@ -2488,6 +2941,10 @@ class Pipeline:
             #: What the length repair did: which lines were re-worded to avoid
             #: cutting them, and how much speech that saved.
             "refine": self._refine_stats(),
+            #: What the word check did *before* synthesising anything: the lines it
+            #: had to reword so the mixer would not have to delete speech, and how
+            #: much of the wording survived (``words_kept``).
+            "prefit": self._prefit_stats(),
             "stretch_ratio_min": round(min(ratios), 3) if ratios else None,
             "stretch_ratio_max": round(max(ratios), 3) if ratios else None,
             "clamped_segments": sum(
@@ -2504,6 +2961,24 @@ class Pipeline:
             ),
             "clamped_short_segments": sum(
                 1 for r in ratios if r >= self.job.max_stretch - 1e-6
+            ),
+            #: The compression floor in force, so a report always says which
+            #: limit its own "needed" numbers should be read against.
+            "compress_floor": self.job.min_stretch,
+            #: Lines the mixer had to speed up at all.
+            "accelerated_segments": sum(1 for r in ratios if r < 0.98),
+            #: Lines whose *translation* was longer than the floor allows, i.e. the
+            #: ones the length repair can help. This is the number to drive to
+            #: zero: while it is above zero, words are being deleted.
+            "needed_below_floor_segments": sum(
+                1
+                for p in timeline.placements
+                if 0.0 < p.needed_ratio < self.job.min_stretch
+            ),
+            "needed_ratio_min": (
+                round(min(p.needed_ratio for p in timeline.placements), 3)
+                if timeline.placements
+                else None
             ),
             #: Lines that left silence in their slot, and how much in total.
             "deficit_segments": sum(1 for value in deficits if value > 0.01),
@@ -2531,6 +3006,25 @@ class Pipeline:
             "overrun_seconds_max": round(max(overruns), 2) if overruns else 0.0,
             "trimmed_segments": sum(1 for value in trimmed if value > 0.01),
             "trimmed_seconds_total": round(sum(trimmed), 2),
+            #: Dead air removed from the ends of synthesised lines before fitting.
+            #: Silent, so nothing is lost - but leaving it in would spend the
+            #: compression budget (and, at the floor, the wording) on a pause.
+            "silence_trimmed_segments": sum(1 for value in silence if value > 0.01),
+            "silence_trimmed_seconds_total": round(sum(silence), 2),
+            #: The worst offenders by name, so the ids in a failure report lead
+            #: straight to the lines to listen to.
+            "worst_trimmed_lines": [
+                {
+                    "id": p.segment_id,
+                    "trimmed": round(p.trimmed, 3),
+                    "needed_ratio": round(p.needed_ratio, 3),
+                }
+                for p in sorted(
+                    (p for p in timeline.placements if p.trimmed > 0.01),
+                    key=lambda p: p.trimmed,
+                    reverse=True,
+                )[:5]
+            ],
             "outputs": {
                 "dub_track": self.job_dir.name + "/" + _DUB_TRACK_NAME,
                 "video": dubbed_video.name if dubbed_video else None,

@@ -417,7 +417,8 @@ python dub.py --video talk.mp4 --target fr --loudness lufs --lufs -16
 **Control timing**
 
 ```bash
-python dub.py --video talk.mp4 --target fr --min-stretch 0.75  # allow faster speech, trim less
+python dub.py --video talk.mp4 --target fr --min-stretch 0.70   # permit faster speech than the default
+python dub.py --video talk.mp4 --target fr --budget-speedup 0.90 # fit more words per line
 python dub.py --video talk.mp4 --target fr --max-stretch 1.10  # cap how far lines are slowed
 python dub.py --video talk.mp4 --target fr --stretcher sox     # pick a specific backend
 ```
@@ -745,13 +746,14 @@ but it also leaves the voice finishing early — on this video the fast clip lef
 still talking on screen.
 
 Those two failures are not equally bad. Silence is a pause; deleted words are
-information loss. So prefer a reference that leans *slightly* fast, and let
-[the length repair](#when-a-translation-is-too-long-for-its-slot) handle the lines
-that still come out long — it removes the deletion without adding silence, which
-no choice of reference pace can do. Measured across five clip speeds, roughly half
-the lines missed their slot at *every* pace, so pacing alone cannot fix this.
-
-Failing all that, lower `--min-stretch` to allow faster speech.
+information loss. Measured across five clip speeds, roughly half the lines missed
+their slot at *every* pace, so pacing alone can never fix this — which is why the
+pipeline no longer sizes its translations from the reference clip at all. It
+measures the **cloned voice** with a probe render per speaker (`03a_rate.json`),
+builds each line's word ceiling from that measurement, and checks the translation
+against the ceiling before synthesising it. Reference pace is now a pronunciation
+and delivery choice rather than a length lever; see
+[When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot).
 
 Need a transcript and never wrote one down? Transcribing the clip with the same
 model the pipeline uses is accurate enough in practice — the run behind the table
@@ -844,7 +846,7 @@ a space.
 
 | Option | Default | What it achieves |
 |---|---|---|
-| `--min-stretch RATIO` | `0.85` | Most a line may be compressed to fit its slot. Lower = faster speech, so fewer words get trimmed, but it can start to sound hurried. |
+| `--min-stretch RATIO` | `0.75` | Compression floor: how much faster than natural a line may be played to fit its slot. It is a clarity limit rather than the point where words are cut — past it the wording has to give instead, because the alternative is deleting speech. Lower = faster speech, and it can start to sound hurried. |
 | `--max-stretch RATIO` | `1.18` | Most a line may be slowed to fill its slot. Raising this makes speech sound unnatural, so prefer fixing the translation. |
 | `--stretcher BACKEND` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none`. `none` disables stretching (lines then only overrun or trim). Falls back automatically if a binary is missing. |
 
@@ -855,7 +857,8 @@ a space.
 | `--refine` / `--no-refine` | on | Rewrites the lines that would otherwise have words cut, then re-synthesises just those. Lines that already fit are untouched; a rewrite is kept only if it measurably reduces the overflow. `--no-refine` restores the previous trim-only behaviour. |
 | `--refine-max-passes N` | `1` | How many times a line may be rewritten before falling back to trimming. `0` disables the repair. |
 | `--refine-threshold SECONDS` | `0.05` | How far a line must overrun its slot *and* the pause after it before it is worth rewriting. Raise it to repair fewer, worse lines. |
-| `--length-budget MODE` | `words` | `words` (the default) also tells the translator how many words fit each slot, measured from a target-language reference (the accent anchor, `--accent-audio`, or a target-language `--ref-audio`). `off` sends only the duration. Falls back to `off` when no target-language reference exists. |
+| `--length-budget MODE` | `words` | `words` (the default) also tells the translator how many words fit each line, measured from the voice that will speak it — one probe render per speaker, before translating. `off` sends only the duration, which measurably loses the ends of sentences. Falls back to the accent clip's own rate when there is no target-language text to probe with. |
+| `--budget-speedup RATIO` | `0.85` | Tempo the word budget is willing to spend on *every* line: the ceiling is how many words fit at that speed-up. Keep it above `--min-stretch` so most lines stay at or above 0.85 and only the stubborn ones reach the floor. |
 
 **Models and hardware**
 
@@ -882,19 +885,41 @@ a space.
 ### When a translation is too long for its slot
 
 Translated speech is routinely longer than the source: French needs roughly 15–40%
-more time than English for the same content. The stretch clamp absorbs part of
-that, and a line is allowed to spill into the pause that follows it, but anything
-beyond that used to be **cut** — words deleted to keep the video in sync.
+more time than English for the same content. Four things stand between that extra
+length and a cut, in the order they apply.
 
-The length repair avoids the cut by fixing the *text* instead:
+1. **The word ceiling.** Each line's *window* — its slot plus the pause before the
+   next line — is converted into a word count using the rate the **cloned voice**
+   was measured at: one probe render per speaker, before translating
+   (`03a_rate.json`). The translator is told that number, and the ceiling
+   *replaces* the "stay within 20% of the original" hint rather than joining it.
+   Sending both was the original bug: the model followed the source-length hint and
+   overran the ceiling by 1.5–1.8×, which the mixer could only answer by deleting
+   words.
+2. **The pre-synthesis check** (`03d_prefit.json`). Whatever still exceeds its
+   ceiling is reworded before it is ever spoken, in one batched translator call. A
+   rewrite is adopted only if it is measurably shorter, the original translation
+   stays in `03_script.json`, and the reworded version is what the subtitles show.
+   Checking here rather than afterwards is the difference between one synthesis
+   pass and two.
+3. **The compression floor** (`--min-stretch`, default `0.75`). The mixer speeds a
+   line up, never past the floor, and spends the pause before the next line before
+   spending more tempo — a pause nobody talks over is free, while tempo always
+   costs clarity.
+4. **The measured repair** (`--refine`, default on). Lines that still overrun are
+   reworded against *real* audio: their spoken length, the time actually available,
+   and a ceiling derived from that measurement. Only those lines are re-synthesised.
 
-1. After the first synthesis pass, each line's spoken length is measured against
-   its slot plus the following pause.
-2. Lines that would overflow are sent back to the translator together, with their
-   previous wording, the source line, and a word ceiling derived from how much
-   time is actually available.
-3. Only those lines are re-synthesised. A rewrite is adopted **only** if it
-   measurably reduces the overflow, so a line can never come out worse.
+Dead air goes first, for every line: a synthesised clip often opens with a tenth to
+a third of a second of digital silence (`silence_trimmed_seconds_total` reports
+what was removed). Left in place it is audible dead air *and* it is charged to the
+compression budget — measured on one line, 0.5 s of silence forced a 0.82
+compression where the speech alone needed 0.97.
+
+The writes are all kept separate so a run explains itself: `03_script.json` is what
+the model said, `03d_prefit.json` what the pre-synthesis check changed, and
+`03b_spoken.json` what the measured repair changed. The subtitles follow the last
+of those, so they never display words the viewer cannot hear.
 
 Three properties make it safe to leave on:
 
@@ -902,10 +927,8 @@ Three properties make it safe to leave on:
   identical to a run with `--no-refine`, which is asserted in the test suite.
 - **A failed repair is a no-op.** If the translator is unreachable, or a custom
   translator cannot rewrite, the run logs a warning and keeps the audio it has.
-- **Nothing is re-shortened on a re-run.** Rewrites always start from the original
-  translation, recorded in `03_script.json`, and the spoken version is kept
-  separately in `03b_spoken.json` — which is also what the target subtitles use,
-  so they never display words the viewer cannot hear.
+- **Nothing is re-shortened on a re-run.** Both rewriting passes always start from
+  the original translation, so repeated runs cannot shorten an already-short line.
 
 Measured on the 4:47 TED talk, English → French, identical settings apart from
 the flag:
@@ -924,6 +947,41 @@ the flag:
 The repair rewrote 3 of 57 lines in one extra translator call. Its cost is a
 second synthesis pass over just those lines, which took the stage from 56 s to
 73 s.
+
+**The same problem on an 11-minute two-speaker video**, which is where the word
+ceiling mattered. Both runs are the same input and settings, English → French,
+`native` accent; ASR re-ran, so the two segmented slightly differently (489 vs 471
+lines) and the deltas are indicative rather than perfectly controlled:
+
+| Metric | Before | After |
+|---|---|---|
+| Speech deleted | 40.63 s | **6.74 s** |
+| Lines that lost speech | 179 | **52** |
+| Lines losing >10% of their speech | 135 | **34** |
+| Worst single line deleted | 97.5% | 80% |
+| Speech fitted into the following pauses | 43.97 s | 30.35 s |
+| Dead air removed from clip ends | — | 31.59 s (277 lines) |
+| Synthesis stage | 699 s | **497 s** |
+| Desync (`shifted_segments`) | 0 | 0 |
+
+Three things did most of the work: the probe measured the cloned voices at 3.52
+and 3.60 words/s where the accent clip reads 2.97, so the ceilings sent to the
+translator rose by about a fifth and the translations landed **on** them
+(words ÷ ceiling: median 1.00, mean 0.95, against 1.5–1.8× before); the
+pre-synthesis check reworded 41 of the 152 lines that still missed, keeping 985 of
+their 1100 words; and dropping the dead air from clip ends removed 31.6 s that had
+been charged to the compression budget. Synthesis got *faster* despite the extra
+translator call, because 192 lines used to be spoken twice.
+
+What is left is not a translation problem. All 52 remaining lines are ones whose
+*source* slot is physically too short — `worst_trimmed_lines` starts at
+`needed_ratio 0.15`, i.e. a line that would have to be compressed to under a sixth
+of its natural length. `id 211` is four words given 0.16 s, with the next segment
+starting 0.02 s later: Whisper's boundaries squeezed that stretch of speech until
+it holds nine words in 0.9 s, which no speaker could say. The mixer cannot invent
+the time, the wording cannot shrink "What's the next snack?" much further, and the
+only remaining answers are shifting those lines late (desync) or fixing the
+segmentation upstream. None of them is taken here.
 
 ### Verified commands
 These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
@@ -959,8 +1017,10 @@ output/talk/
 ├── 02c_overlap.json     # which segments carry a second voice (multi-speaker runs)
 ├── 02d_overlap_segments.json   # only with --overlap separate: the per-voice lines
 ├── 03_script.json       # source -> target text per segment
+├── 03a_rate.json        # words/s measured for each cloned voice (what budgets come from)
 ├── 03b_spoken.json      # lines the length repair re-wrote (only those)
 ├── 03c_refine.json      # what the length repair achieved
+├── 03d_prefit.json      # lines re-worded before synthesis, and how much of the wording survived
 ├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
 │   ├── donor.json       # which voice was cloned for each speaker, and from what
 │   ├── reference_blend.wav   # only in reference-accent: the clip every line is cloned from
@@ -1009,6 +1069,17 @@ output/talk/
 | `clamped_segments` | Lines that hit a stretch limit (either direction) |
 | `clamped_long_segments` | …of which were too long to compress into their slot |
 | `clamped_short_segments` | …of which were too short to slow down enough to fill it |
+| `compress_floor` | The compression floor this run used (`--min-stretch`), which is what `needed_ratio` should be read against |
+| `delivery_wps` | Words per second measured for each cloned voice by the probe — the number every word budget is derived from |
+| `budget_wps` | …divided by `budget_speedup`: the ceiling the translator was actually given, per voice |
+| `budget_speedup` | The tempo the budget was allowed to spend on every line |
+| `accelerated_segments` | Lines the mixer sped up at all |
+| `needed_below_floor_segments` | Lines whose *translation* was longer than the floor allows — the only ones that can lose words, and the number to drive to zero |
+| `needed_ratio_min` | The hardest compression any line needed, before the floor was applied |
+| `prefit` | What the check *before* synthesis did: `attempted`, `offenders`, `improved`, `llm_calls`, and `words_kept` (the share of the wording that survived) |
+| `silence_trimmed_segments` | Lines that had dead air trimmed from their ends before fitting |
+| `silence_trimmed_seconds_total` | Seconds of dead air removed. Silent, so nothing is lost — but leaving it in would spend the compression budget (and, at the floor, the wording) on a pause |
+| `worst_trimmed_lines` | The worst offenders by name: `id`, `trimmed` seconds and the `needed_ratio` that caused it |
 | `deficit_segments` | Lines that left silence in their slot |
 | `deficit_seconds_total` | Total silence left inside slots |
 | `overrun_segments` | Lines that spilled into the pause after them (free, no speech lost) |
@@ -1018,7 +1089,7 @@ output/talk/
 | `trimmed_seconds_total` | Seconds of speech lost to those cuts |
 | `worst_line_deleted_ratio` | The largest share of a single line that was deleted |
 | `lines_over_10pct_deleted` | Lines that lost more than a tenth of their speech |
-| `speech_rate_wps` | Words per second the cloned voice actually delivered |
+| `speech_rate_wps` | Words per second the cloned voice actually delivered, measured on the placed audio (dead air excluded, stretch included) — compare it with `delivery_wps` to see whether the probe was right |
 | `refine` | What the length repair did: offenders, improved, seconds reclaimed |
 | `shifted_segments` | Lines pushed later to avoid overlapping another |
 
@@ -1033,14 +1104,14 @@ and without limiting a handful of transients would hold the whole program severa
 dB too quiet. The delivered loudness should still match `loudness_target_lufs`;
 if it does not, the material was too dynamic to reach the target cleanly.
 - **`trimmed_seconds_total`** is the one to watch. Translated speech is often
-  longer than the source (French runs roughly 15–40% longer than English), and
-  the stretch limit caps how far a line can be compressed. A line is first
-  allowed to spill into the pause that follows it — free, since nobody is talking
-  — and only the remainder is cut, because letting it run on would push every
-  later line out of sync with the video. Nothing is ever shifted late: sync is
-  exact. To reduce trimming, ask the translator for terser output (roadmap P3
-  adds an automatic length-feedback loop), or lower `--min-stretch` to allow
-  faster speech.
+  longer than the source (French runs roughly 15–40% longer than English), and no
+  amount of tempo can absorb an arbitrarily long line. A line is first compressed
+  to the floor, then allowed to spill into the pause that follows it — free,
+  since nobody is talking — and only the remainder is cut. Three things keep that
+  remainder at zero, in order: the word ceiling the translator is given, the
+  pre-synthesis check that rewords whatever still misses it, and the floor itself.
+  `needed_below_floor_segments` counts the lines that got past all three, and
+  `worst_trimmed_lines` names them. Nothing is ever shifted late: sync is exact.
 
 ### Caching
 
@@ -1232,10 +1303,11 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | The GPU is not being used at all | Run `python dub.py info` — it reports the accelerator, the device it would pick, and the precision. If it says `cpu`, torch either sees no GPU or the wrong wheel is installed (see Prerequisites §2 and §3) |
 | Speech recognition is on the CPU when a GPU exists | CTranslate2 links against a specific CUDA major. Run `python dub.py info` and check the `asr device` line; Prerequisites §3 has the fix |
 | Dub sounds rushed or slow | Check `report.json` → `clamped_segments`; tighten the translation |
-| Some words are cut off | `report.json` → `trimmed_segments`: the translation is too long for its slot. Check `worst_line_deleted_ratio` too — a small total can hide one badly damaged line. Leave the length repair on (it is on by default), shorten the translation, or lower `--min-stretch` |
+| Some words are cut off | `report.json` → `worst_trimmed_lines` names them (`id`, `trimmed`, `needed_ratio`); `needed_below_floor_segments` counts them. A `needed_ratio` below `compress_floor` means the translation was longer than even a 0.75 compression can hold, so the wording, not the tempo, is what to change: check `prefit` (did the pre-synthesis check run, and how much wording did it keep?) and `--length-budget`. Lowering `--min-stretch` further buys room at the cost of sounding hurried |
 | A line lost a lot of words despite a low `trimmed_seconds_total` | Look at `worst_line_deleted_ratio` and `lines_over_10pct_deleted`: damage is usually concentrated in one or two lines, not spread evenly |
-| Lines sound slow or have gaps | `report.json` → `deficit_seconds_total`: the translation is shorter than its slot. See [Reference pacing](#reference-pacing), or use `--length-budget words` with a target-language reference |
-| The repair did not help | Check `report.json` → `refine`. `attempted: false` means no line overflowed (nothing to fix) or the translator cannot rewrite; `improved: 0` means the rewrites did not fit either, so the old behaviour applied |
+| Lines sound slow or have gaps | `report.json` → `deficit_seconds_total`: the translation is shorter than its slot, i.e. the word ceiling was conservative. Check `delivery_wps` (the probe's measurement) against `speech_rate_wps` (what the voice actually delivered): if the probe reads well under the delivery, raise `--budget-speedup`. See also [Reference pacing](#reference-pacing) |
+| A rewrite did not help | Check `report.json` → `refine` (the measured pass) and → `prefit` (the pre-synthesis one). `attempted: false` means no line overflowed, or the translator cannot rewrite; `improved: 0` means the rewrites did not fit either, and the pre-fit check was skipped or its candidates were not shorter |
+| `delivery_wps` looks wrong for my video | It is measured from one 40-word probe render per voice, so a very expressive or very short-spoken video can differ from `speech_rate_wps` (what the lines actually delivered). Delete `<job>/03a_rate.json` to re-probe, or set `--budget-speedup`/`--min-stretch` yourself and leave the budget out of it with `--length-budget off` |
 | Dub drifts out of sync | Should not happen — lines are never shifted late. If `shifted_segments > 0`, check `timing.json` for genuinely overlapping source speech |
 | Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
 | Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
@@ -1258,7 +1330,7 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
 | A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
 | `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
-| The dub is rushed, or words are missing | The reference clip's pacing is being imitated, and a slow reference lengthens every line. Use a faster-paced reference — see [Reference pacing](#reference-pacing) |
+| The dub is rushed, or words are missing | Check `accelerated_segments` and `needed_ratio_min`: the voice is being sped up because the written line is longer than the window holds. Raise `--budget-speedup` only if `deficit_seconds_total` is also high; otherwise the lines are simply long for their slots. See [When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot) |
 | `audit_qc.py` reports `SKIP timbre — no accent clip to measure against` | Expected for a `preserve` job: nothing was borrowed, so "did the line follow the accent voice?" has no answer. Pass `--accent <clip>` to force one. The other three gates still report, and the exit code stays 0 |
 | The timbre audit fails while the GPUs are busy | Pass `--device cpu` to `audit_qc.py` or `audit_timbre.py`. The measurement is slower there but identical |
 

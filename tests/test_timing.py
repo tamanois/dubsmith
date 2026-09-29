@@ -16,6 +16,8 @@ from pipeline.timing import (
     compute_ratio,
     detect_stretcher,
     fit_line,
+    fit_ratio,
+    trim_silence,
 )
 
 SR = 24_000
@@ -62,6 +64,95 @@ class TestComputeRatio:
     @pytest.mark.parametrize(("source", "synth"), [(0.0, 2.0), (2.0, 0.0), (-1.0, 1.0)])
     def test_unusable_durations_are_neutral(self, source: float, synth: float) -> None:
         assert compute_ratio(source, synth) == 1.0
+
+
+class TestFitRatio:
+    """The floor and the following gap decide how a line is fitted."""
+
+    def test_a_line_that_exactly_fits_is_untouched(self) -> None:
+        assert fit_ratio(2.0, 2.0, 2.0) == pytest.approx(1.0)
+
+    def test_compression_aims_at_the_slot(self) -> None:
+        # Speech should stop when the source speaker stopped, so the slot is the
+        # target even when the gap alone would have covered the difference.
+        assert fit_ratio(2.0, 2.4, 2.4, min_ratio=0.75) == pytest.approx(2.0 / 2.4)
+
+    def test_a_short_line_is_slowed_to_fill_its_slot(self) -> None:
+        assert fit_ratio(2.0, 2.0, 1.0) == pytest.approx(1.18)
+
+    def test_the_floor_limits_compression(self) -> None:
+        # 4.0s of speech in a 2.0s slot needs 0.5, far below the floor.
+        assert fit_ratio(2.0, 2.0, 4.0, min_ratio=0.75) == pytest.approx(0.75)
+
+    def test_the_gap_is_spent_before_going_below_the_floor(self) -> None:
+        # The slot alone would need 0.5, under the floor; the 1.4s gap pays for
+        # the difference, so only 0.85 is applied and no quality is spent twice.
+        assert fit_ratio(2.0, 3.4, 4.0, min_ratio=0.75) == pytest.approx(0.85)
+
+    def test_the_gap_cannot_justify_more_compression(self) -> None:
+        # A gap smaller than the excess still leaves the floor as the answer.
+        assert fit_ratio(2.0, 2.4, 4.0, min_ratio=0.75) == pytest.approx(0.75)
+
+    def test_a_zero_window_falls_back_to_the_slot(self) -> None:
+        assert fit_ratio(2.0, 0.0, 2.5, min_ratio=0.75) == pytest.approx(0.8)
+
+    @pytest.mark.parametrize(
+        ("slot", "window", "synth"),
+        [(0.0, 2.0, 3.0), (2.0, 2.0, 0.0), (-1.0, 2.0, 3.0)],
+    )
+    def test_unusable_durations_are_neutral(
+        self, slot: float, window: float, synth: float
+    ) -> None:
+        assert fit_ratio(slot, window, synth) == 1.0
+
+
+class TestTrimSilence:
+    """Dead air at the ends of a synthesised line is not speech."""
+
+    @staticmethod
+    def padded(lead: float, speech: float, trail: float) -> np.ndarray:
+        return np.concatenate(
+            [
+                np.zeros(int(lead * SR), dtype=np.float32),
+                tone(speech),
+                np.zeros(int(trail * SR), dtype=np.float32),
+            ]
+        )
+
+    def test_leading_and_trailing_silence_are_dropped(self) -> None:
+        trimmed = trim_silence(self.padded(0.35, 1.0, 0.2), SR)
+        # 1.0s of speech plus the 50 ms guard on each side: 0.30s and 0.15s of
+        # genuine silence are gone.
+        assert len(trimmed) / SR == pytest.approx(1.1, abs=0.02)
+
+    def test_a_clip_without_silence_is_unchanged(self) -> None:
+        source = tone(1.0)
+        assert trim_silence(source, SR).size == source.size
+
+    def test_the_guard_bounds_the_start(self) -> None:
+        """Silence nearer than the guard survives, so an attack is not cut."""
+        source = self.padded(0.02, 1.0, 0.0)
+        assert trim_silence(source, SR).size == source.size
+
+    def test_a_quiet_line_is_measured_against_its_own_peak(self) -> None:
+        quiet = self.padded(0.3, 1.0, 0.3) * 0.01
+        trimmed = trim_silence(quiet, SR)
+        assert len(trimmed) < quiet.size
+        assert len(trimmed) / SR > 1.0
+
+    def test_silence_alone_is_returned_untouched(self) -> None:
+        source = np.zeros(2400, dtype=np.float32)
+        assert trim_silence(source, SR).size == source.size
+
+    def test_a_transient_does_not_shrink_a_line_to_a_click(self) -> None:
+        """A single spike would otherwise make everything else "silence"."""
+        source = np.concatenate(
+            [np.zeros(int(2.0 * SR), dtype=np.float32), np.array([0.9], dtype=np.float32)]
+        )
+        assert trim_silence(source, SR).size == source.size
+
+    def test_empty_input_is_returned_unchanged(self) -> None:
+        assert trim_silence(np.zeros(0, dtype=np.float32), SR).size == 0
 
 
 class TestFitLength:
@@ -148,6 +239,32 @@ class TestFitLine:
     def test_zero_target_is_rejected(self) -> None:
         with pytest.raises(Exception, match="target_duration"):
             fit_line(tone(1.0), SR, 0.0, stretcher=SpyStretcher())
+    def test_the_available_window_softens_the_compression(self) -> None:
+        """A gap the line may spill into is spent before more tempo."""
+        _, ratio = fit_line(
+            tone(4.0), SR, 2.0, stretcher=SpyStretcher(), min_ratio=0.75, available=3.4
+        )
+        assert ratio == pytest.approx(0.85)
+
+    def test_the_available_window_never_adds_compression(self) -> None:
+        # A line that already fits its slot is compressed to the slot regardless.
+        _, ratio = fit_line(
+            tone(2.4), SR, 2.0, stretcher=SpyStretcher(), min_ratio=0.75, available=3.4
+        )
+        assert ratio == pytest.approx(2.0 / 2.4)
+
+    def test_the_floor_decides_when_the_window_is_too_small(self) -> None:
+        result, ratio = fit_line(
+            tone(4.0),
+            SR,
+            2.0,
+            stretcher=SpyStretcher(),
+            min_ratio=0.75,
+            max_overrun=0.4,
+            available=2.4,
+        )
+        assert ratio == pytest.approx(0.75)
+        assert result.size == int(round(2.4 * SR))
 
 
 class TestBuildTimeline:
@@ -168,6 +285,34 @@ class TestBuildTimeline:
         second = timeline.placements[1]
         assert second.shifted is True
         assert second.start == pytest.approx(2.0)
+
+    def test_a_rounding_level_move_is_not_a_shift(self) -> None:
+        """A line fitted to end on the next start can land a sample past it.
+
+        Lines are now compressed to fill their window, so this is the common case,
+        and calling it a desync would fail the QC gate on arithmetic.
+        """
+        previous = tone(1.0)
+        over = previous.size + 2  # two samples past the next line's start
+        timeline = build_timeline(
+            [(0, 0.0, tone(over / SR)), (1, 1.0, tone(0.5))],
+            sample_rate=SR,
+            total_duration=4.0,
+        )
+        second = timeline.placements[1]
+        # Still placed after the first clip, but not reported as a desync.
+        assert second.start == pytest.approx(over / SR, abs=1 / SR)
+        assert second.shifted is False
+
+    def test_a_perceptible_move_is_still_a_shift(self) -> None:
+        timeline = build_timeline(
+            [(0, 0.0, tone(1.0)), (1, 0.95, tone(0.5))],
+            sample_rate=SR,
+            total_duration=4.0,
+        )
+        second = timeline.placements[1]
+        assert second.start == pytest.approx(1.0)
+        assert second.shifted is True
 
     def test_empty_audio_is_skipped(self) -> None:
         timeline = build_timeline(

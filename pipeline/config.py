@@ -21,6 +21,7 @@ from .mixing import (
 __all__ = [
     "ACCELERATORS",
     "DEFAULT_MIN_SPEAKER_S",
+    "DEFAULT_BUDGET_SPEEDUP",
     "DTYPE_ALIASES",
     "DeviceInfo",
     "LANGUAGE_ALIASES",
@@ -155,6 +156,12 @@ ENV_PREFIX = ""
 #: Folding them into their neighbours left four voices with 4-5 s donors and
 #: blends at 0.79-0.86.
 DEFAULT_MIN_SPEAKER_S = 20.0
+
+#: Tempo the word budget is willing to spend on *every* line: the ceiling becomes
+#: ``window * delivery_wps / DEFAULT_BUDGET_SPEEDUP`` words. Deliberately gentler
+#: than ``JobConfig.min_stretch``, so most lines land at or above 0.85 and only the
+#: stubborn ones reach the floor instead of the whole dub sounding rushed.
+DEFAULT_BUDGET_SPEEDUP = 0.85
 
 #: Accepted spellings for the loudness policy, normalised to two canonical forms.
 _LOUDNESS_POLICIES: dict[str, str] = {
@@ -327,7 +334,13 @@ class JobConfig(BaseModel):
     tts_batch: int = Field(default=8, ge=1, le=64)
 
     # Duration fitting.
-    min_stretch: float = Field(default=0.85, gt=0.05, le=1.0)
+    #: How far a line may be *compressed* to fit. This is an intelligibility
+    #: floor, not the point where trimming begins: past it the wording has to give
+    #: instead of the tempo. Measured on a real job (``output/louisavy-11m``): at
+    #: 0.85, 326 of 489 lines sat at the clamp and 40.6s of speech was deleted;
+    #: the deleted time is exactly what a lower floor can absorb, because no single
+    #: line needed more than 0.73 and none lost more than 1s.
+    min_stretch: float = Field(default=0.75, gt=0.05, le=1.0)
     max_stretch: float = Field(default=1.18, ge=1.0, le=3.0)
 
     # Length repair. Translations routinely come out longer than their slot;
@@ -347,6 +360,11 @@ class JobConfig(BaseModel):
     #              because every accent mode now has a target-language reference to
     #              measure the rate from (the accent clip, or the native anchor).
     length_budget: str = "words"
+    #: Tempo the word budget is willing to spend on *every* line, i.e. the ceiling
+    #: is ``window * delivery_wps / budget_speedup`` words. Deliberately gentler
+    #: than ``min_stretch``: most lines then land at or above 0.85 and only the
+    #: stubborn ones reach the floor, instead of the whole dub sounding rushed.
+    budget_speedup: float = Field(default=DEFAULT_BUDGET_SPEEDUP, gt=0.05, le=2.0)
 
     # ASR gating: segments the model itself distrusts are dropped.
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)

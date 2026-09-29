@@ -207,16 +207,18 @@ class TestPerSpeakerVoices:
         pipeline, _, tts, _ = self.accent_pipeline(tmp_path)
         pipeline.run()
 
-        cloned = [Path(path).name for path, _ in tts.file_prompts]
-        assert cloned == ["reference_blend_SPK_0.wav", "reference_blend_SPK_1.wav"]
+        cloned = {Path(path).name for path, _ in tts.file_prompts}
+        assert cloned == {"reference_blend_SPK_0.wav", "reference_blend_SPK_1.wav"}
 
     def test_the_prompt_is_rebuilt_once_per_speaker(self, tmp_path: Path) -> None:
         pipeline, _, tts, _ = self.accent_pipeline(tmp_path)
         pipeline.run()
 
-        # Stage 1 builds a hybrid prompt per speaker, then each speaker's lines are
-        # cloned from a file: two voices means four prompts but only two batches.
-        assert tts.prompt_history == ["hybrid", "hybrid", "file", "file"]
+        # Stage 1 builds a hybrid prompt per speaker, then the rate probe primes
+        # each voice and the synthesis builds them again in speaker order: two
+        # voices means six prompt builds but still only two synthesis batches. The
+        # cost that matters - one batch per voice, not one per line - is unchanged.
+        assert tts.prompt_history == ["hybrid", "hybrid", "file", "file", "file", "file"]
         assert tts.synth_calls == 2
 
     def test_consecutive_lines_of_one_speaker_share_a_batch(self, tmp_path: Path) -> None:
@@ -272,7 +274,8 @@ class TestPerSpeakerVoices:
         pipeline.run()
 
         assert tts.blend_calls == 0
-        assert tts.prompt_history == ["hybrid", "hybrid"]
+        # Per speaker for the probe, then per speaker again for the synthesis.
+        assert tts.prompt_history == ["hybrid", "hybrid", "hybrid", "hybrid"]
         assert not (pipeline.job_dir / "04_dubbed" / "reference_blend.wav").exists()
 
     def test_a_blank_line_in_a_group_does_not_stop_the_others(

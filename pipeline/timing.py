@@ -37,19 +37,40 @@ __all__ = [
     "LibrosaStretcher",
     "detect_stretcher",
     "compute_ratio",
+    "fit_ratio",
     "fit_line",
+    "trim_silence",
     "Placement",
     "build_timeline",
     "MIN_RATIO",
     "MAX_RATIO",
+    "SHIFT_FLAG_GUARD_S",
 ]
-#: Stretch bounds. Beyond roughly ±15–20% phase-vocoder and transient artefacts
-#: become audible, so it is better to accept a small timing miss.
+#: Stretch bounds for callers that pass none. The pipeline is stricter about
+#: slowing down (speech that lags its slot reads as sloppy) than about speeding
+#: up, and its compression floor is ``JobConfig.min_stretch`` (0.75): past that
+#: the wording has to change, because the alternative is deleting words.
 MIN_RATIO = 0.85
 MAX_RATIO = 1.18
 
 #: Ratios closer than this to 1.0 are not worth processing.
 _NEUTRAL_EPSILON = 0.02
+
+#: A line pushed later than this counts as "shifted" in the report. Below it, the
+#: move is rounding: a line fitted to end exactly at the next one's start can land
+#: a sample or two over it, and calling that a desync would make the QC gate fail
+#: on arithmetic rather than on sync.
+SHIFT_FLAG_GUARD_S = 0.02
+
+#: Level, relative to a clip's own peak, below which it counts as silent. Relative
+#: because a quiet line must not be trimmed away, and -40 dB is far under speech.
+_SILENCE_FLOOR_DB = -40.0
+#: Silence shorter than this is kept, so a click or a plosive that dips the whole
+#: clip for a few frames is not cut into.
+_SILENCE_GUARD_S = 0.05
+#: Give up on a clip that shrinks past this share of itself: the "peak" was
+#: probably a transient and the rest of the line is not what was promised.
+_SILENCE_MIN_KEEP = 0.25
 
 
 class TimeStretcher(Protocol):
@@ -219,6 +240,87 @@ def compute_ratio(
     return float(min(max_ratio, max(min_ratio, source_duration / synth_duration)))
 
 
+def fit_ratio(
+    slot: float,
+    window: float,
+    synth_seconds: float,
+    *,
+    min_ratio: float = MIN_RATIO,
+    max_ratio: float = MAX_RATIO,
+) -> float:
+    """Ratio the mix stage applies to a ``synth_seconds``-long line.
+
+    Compression aims at the *slot* first: speech should stop when the source
+    speaker stopped. When that would need more than ``min_ratio``, the gap before
+    the next line - ``window - slot`` - is spent before more tempo is, because a
+    pause nobody talks over costs nothing while tempo always costs quality. A line
+    that still does not fit the window is the only one that gets trimmed.
+
+    Args:
+        slot: The segment's own duration, in seconds.
+        window: The time the line may use at most: the slot plus the gap before it.
+        synth_seconds: Duration of the synthesised line, before stretching.
+        min_ratio: Compression floor; the caller's policy limit.
+        max_ratio: Slow-down ceiling.
+
+    Returns:
+        The ratio to apply, clamped to ``[min_ratio, max_ratio]``.
+    """
+    if slot <= 0.0 or synth_seconds <= 0.0:
+        return 1.0
+    ratio = min(max_ratio, max(min_ratio, slot / synth_seconds))
+    needed = (window if window > 0.0 else slot) / synth_seconds
+    # Compress less when the following pause can pay for the difference.
+    if ratio < needed < 1.0:
+        ratio = needed
+    return float(ratio)
+
+
+def trim_silence(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    floor_db: float = _SILENCE_FLOOR_DB,
+    guard_s: float = _SILENCE_GUARD_S,
+) -> np.ndarray:
+    """Drop leading and trailing silence from a synthesised line.
+
+    A cloned line routinely opens with a tenth to a third of a second of digital
+    silence (measured: 0.13 s and 0.35 s on a two-line job). Placed at its slot
+    start that is audible dead air *and* it is charged to the compression budget,
+    so the mixer speeds real speech up to pay for a pause nobody asked for - on the
+    measured line, 0.5 s of silence forced a 0.82 compression where the speech
+    alone needed 0.97.
+
+    Args:
+        samples: The synthesised line.
+        sample_rate: Its sample rate.
+        floor_db: Level relative to the clip's own peak that counts as silence.
+        guard_s: Silence kept on each side, so an attack is never cut into.
+
+    Returns:
+        The trimmed clip, or the input unchanged when trimming is not safe.
+    """
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if data.size == 0:
+        return data
+    peak = float(np.abs(data).max())
+    if peak <= 0.0:
+        return data
+
+    loud = np.flatnonzero(np.abs(data) > peak * (10.0 ** (floor_db / 20.0)))
+    if loud.size == 0:
+        return data
+    guard = max(0, int(round(guard_s * sample_rate)))
+    start = max(0, int(loud[0]) - guard)
+    stop = min(data.size, int(loud[-1]) + 1 + guard)
+    if stop - start < _SILENCE_MIN_KEEP * data.size:
+        # Almost everything measured as silence: the peak was a transient, and
+        # returning a stub would turn a long line into a stretched click.
+        return data
+    return np.ascontiguousarray(data[start:stop])
+
+
 def _fit_length(
     samples: np.ndarray,
     target_samples: int,
@@ -270,6 +372,7 @@ def fit_line(
     min_ratio: float = MIN_RATIO,
     max_ratio: float = MAX_RATIO,
     max_overrun: float | None = None,
+    available: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """Fit one synthesised line into ``target_duration`` seconds.
 
@@ -294,6 +397,9 @@ def fit_line(
         max_overrun: Extra seconds the line may exceed its slot — pass the gap to
             the next utterance. ``None`` never trims (may drift); ``0.0`` forces
             the exact slot length.
+        available: Total seconds the line may use, i.e. ``target_duration`` plus
+            ``max_overrun``. Only changes how far the line is compressed: the gap
+            is spent before tempo. ``None`` means "the slot only".
 
     Returns:
         ``(audio, ratio)`` where ``ratio`` is the stretch that was applied.
@@ -307,8 +413,12 @@ def fit_line(
 
     data = np.asarray(synth, dtype=np.float32).reshape(-1)
     synth_duration = data.size / float(sample_rate)
-    ratio = compute_ratio(
-        target_duration, synth_duration, min_ratio=min_ratio, max_ratio=max_ratio
+    ratio = fit_ratio(
+        target_duration,
+        available if available is not None else target_duration,
+        synth_duration,
+        min_ratio=min_ratio,
+        max_ratio=max_ratio,
     )
 
     if abs(ratio - 1.0) > _NEUTRAL_EPSILON:
@@ -340,6 +450,12 @@ class Placement:
     synth_seconds: float = 0.0
     #: Seconds of the slot still silent after stretching (0.0 when it fills).
     deficit: float = 0.0
+    #: Compression the line needed to fit its slot plus the following gap, before
+    #: the floor was applied. Below ``min_stretch`` means the wording, not the
+    #: tempo, has to give - which is what the length repair is for.
+    needed_ratio: float = 0.0
+    #: Dead air dropped from the clip's ends before it was fitted.
+    silence_trimmed: float = 0.0
 
 
 @dataclass
@@ -382,6 +498,7 @@ def build_timeline(
         raise TimingError("sample_rate must be positive")
 
     overlays = set(overlay_ids)
+    guard = int(round(SHIFT_FLAG_GUARD_S * sample_rate))
     positions: list[tuple[int, int, np.ndarray, float, bool]] = []
     cursor = 0
     required = 0
@@ -393,7 +510,10 @@ def build_timeline(
         overlay = segment_id in overlays
         shifted = False
         if not overlay and start_sample < cursor:
-            start_sample, shifted = cursor, True
+            # Moved, but only a flag when the move is big enough to hear: see
+            # ``SHIFT_FLAG_GUARD_S``.
+            shifted = cursor - start_sample > guard
+            start_sample = cursor
         positions.append((segment_id, start_sample, data, float(start), shifted))
         # An overlay line is simultaneous with the line it accompanies, so it must
         # not advance the cursor even though it lengthens the track.

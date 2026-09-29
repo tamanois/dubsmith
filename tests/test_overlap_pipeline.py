@@ -238,10 +238,10 @@ class TestOverlapSeparationStage:
         pipeline, _transcript, _translator, tts, _separator, _stream = build(tmp_path)
         pipeline.run()
 
-        # Both voices come from the same file, but the prompt *is* the voice: the
-        # second line must have been synthesised after its speaker's prompt was
-        # (re)built. Two speakers => two distinct prompts.
-        assert tts.prompt_calls == 2
+        # Both voices come from the same file, but the prompt *is* the voice: each
+        # line must be synthesised after its own speaker's prompt was built. Two
+        # speakers, each primed once for the rate probe and once for the synthesis.
+        assert tts.prompt_calls == 4
 
 
 class TestSeparationFallsBackSafely:
