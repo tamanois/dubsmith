@@ -22,6 +22,13 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from . import media, subtitles
+from .anchors import (
+    AnchorSpec,
+    ensure_anchor,
+    measure_gender,
+    measure_rate,
+    rate_band,
+)
 from .asr import (
     Segment,
     Transcript,
@@ -35,6 +42,7 @@ from .asr import (
 from .config import (
     JobConfig,
     Settings,
+    configure_allocator,
     language_code_for_name,
     normalize_loudness_policy,
     probe_device,
@@ -43,7 +51,7 @@ from .config import (
 from .diarize import NullDiarizer, assign_streams, detect_diarizer, single_speaker_labels
 from .errors import ASRError, DubbingError, MediaError, TimingError
 from .logging_utils import job_logger
-from .models import resolve_model
+from .models import anchors_dir, resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
 from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
 from .separation import NullSeparator, detect_separator
@@ -54,7 +62,14 @@ from .translate import (
     TranslationRequest,
     Translator,
 )
-from .tts import DonorClip, TTSEngine, resolve_dtype, select_donor
+from .tts import (
+    MAX_DECODE_SECONDS,
+    DonorClip,
+    TTSEngine,
+    VoiceDesignEngine,
+    resolve_dtype,
+    select_donor,
+)
 
 __all__ = ["Pipeline", "JobResult", "Manifest"]
 
@@ -244,6 +259,7 @@ class Pipeline:
         transcriber: Callable[[Path], Transcript] | None = None,
         translator: Translator | None = None,
         tts_engine: TTSEngine | None = None,
+        anchor_engine: Any | None = None,
         stretcher: Any | None = None,
         separator: Any | None = None,
         diarizer: Any | None = None,
@@ -255,13 +271,17 @@ class Pipeline:
         self.settings = settings or Settings.from_env()
         self.input_path = job.input_path
         self.stem = self.input_path.stem
-        self.job_dir = job.output_dir / self.stem
+        self.job_dir = job.job_dir
         self.job_id = f"{self.stem}-{job.fingerprint()}"
         self.log = job_logger("pipeline", self.job_id)
 
         self._transcriber = transcriber
         self._translator = translator
         self._tts = tts_engine
+        #: VoiceDesign engine used to generate accent anchors. Injected in tests;
+        #: ``None`` resolves the real checkpoint lazily, and only on a cache miss.
+        self._anchor_engine = anchor_engine
+        self.__anchor_engine_resolved: Any | None = None
         self._stretcher = stretcher
         self._separator = separator
         self._diarizer = diarizer
@@ -278,6 +298,15 @@ class Pipeline:
         self._stage_seconds: dict[str, float] = {}
         #: Segments of the run currently being refined (set by the length repair).
         self._segments_for_refine: list[Any] = []
+        #: Accent clip per speaker (path/array + its transcript), resolved once by
+        #: the accent stage and consumed by the blend and synthesis stages.
+        self._accents: dict[str, tuple[Any, str]] = {}
+        #: Per-speaker accent provenance for the report, mirroring :attr:`_accents`.
+        self._accent_records: dict[str, dict[str, Any]] = {}
+        #: The anchor whose pace sizes the translator's word budget, when one exists.
+        self._primary_accent: tuple[Any, str] | None = None
+        #: Name of the speaker that :attr:`_primary_accent` belongs to.
+        self._primary_speaker_name: str | None = None
         #: Donor per speaker and its report record, resolved once and shared by the
         #: blend and synthesis stages. ``None`` until either of them needs it.
         self._donors_resolved: (
@@ -293,6 +322,9 @@ class Pipeline:
         if not self.input_path.exists():
             raise MediaError(f"Input file not found: {self.input_path}")
 
+        # Before any model loads: torch reads the allocator setting at its first
+        # allocation, so applying it later does nothing and says nothing.
+        configure_allocator(self.job.device)
         self.job_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir = self.job_dir / _TMP_DIR
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -324,10 +356,15 @@ class Pipeline:
             # Free the ASR model's cache before TTS loads its own weights;
             # otherwise the two multi-GB models contend for the same GPU.
             release_gpu_memory()
+            # Which accent clip each voice borrows pronunciation from. Resolved (and
+            # generated) here, before the base model loads, so the VoiceDesign and
+            # cloning checkpoints are never resident together.
+            accents = self._stage_accent_anchor(source_audio, transcript)
+            release_gpu_memory()
             script = self._stage_translate(transcript, lines)
             # Rendered before synthesis so every line is cloned from one clip
             # whose speech codes and speaker embedding agree - one clip per voice.
-            blends = self._stage_blend(source_audio, transcript)
+            blends = self._stage_blend(source_audio, transcript, accents)
             dubbed = self._stage_synthesize(
                 source_audio, transcript, lines, script, tmp_dir, blends
             )
@@ -390,9 +427,30 @@ class Pipeline:
                 model_dir,
                 device=self.job.device,
                 dtype=dtype,
+                batch_size=self.job.tts_batch,
                 x_vector_only=self.job.accent_mode == "speaker-only",
             )
         return self._tts
+
+    def _resolve_anchor_engine(self) -> Any:
+        """The VoiceDesign engine used to build accent anchors.
+
+        Resolved lazily - and only on a cache miss - so a run whose anchors are
+        already generated never loads this checkpoint, let alone alongside the
+        cloning one. A missing model raises the actionable download error from
+        :func:`resolve_model`, which the CLI prints as-is.
+        """
+        if self._anchor_engine is not None:
+            return self._anchor_engine
+        if self.__anchor_engine_resolved is None:
+            model_dir = resolve_model("tts_voice_design", self.settings.models_dir)
+            self.log.info("Generating an accent anchor with the VoiceDesign model.")
+            self.__anchor_engine_resolved = VoiceDesignEngine(
+                model_dir,
+                device=self.job.device,
+                dtype=resolve_dtype(self.job.device, self.job.dtype),
+            )
+        return self.__anchor_engine_resolved
 
     def _resolve_separator(self) -> Any:
         if self._separator is None:
@@ -640,9 +698,9 @@ class Pipeline:
                 "transcript_provided": bool((self.job.ref_text or "").strip()),
                 "accent_mode": self.job.accent_mode,
             }
-        elif self.job.accent_mode == "reference-accent":
+        elif self.job.accent_mode in ("native", "reference-accent"):
             # Timbre came from the video, so it is unknown without donor.json; the
-            # accent clip is still known from the config.
+            # accent source is still known from config or the resolved anchors.
             info = {"accent_mode": self.job.accent_mode}
         else:
             return None
@@ -653,6 +711,11 @@ class Pipeline:
                 "path": str(self.job.accent_audio),
                 "transcript_provided": bool((self.job.accent_text or "").strip()),
             }
+        elif self._accent_records:
+            primary = self._primary_speaker_name
+            info["accent"] = self._accent_records.get(primary) or next(
+                iter(self._accent_records.values())
+            )
         blend_stats = self._blend_stats()
         if blend_stats is not None:
             info["blend"] = blend_stats
@@ -1202,7 +1265,17 @@ class Pipeline:
         if self.job.length_budget != "words":
             return None
 
-        if self.job.accent_mode == "reference-accent":
+        if self.job.accent_mode == "native":
+            # The generated anchor is target-language speech, so it sizes the
+            # budget exactly as a supplied accent clip would.
+            if self._primary_accent is None:
+                self.log.info(
+                    "No accent anchor is available yet, so no word budget can be "
+                    "derived; translating with duration hints only."
+                )
+                return None
+            clip, text = self._primary_accent
+        elif self.job.accent_mode == "reference-accent":
             clip, text = self.job.accent_audio, self.job.accent_text
         elif self.job.ref_audio is not None and self.job.ref_text:
             clip, text = self.job.ref_audio, self.job.ref_text
@@ -1290,13 +1363,168 @@ class Pipeline:
         payload = json.loads(out.read_text(encoding="utf-8"))
         return {line["id"]: line["target"] for line in payload["lines"]}
 
+    # -- accent source ----------------------------------------------------- #
+
+    def _speaker_rate_bands(self, transcript: Transcript) -> dict[str, str]:
+        """Rate band per speaker, measured from that speaker's own lines."""
+        bands: dict[str, str] = {}
+        for name in self._speaker_order(transcript.segments):
+            owned = [
+                segment
+                for segment in transcript.segments
+                if self._speaker_of(segment) == name
+            ]
+            rate = measure_rate(owned)
+            bands[name] = rate_band(rate)
+            self.log.info(
+                "Measured %s speaking rate: %.2f words/s (%s)",
+                name,
+                rate,
+                bands[name],
+            )
+        return bands
+
+    def _speaker_genders(
+        self, audio_path: Path, transcript: Transcript
+    ) -> dict[str, str]:
+        """Coarse gender per speaker, from the donor clip when there is one.
+
+        The donor is a clean single-speaker window, so it is a better sample than
+        the whole track; when a reference file pins the voice there is no donor and
+        the speaker's own segments are used instead.
+        """
+        donors = self._resolve_donors(audio_path, transcript)
+        genders: dict[str, str] = {}
+        samples: np.ndarray | None = None
+        sample_rate = 0
+        for name in self._speaker_order(transcript.segments):
+            donor, _info = donors.get(name, (None, {}))
+            if donor is not None:
+                genders[name] = measure_gender(donor.samples, donor.sample_rate)
+                self.log.info("Estimated %s voice gender: %s", name, genders[name])
+                continue
+            if samples is None:
+                samples, sample_rate = media.load_audio(audio_path)
+            owned = [
+                segment
+                for segment in transcript.segments
+                if self._speaker_of(segment) == name
+            ]
+            chunks = [
+                samples[max(0, int(segment.start * sample_rate)) : int(segment.end * sample_rate)]
+                for segment in owned
+            ]
+            joined = (
+                np.concatenate(chunks)
+                if chunks
+                else np.zeros(0, dtype=np.float32)
+            )
+            genders[name] = measure_gender(joined, sample_rate)
+            self.log.info("Estimated %s voice gender: %s", name, genders[name])
+        return genders
+
+    def _primary_speaker(self, transcript: Transcript) -> str | None:
+        """The speaker with the most speech, or ``None`` for an empty transcript."""
+        speakers = self._speaker_order(transcript.segments)
+        if not speakers:
+            return None
+        return max(
+            speakers,
+            key=lambda name: sum(
+                segment.duration
+                for segment in transcript.segments
+                if self._speaker_of(segment) == name
+            ),
+        )
+
+    def _stage_accent_anchor(
+        self, audio_path: Path, transcript: Transcript
+    ) -> dict[str, tuple[Any, str]]:
+        """Resolve the accent clip each voice borrows pronunciation from.
+
+        ``reference-accent`` uses the supplied clip for every speaker. ``native``
+        uses a generated per-language anchor, or - with ``--accent-match`` - a
+        per-speaker anchor whose delivery fits the source voice. The other modes
+        borrow no accent and resolve to nothing.
+
+        The anchor is generated only on a cache miss, so a warm cache never loads
+        the VoiceDesign checkpoint at all.
+        """
+        speakers = self._speaker_order(transcript.segments)
+
+        if self.job.accent_mode == "reference-accent":
+            assert self.job.accent_audio is not None  # guaranteed by JobConfig
+            text = self.job.accent_text or ""
+            self._accents = {name: (self.job.accent_audio, text) for name in speakers}
+            self._accent_records = {
+                name: {
+                    "source": "reference-audio",
+                    "path": str(self.job.accent_audio),
+                    "transcript_provided": bool(text.strip()),
+                }
+                for name in speakers
+            }
+            self._primary_accent = (self.job.accent_audio, text) if speakers else None
+            self._primary_speaker_name = self._primary_speaker(transcript)
+            return dict(self._accents)
+
+        if self.job.accent_mode != "native":
+            self._accents, self._accent_records, self._primary_accent = {}, {}, None
+            self._primary_speaker_name = None
+            return {}
+
+        anchor_root = anchors_dir(self.settings.models_dir)
+        matched = self.job.accent_match != "off"
+        bands = self._speaker_rate_bands(transcript) if matched else {}
+        genders = (
+            self._speaker_genders(audio_path, transcript)
+            if self.job.accent_match == "gender"
+            else {}
+        )
+
+        accents: dict[str, tuple[Any, str]] = {}
+        records: dict[str, dict[str, Any]] = {}
+        for name in speakers:
+            spec = AnchorSpec(
+                self.job.target_language,
+                rate_band=bands.get(name) if matched else None,
+                gender=genders.get(name) if matched else None,
+            )
+            wav, txt = ensure_anchor(anchor_root, spec, self._resolve_anchor_engine)
+            accents[name] = (wav, txt.read_text(encoding="utf-8"))
+            records[name] = {
+                "source": "anchor-matched" if matched else "anchor",
+                "path": str(wav),
+                "language": spec.language,
+                "rate_band": spec.rate_band,
+                "gender": spec.gender,
+                "transcript_provided": True,
+            }
+            self.log.info(
+                "Accent anchor for %s: %s%s",
+                name,
+                wav.name,
+                (
+                    f" (rate {spec.rate_band}, gender {spec.gender or 'u'})"
+                    if matched
+                    else ""
+                ),
+            )
+
+        self._accents = accents
+        self._accent_records = records
+        primary = self._primary_speaker(transcript)
+        self._primary_speaker_name = primary
+        self._primary_accent = accents.get(primary) if primary is not None else None
+        return dict(accents)
+
     def _blend_stats(self) -> dict[str, Any] | None:
         """How the blended reference was chosen, or ``None`` when it was not used.
 
         Re-derived from ``blend.json`` rather than held in memory, so a run served
         from cache still reports the strategy behind the voice it is reusing.
         """
-        if self.job.accent_mode != "reference-accent":
+        if self.job.accent_mode not in ("native", "reference-accent"):
             return None
         if self.job.accent_blend_mode != "two-stage":
             return {"strategy": "single-stage"}
@@ -1371,26 +1599,31 @@ class Pipeline:
             for name, (donor, info) in self._donors_resolved.items()
         }
 
-    def _stage_blend(self, audio_path: Path, transcript: Transcript) -> dict[str, Path]:
+    def _stage_blend(
+        self,
+        audio_path: Path,
+        transcript: Transcript,
+        accents: Mapping[str, tuple[Any, str]] | None = None,
+    ) -> dict[str, Path]:
         """Render a blended reference per speaker, for the two-stage accent path.
 
         Returns speaker to clip path, empty when the configured mode needs none.
-        Each voice is reconciled with the *same* accent clip but its own embedding,
-        so codes and speaker embedding agree per voice. Cached as a set, because
-        these clips fix the voice of the whole video: regenerating them would make
-        an otherwise identical rerun sound like different people.
+        Each voice is reconciled with its own accent clip but its own embedding, so
+        codes and speaker embedding agree per voice. Cached as a set, because these
+        clips fix the voice of the whole video: regenerating them would make an
+        otherwise identical rerun sound like different people.
         """
-        if self.job.accent_mode != "reference-accent":
+        if self.job.accent_mode not in ("native", "reference-accent"):
             return {}
         if self.job.accent_blend_mode != "two-stage":
             return {}
 
+        resolved = dict(accents) if accents is not None else dict(self._accents)
         speakers = self._speaker_order(transcript.segments)
         outputs = _blend_paths(self.job_dir, speakers)
         info_path = self.job_dir / _BLEND_INFO_NAME
 
         def build() -> dict[str, Path]:
-            assert self.job.accent_audio is not None  # guaranteed by JobConfig
             engine = self._resolve_tts()
             donors = self._resolve_donors(audio_path, transcript)
             target_ratio = self.job.resolved_blend_ratio
@@ -1398,9 +1631,10 @@ class Pipeline:
             stats: dict[str, Any] = {}
             for name in speakers:
                 donor, _donor_info = donors[name]
+                accent_audio, accent_text = resolved[name]
                 blended = engine.build_blended_reference(
-                    accent_audio=self.job.accent_audio,
-                    accent_text=self.job.accent_text or "",
+                    accent_audio=accent_audio,
+                    accent_text=accent_text,
                     language=self.job.target_language,
                     timbre=donor,
                     timbre_audio=self.job.ref_audio,
@@ -1532,21 +1766,25 @@ class Pipeline:
         changes - which is the whole cost of multi-speaker synthesis.
         """
         donor, info = donor_entry if donor_entry else (None, {})
-        if self.job.accent_mode == "reference-accent":
-            assert self.job.accent_audio is not None  # guaranteed by JobConfig
+        if self.job.accent_mode in ("native", "reference-accent"):
+            # The accent source is resolved once by the accent stage; a speaker's
+            # own matched anchor (or the shared supplied clip) lives in ``_accents``.
+            accent_audio, accent_text = self._accents.get(
+                name, (self.job.accent_audio, self.job.accent_text or "")
+            )
             blend = blends.get(name)
             if blend is not None:
-                engine.prepare_prompt_from_file(blend, self.job.accent_text or "")
+                engine.prepare_prompt_from_file(blend, accent_text)
                 return
             self.log.info(
                 "Hybrid voice for %s: timbre from %s, accent from %s",
                 name,
                 info.get("path") or f"segment {info.get('segment_id')}",
-                self.job.accent_audio,
+                accent_audio,
             )
             engine.prepare_hybrid_prompt(
-                accent_audio=self.job.accent_audio,
-                accent_text=self.job.accent_text or "",
+                accent_audio=accent_audio,
+                accent_text=accent_text,
                 timbre=donor,
                 timbre_audio=self.job.ref_audio,
             )
@@ -1633,12 +1871,9 @@ class Pipeline:
             _donor, info = donors.get(name, (None, {}))
             record: dict[str, Any] = dict(info)
             record["accent_mode"] = self.job.accent_mode
-            if self.job.accent_audio is not None:
-                record["accent"] = {
-                    "source": "reference-audio",
-                    "path": str(self.job.accent_audio),
-                    "transcript_provided": bool((self.job.accent_text or "").strip()),
-                }
+            accent_record = self._accent_records.get(name)
+            if accent_record is not None:
+                record["accent"] = accent_record
             if isinstance(blend_info, dict):
                 # Two-stage records statistics per speaker; single-stage only knows
                 # the strategy, which is the same for everyone.
@@ -2140,6 +2375,32 @@ class Pipeline:
             "asr_compute_type": resolve_compute_type(asr_device(self.job.device)),
         }
 
+    def _tts_stats(self) -> dict[str, Any]:
+        """How synthesis batched, and how close to the memory ceiling it ran.
+
+        The peak comes from the device counter rather than the engine, so a job
+        served partly from cache still reports the number that matters. A fully
+        cached job reports zero batches — the honest answer, since nothing was
+        synthesised this time. Recorded because a thrashing run leaves artifacts
+        that otherwise look clean: the allocator recovers internally, so no error
+        ever reaches the pipeline.
+        """
+        stats: dict[str, Any] = {
+            "batch_size": self.job.tts_batch,
+            "max_decode_seconds": round(MAX_DECODE_SECONDS, 2),
+            "reference_seconds": None,
+            "seconds_per_char": None,
+            "batches": 0,
+            "peak_batch_seconds": 0.0,
+            "oom_retries": 0,
+            "cache_releases": 0,
+            "ceiling_shrinks": 0,
+            "peak_reserved_bytes": None,
+        }
+        if self._tts is not None:
+            stats.update(self._tts.synthesis_stats())
+        return stats
+
     def _build_report(
         self,
         timeline: Timeline,
@@ -2215,6 +2476,10 @@ class Pipeline:
             "accent_mode": self.job.accent_mode,
             #: Which device and precision the models ran on.
             "device": self._device_info(),
+            #: How synthesis batched, and the memory it actually reached. A run
+            #: that quietly retried around an out-of-memory error shows up here
+            #: rather than only in the allocator's own log lines.
+            "tts": self._tts_stats(),
             "donor": self._donor_info(),
             #: Which voices were found and how much each of them said. ``None``
             #: when the video has one speaker, so single-speaker reports are

@@ -24,13 +24,22 @@
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
 | Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
 | Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
+| Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 825 passing | `tests/` |
+| Tests | ✅ 930 passing | `tests/` |
 
 Verification performed:
 
 - Full pytest suite green (no GPU, models or ffmpeg needed — heavy parts are faked).
+- **Blend strength A/B** (2026-09-29, `input/veo-studio-creation.mp4`, 8 s, 2 lines,
+  same 4.7 s donor, `native` unless stated): a human accent clip clears a
+  `donor_ratio` of 0.8 in one pass (0.8992), the generated anchor reached only 0.861
+  after eight passes at a 0.9 target, and under the old 0.7 default it stopped at
+  0.79 — the setting whose voice a listener called lost. `--accent-match gender`
+  measured *worst* (0.7571, margin −0.001) and returned a slow anchor; so it is an
+  accent lever, not a timbre one. Defaults are now `--blend-ratio 0.85`,
+  `--blend-iters 5`; a plain `native` run with them landed at 0.8989 on pass one.
 - `ffmpeg` integration exercised against real `ffmpeg` 4.4.2: probe, audio extract
   (48 kHz mono), and mux with `-c:v copy`.
 - `rubberband` 2.0.0 verified: `--time 1.10` on a 2.000 s clip yields 2.200 s, so
@@ -530,9 +539,10 @@ per-segment, so all diarization has to produce is a *label* per segment:
   with the text by construction. A segment is never split — a line is assigned,
   not re-cut — which is what keeps `02_transcript.json` and the subtitles valid.
 - Average-linkage AHC over cosine distance, then clusters shorter than
-  `--min-speaker-seconds` (3.0) are folded into their nearest neighbour: below the
-  3 s donor window there is no voice to clone, so such a cluster is noise, not a
-  speaker.
+  `--min-speaker-seconds` are folded into their nearest neighbour: below the 3 s
+  donor window there is no voice to clone, so such a cluster is noise, not a
+  speaker. (The default was 3.0 when this was written and is 20.0 now — see §3.4 —
+  because a donor of a second or two exists but does not describe a voice.)
 - Labels are assigned by **first appearance**, so `SPK_0` is whoever talks first
   and a rerun numbers them the same way.
 - A segment whose embedding fails inherits the previous segment's speaker, and a
@@ -1068,6 +1078,106 @@ used the way a second person would use it:
    because a dedicated single-job tool asking an unanswerable question should say
    so; only the gate degrades.
 
+### P8 — Long-video memory: the allocator, not the video (IMPLEMENTED)
+
+**The gap.** The DoD asks for a ≤10-minute video on one RTX 3060 without OOM. The
+longest run was 4:47, and it hit `CUDACachingAllocator` OOM retries that the
+batch-halving fallback absorbed. An 11-minute job (`input/louisavy-11m.mp4`, 476
+segments, English → French, ~58 min wall) turned that into a measurement.
+
+**What the log said.** During synthesis, hundreds of lines like:
+
+```
+[W CUDACachingAllocator.cpp:3934] memory allocation failed with OOM on device 0
+  while trying to allocate 1639972864 bytes (free: 1209729024, total: 12744982528)
+```
+
+Three numbers, and they are the whole diagnosis:
+
+| | bytes | GiB |
+|---|---|---|
+| Card total | 12,744,982,528 | 11.87 |
+| Free at the failure | 1,209,729,024 | **1.13** |
+| Requested tensor | 1,639,972,864 … 1,723,858,944 | **1.53 – 1.61** |
+
+Every failing request was ~0.4 GiB larger than the *entire* free memory on the
+card, and the bursts repeated hundreds of times in ~15 ms at a constant `free:`
+value. The job still finished: the allocator recovers internally, so no exception
+ever reached `TTSEngine._generate` — which is why the existing halving fallback
+never ran, and why `report.json` looked perfectly clean. Retrying at that edge is
+one unlucky batch away from a failed run.
+
+**Two causes, both structural.**
+
+1. **The clone prompt's reference is decoded once per line.**
+   `generate_voice_clone` concatenates the prompt's `ref_code` onto *every* line's
+   codes and only trims the reference back off the waveform afterwards, so a batch
+   of eight lines cloned from an 21 s clip decodes ~170 s of audio however short
+   the lines are. Measured directly (real checkpoint, the job's own blend clip as
+   prompt, RTX 3060 bfloat16):
+
+   | Lines in one call | Audio produced | Peak reserved |
+   |---|---|---|
+   | 1 | 0.2 s | 4.67 GiB |
+   | 2 | 0.5 s | 5.33 GiB |
+   | 4 | 1.3 s | 6.74 GiB |
+   | 8 | 3.0 s | **9.55 GiB** |
+
+   ~0.65 GiB per line, set by the reference length, essentially independent of what
+   the lines produce. The first fix attempt — capping the *lines'* predicted
+   duration — changed nothing (`peak_reserved_bytes` 11.55 → 11.58 GiB, failures
+   66 on the next run), because the reference term dominates.
+2. **Nothing was released between batches.** `release_gpu_memory()` ran at stage
+   boundaries and inside the OOM handler only, so across hundreds of calls the
+   caching allocator accumulated a pool that had free memory in it but no block
+   large enough for the next request. Free memory was measured as low as 54 MB.
+
+**The fix.**
+
+| Change | Where |
+|---|---|
+| A batch is budgeted in **decoded** audio: the reference is charged to every line on top of the lines' predicted duration | `TTSEngine._take_batch` |
+| A measured **ceiling** (`0.7` of the card): a call whose peak exceeds it halves the size of everything after it, and never grows back | `TTSEngine._adapt_batch_size`, `_resolve_ceiling` |
+| Cached blocks go back to the driver when free memory falls below 3 GB | `TTSEngine._release_when_tight` |
+| `configure_allocator()` applies `PYTORCH_ALLOC_CONF=expandable_segments:True` for CUDA runs, before the first allocation; an explicit user value always wins, and ROCm/XPU/CPU are untouched | `pipeline/config.py`, called from `Pipeline.run()` and both audit CLIs |
+| A batch that OOMs shrinks `batch_size` **for the rest of the run**, and batches are taken lazily so the smaller size applies to them | `TTSEngine._generate`, `synthesize` |
+| `--tts-batch` (default 8) is the manual ceiling | `JobConfig.tts_batch` |
+| `report.json` → `tts` records `oom_retries`, `ceiling_shrinks`, `cache_releases`, `reference_seconds`, `seconds_per_char`, `peak_batch_seconds` and `peak_reserved_bytes` | `Pipeline._tts_stats` |
+
+**Three attempts, two of them wrong** - recorded because the wrong ones are
+instructive. Budgeting the *lines'* predicted duration changed nothing: failures
+went 66 -> 72 and the peak reserved went 11.55 -> 11.58 GiB, because the lines were
+never the term that mattered. Only after reading `generate_voice_clone` and
+measuring the prompt itself did the reference-per-line cost appear (table above).
+
+**Verified on the 11-minute job** (`input/louisavy-11m.mp4`, 476 lines, English ->
+French, RTX 3060, bfloat16, with `--min-speaker-seconds 20` so synthesis is reached
+in minutes instead of an hour):
+
+| | Before the fix | After |
+|---|---|---|
+| `CUDACachingAllocator` failures | thousands | **0** |
+| `report.json` -> `tts` | *absent* | `batch_size 2`, `reference_seconds 17.2`, `seconds_per_char 0.0536`, `batches 267`, `peak_batch_seconds 13.04`, `oom_retries 0`, `cache_releases 1`, `ceiling_shrinks 1`, `peak_reserved_bytes 10,053,746,688` |
+| Peak memory held | 11.55 GiB of 11.87 | **9.36 GiB** |
+| Synthesis stage | 393 s, with 66 failures | 616 s, with none |
+
+`ceiling_shrinks 1` is the controller visible in the log:
+
+```
+A batch of 4 line(s) filled 9.4 GiB, past the 8.3 GiB ceiling for this card; using 2 line(s) per batch from here on.
+```
+
+The halving follows the batch that **overshot**, not the configured cap: halving the
+cap would have left the next batch as large as the one that just filled the card, and
+the earlier version of this rule needed two shrinks where this one needs one. It
+never grows back, so a run cannot oscillate around the edge.
+
+**The cost is real and is the trade.** Synthesis went from 393 s to 616 s: 0.65 GiB
+of reference decoding per line is not negotiable, so the choice is between more model
+calls and a full card. On a card with room the controller never fires and nothing
+changes; on this 12 GB card a long job now costs ~55% more synthesis time than the
+version that failed 66 allocations.
+
 ### Still open (verified against the code, 2026-09-28)
 
 The capability work is implemented; this is the verified remainder, so the table
@@ -1098,12 +1208,11 @@ above is not read as "finished".
 
 **Phases not started**
 
-- **P2** native accent (VoiceDesign anchor + voice conversion) — `tts_voice_design` is
-  registered in `pipeline/models.py` but unused, and there is no per-speaker
-  `accent: preserve | native` knob.
 - **P3** model bake-off harness — the only remaining P3 item.
 - **P4** lip sync, **P5** multi-source-language (per-utterance LID), **P6**
   service-ification (FastAPI + Celery/Redis).
+- **P2's remaining nicety**: the optional voice-conversion path is unnecessary —
+  the generated anchor supplies native prosody directly — so P2 is closed.
 
 **Engineering standards** (`.agents/technical-guidelines.md`, tracked separately)
 
@@ -1143,7 +1252,7 @@ voice timbre**, ideally with the **target language's accent**.
 | D6 | Lip sync | **Out of MVP** (dub audio only) | Most expensive stage (~10–60× real-time) |
 | D7 | Translation engine | OpenAI-compatible client → local `llama-server` or cloud | Satisfies D-AGENTS requirement, swappable by config |
 | D8 | TTS | Qwen3-TTS Base (`generate_voice_clone`) | Already proven working in this repo |
-| D9 | Accent default | `preserve` (clone source speaker directly) | Matches D1; `native` mode comes in P2 |
+| D9 | Accent default | `native` — a generated per-language accent anchor supplies pronunciation, the source speaker supplies timbre; `--accent-match rate|gender` fits the anchor to the source voice | Supersedes the earlier `preserve` default. VoiceDesign makes D1's native accent the zero-input default without shipping a voice per language: one checkpoint plus a small text table yields all ten anchors, cached under `models/anchors/`. `preserve` / `speaker-only` / `reference-accent` remain as opt-ins, and the blend knobs now cover `native` too |
 | D10 | `reference-accent` prompt | **Two-stage** by default: reconcile accent + timbre into one clip, then clone from it | Conditioning each line on two disagreeing sources lets sampling pick the winner per line, which is heard as the speaker changing mid-video. Kept `--accent-blend single-stage` as a documented escape hatch for A/B |
 | D11 | Blend strength | **Iterate Stage 1 and stop on a measured target**: `--blend-ratio 0.5` (position between the accent voice at 0 and the speaker's own voice at 1), capped by `--blend-iters 4` | One pass is biased toward the accent clip by construction (a ~165-token in-context example versus a single embedding token), which left the speaker's voice barely audible. The target is measured on a language-matched scale — the donor anchor is the donor's voice speaking the target language in x-vector mode — because a similarity against the source-language donor measures the language gap too. Defaults change behaviour and cost: every `reference-accent` run now iterates |
 | D12 | Diarization | **Embed and cluster ASR segments** with `funasr` + ERes2NetV2 (`iic/speech_eres2netv2_sv_zh-cn_16k-common`), `--speaker-threshold 0.40` | Measured against the repo's two-person clip rather than assumed: reusing the Qwen3-TTS cloning encoder was **refuted** (all pairs 0.963–0.991, no merge gap) and `wespeaker` is not on PyPI. ERes2NetV2 separates the same clip at 0.341–0.874 with a merge plateau (flat to 0.379, then 0.468), so a constant threshold is defensible. Embedding the existing segments avoids a second segmentation pass, which is what keeps the labels aligned with the text instead of re-cutting lines |
@@ -1167,8 +1276,9 @@ voice timbre**, ideally with the **target language's accent**.
 - Single source language (auto-detected at video level, overridable by flag).
 - One speaker, or several via diarization; target language **French**.
 - Voice cloning with the speaker's own timbre.
-- Accent handling: `preserve` (default), `speaker-only`, or `reference-accent`
-  (borrow a native clip's pronunciation while keeping the voice's timbre).
+- Accent handling: `native` (default — a generated accent anchor for pronunciation,
+  the speaker's own timbre), `preserve`, `speaker-only`, or `reference-accent`
+  (borrow a supplied native clip's pronunciation while keeping the voice's timbre).
 - Overlong lines repaired by re-wording rather than by cutting speech (`--refine`).
 - Overlapping-speech separation: a segment carrying two voices is split with
   SepFormer and both voices are dubbed (`--overlap separate`).
@@ -1176,13 +1286,12 @@ voice timbre**, ideally with the **target language's accent**.
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
-- Fully automatic native accent: `reference-accent` needs a supplied clip, so an
-  unattended native-accent path via voice conversion is still P2.
-- Iterative length-control loop, reverb/loudness matching, QC metrics (P3).
+- Iterative length control, reverb/loudness matching, QC metrics (P3).
   The length-repair half is now implemented (see the P3 section above), and both
   loudness matching and room matching ship (`--room match`, P3d). The automated QC
   gate is implemented too (P3e); only the model bake-off harness remains.
 - Lip sync (P4), multi-source-language videos (P5), service-ification (P6).
+  (Fully automatic native accent is no longer deferred: it is the default.)
 
 ### 3.2 Pipeline
 
@@ -1292,18 +1401,19 @@ source_language: null            # auto-detect when null
 # Voice reference
 ref_audio: null                  # auto-select a donor from the video when null
 ref_text: null                   # required with ref_audio in `preserve` mode
-accent_mode: preserve            # preserve | speaker-only | reference-accent
+accent_mode: native              # native | preserve | speaker-only | reference-accent
+accent_match: off                # off | rate | gender (native only)
 accent_audio: null               # required for reference-accent
 accent_text: null                # required with accent_audio
 accent_blend: two-stage          # two-stage | single-stage
 blend_takes: 3                   # first-pass candidates
-blend_iters: 4                   # max passes pulling toward the speaker
-blend_ratio: 0.5                 # stop target; 0 disables the search
+blend_iters: 5                   # max passes pulling toward the speaker
+blend_ratio: 0.85                # stop target; 0 disables the search
 
 # Speakers
 diarizer: auto                   # auto | none (none = every line in one voice)
-speaker_threshold: 0.40          # cosine distance above which voices differ
-min_speaker_seconds: 3.0         # shorter clusters join their nearest neighbour
+speaker_threshold: 0.70          # cosine distance above which voices differ
+min_speaker_seconds: 20.0        # shorter clusters join their nearest neighbour
 
 # Overlapping speech
 overlap: dominant                # dominant | separate (--overlap)
@@ -1312,7 +1422,7 @@ overlap_separator: auto          # auto | sepformer | none
 # Timing
 min_stretch: 0.85
 max_stretch: 1.18
-length_budget: off               # off | words
+length_budget: words             # off | words
 
 # Length repair
 refine: true
@@ -1344,6 +1454,7 @@ device: auto                     # auto | cpu | cuda | cuda:N | mps | xpu
 dtype: auto                      # auto | bf16 | fp16 | fp32
 whisper_model: large-v3
 llm_model: null                  # overrides LLM_MODEL for this run
+tts_batch: 8                     # line-count ceiling on a synthesis batch
 keep_subtitles: true
 output_dir: output/
 force: false                     # ignore the stage cache
@@ -1397,9 +1508,12 @@ enforced; that gap sits outside this roadmap and is tracked separately.
 - Quality signals thresholded into a gate rather than inspected by hand ✅
   (`audit_qc.py`, P3e). The gate reports; it does not block delivery, so a
   failure is a verdict on the finished job rather than a lost run.
-- Handles a ≤ 10-minute video on one RTX 3060 without OOM — ⚠️ **unverified**.
-  The longest real run is 4:47, and it still hit `CUDACachingAllocator` OOM
-  retries during synthesis, which the batch-halving fallback absorbed.
+- Handles a ≤ 10-minute video on one RTX 3060 without OOM — ✅ **verified at 11
+  minutes** (P8). The batch ceiling is measured rather than fixed, cached blocks
+  are returned to the driver under pressure, and the allocator runs with
+  expandable segments. `report.json` → `tts.oom_retries` is the number to check;
+  the 11-minute run reports `0` where it previously flooded the log with failed
+  1.6 GiB allocations.
 - Runs on hardware other than the author's — **verified on CPU and on the
   float16 path**. The device *rules* are proven for every profile
   (`tests/test_device.py`, fake hardware), and there are now four real end-to-end
@@ -1414,6 +1528,7 @@ cell that has not been run is `unverified`, never assumed.
 
 | Hardware | Runs end to end | Sync (`shifted_segments`) | Truncation (`worst_line_deleted_ratio`) | Loudness (dB vs source) | Timbre | Wall clock | Peak memory |
 |---|---|---|---|---|---|---|---|
+| RTX 3060, bfloat16, CUDA | ✅ 11:00 video, 476 lines, `min-speaker-seconds 20` | 0.000 s | 64.7% worst line, 21.6 s cut - the *translation* is too long for its slots (unrelated to memory; text identical to the pre-fix run) | −0.0 | not audited | **~21 min** (1258 s, incl. 241 s of blend for the parked 4-voice issue) | **9.36 GiB reserved, 0 OOM failures** |
 | RTX 3060, bfloat16, CUDA | ✅ 4:47 TED + 60 s clip | 0.000 s | 0% with `--refine` | −0.0 | 0 lines closer to accent | 2× realtime | ⚠️ OOM retries |
 | 12-core CPU, float32, `preserve` | ✅ 22.1 s clip (`change-the-world.mp4`) | 0; 1.84 s spilled into pauses, 0.00 s trimmed | 0.0%; 0 lines over 10% | −0.0 | n/a — needs a `reference-accent` job | **2:10** (130 s), 0.17× realtime | **12.7 GB** RSS |
 | 12-core CPU, float32, `reference-accent` | ✅ same clip, accent clip + transcript | 0; 0.00 s overrun, 0.00 s trimmed | 0.0%; 0 lines over 10% | +0.08 | **0 of 5** lines closer to the accent voice; margin median +0.0513 on a ±0.056 scale | **5:18** (318 s), 0.07× realtime | **17.2 GB** RSS |
@@ -1513,7 +1628,7 @@ faster-whisper), or `".[full]"` for all of them.
 |-------|-------|---------------|------------|
 | **P0** | MVP (this doc §3) | Single-speaker dub, French, no lip sync | — |
 | **P1** | Multi-speaker + background | Diarization **done**, voice bible **done**, per-speaker cloning **done**, overlap detection **done**, overlapping-speech separation **done** | M |
-| **P2** | Native accent | Supplied-clip accent **done**; remaining: VoiceDesign anchor + voice conversion, per-speaker knob | M |
+| **P2** | Native accent | **done** — generated anchor by default, per-speaker `--accent-match` | M |
 | **P3** | Quality & timing | Isochrony loop, room matching (P3d) and the automated QC gate (P3e) **done**; remaining: the model bake-off harness | M |
 | **P4** | Lip sync | LatentSync/MuseTalk, gated on face visibility | L |
 | **P5** | Multi-source-language | Per-utterance LID, per-segment source language | S–M |
@@ -1549,15 +1664,38 @@ faster-whisper), or `".[full]"` for all of them.
 **P1 is complete**: overlapping speech is detected (P1b) *and*, with `--overlap
 separate`, split so both voices are dubbed (P1c).
 
-### P2 — Native target accent (nice-to-have per D1)
+### P2 — Native target accent (IMPLEMENTED)
 
-- **Accent anchor**: download `Qwen3-TTS-12Hz-1.7B-VoiceDesign`; generate a
-  native-target reference with an accent description ("voix masculine, français
-  natif, accent parisien").
-- **Voice conversion**: Seed-VC / kNN-VC to swap source timbre onto the
-  native-accent synthesis.
-- **Product knob**: per-video and per-speaker `accent: preserve | native`.
-- **Output**: their voice, native target accent.
+**The gap.** Native accent was a nice-to-have (D1) because it seemed to need a
+native recording per language, or a voice-conversion stage. The VoiceDesign
+checkpoint removes both: it synthesises speech from a text *description*, so one
+model yields an accent anchor for every supported language.
+
+**What ships.**
+
+- **Accent anchor** (`pipeline/anchors.py`): a short, phonetically varied passage
+  per language (`ANCHOR_TEXT`) is rendered once by
+  `Qwen3-TTS-12Hz-1.7B-VoiceDesign` with a style description (`instruct_for`) and
+  cached under `models/anchors/`. The anchor is used exactly like a supplied
+  `--accent-audio` clip: it feeds the existing two-stage blend, so no new synthesis
+  path was needed.
+- **Lazy generation**: `ensure_anchor` builds the engine only on a cache miss, so a
+  warm cache never loads the checkpoint, and the two TTS models are never resident
+  together (`_stage_accent_anchor` releases the GPU before the blend loads base).
+- **Setup path**: `dub.py anchors --generate [--lang …]` / `--list` pre-warms
+  anchors explicitly; a run generates a missing one lazily instead of failing the
+  setup step.
+- **Product knob**: `--accent-mode native` is the default; `--accent-match
+  off|rate|gender` generates a **per-speaker** anchor whose delivery fits the
+  source: `rate` from the speaker's measured words-per-second, `gender` from a
+  median-F0 estimate. Anchors are keyed by `(language, rate_band, gender)`.
+- **Word budget**: because a target-language anchor always exists, `--length-budget
+  words` is now the default, so the translator gets an actionable ceiling.
+
+**Output**: their voice, native target accent, with no user-supplied clip.
+
+The exported ``--accent-mode reference-accent`` with a supplied clip remains for
+users who want to choose the accent themselves.
 
 ### P3 — Quality & timing
 

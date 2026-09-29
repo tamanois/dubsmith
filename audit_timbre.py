@@ -53,6 +53,7 @@ import sys
 from pathlib import Path
 
 from pipeline.audit import audit_job
+from pipeline.config import configure_allocator
 from pipeline.errors import AuditError
 from pipeline.tts import TTSEngine
 
@@ -126,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(f"Loading {model_dir.name} ...", flush=True)
+    # Before the model loads: torch reads the allocator setting at the first
+    # allocation, so a long audit would otherwise never see it.
+    configure_allocator(args.device)
     engine = TTSEngine(model_dir, device=args.device)
 
     results = []

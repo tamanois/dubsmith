@@ -53,11 +53,15 @@ SPEAKER_RATE = 16_000
 DEFAULT_MODEL_ID = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 
 #: Cosine *distance* at which two cluster averages are considered different
-#: voices, for average-linkage clustering. Calibrated on the repo's two-speaker
-#: clip, where the merge profile was flat to 0.379 and then jumped to 0.468 - so
-#: anything in that gap returns the same two speakers. That plateau is what makes
-#: a constant defensible; ``--speaker-threshold`` exposes it for other material.
-DEFAULT_THRESHOLD = 0.40
+#: voices, for average-linkage clustering. Measured, not assumed: on the 11-minute
+#: job the previously calibrated 0.40 split the video into 42 voices, while 0.70
+#: returned the 5 people actually in it - and a listener confirmed that as the
+#: point where the extra voices stopped appearing. It holds up as a constant
+#: because real material plateaus rather than slides (the repo's two-speaker clip
+#: was flat to 0.379 and then jumped to 0.468), so a value inside the plateau is
+#: no more arbitrary than one at its edge; ``--speaker-threshold`` exposes it for
+#: other material.
+DEFAULT_THRESHOLD = 0.7
 
 #: A cluster shorter than this cannot supply a usable clone prompt - the donor
 #: window starts at 3 s - so it is folded into the nearest other cluster instead

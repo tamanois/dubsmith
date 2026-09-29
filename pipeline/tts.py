@@ -24,9 +24,17 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+import soundfile as sf
 
 from .asr import Segment
-from .config import pick_dtype, release_gpu_memory
+from .config import (
+    device_free_bytes,
+    peak_reserved_bytes,
+    pick_dtype,
+    probe_device,
+    release_gpu_memory,
+    reset_peak_reserved,
+)
 from .errors import DependencyError, TTSError
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +46,7 @@ __all__ = [
     "select_donor",
     "score_candidate",
     "TTSEngine",
+    "VoiceDesignEngine",
     "resolve_dtype",
 ]
 
@@ -50,6 +59,38 @@ IDEAL_DONOR_S = 8.0
 #: Rate the checkpoint's speaker encoder expects. ``extract_speaker_embedding``
 #: asserts on it, so any clip scored against a prompt embedding must be resampled.
 SPEAKER_ENCODER_RATE = 24_000
+
+#: Free-memory floor below which a batch hands cached blocks back to the driver.
+#: Set from the failure, not by taste: on the 11-minute run a 0.8-2.4 GiB request
+#: failed with free memory as low as 54 MB, i.e. the batch had started with barely
+#: more than the old 1.5 GB floor. Releasing at 3 GB means a batch starts with room
+#: for the transient tensors it is about to ask for. Costs milliseconds.
+MEMORY_FLOOR_BYTES = 3_000_000_000
+
+#: Total audio the decoder may be asked to process in one call, in seconds -
+#: **including the clone prompt's reference, which is decoded once per line**.
+#: ``generate_voice_clone`` concatenates ``ref_code`` onto every line's codes and
+#: only trims the reference back off the waveform afterwards, so a batch of eight
+#: lines cloned from a 21 s blend clip decodes ~170 s of audio however short the
+#: lines are. Measured (RTX 3060, bfloat16, 2026-09-28): the peak grows by
+#: ~0.65 GiB per line at that reference length, and this budget keeps a batch near
+#: 85 s of decoded audio, which measured 6.7 GiB of an 11.87 GiB card.
+MAX_DECODE_SECONDS = 85.0
+
+#: Fraction of the card a batch may fill before the following ones are made
+#: smaller. The peak is not predictable from the text - it depends on the
+#: reference length, the dtype and the card - so it is measured per batch and this
+#: is the one rule applied to the measurement. 0.7 of an 11.87 GiB card is ~8.3 GiB,
+#: which left 3.5 GiB free for the largest transient requests observed (2.3 GiB).
+MEMORY_CEILING_FRACTION = 0.7
+
+#: Ceiling used when the card's own size cannot be read.
+DEFAULT_MEMORY_CEILING_BYTES = 8_000_000_000
+
+#: Seconds of output assumed per character before any batch has been measured.
+#: Only a seed for the first batch of a run: the engine then uses what it actually
+#: produced, so the estimate converges on the language and delivery at hand.
+_SEED_SECONDS_PER_CHAR = 0.07
 
 #: A reference clip as the checkpoint accepts it: a path, or raw samples and rate.
 #: Iteration needs the second form, because the previous blend exists only in
@@ -289,6 +330,23 @@ def _reference_audio(value: ReferenceAudio) -> Any:
     return str(value)
 
 
+def _audio_seconds(value: ReferenceAudio) -> float:
+    """Duration of a reference clip, or ``0.0`` when it cannot be measured.
+
+    Only ever used to charge a batch for the audio the decoder will be handed, so
+    an unmeasurable clip is charged nothing rather than failing: the measured
+    memory ceiling below still catches a batch that turns out too large.
+    """
+    if isinstance(value, tuple):
+        samples, rate = value
+        return float(len(samples)) / float(rate or 1)
+    try:
+        return float(sf.info(str(value)).duration)
+    except Exception:  # noqa: BLE001 - a reference clip may be a URL or a stream
+        _LOGGER.debug("Could not measure the reference clip %s", value, exc_info=True)
+        return 0.0
+
+
 def _donor_ratio(
     candidate: np.ndarray,
     accent_embedding: np.ndarray | None,
@@ -389,12 +447,39 @@ class TTSEngine:
         device: str = "auto",
         dtype: Any | None = None,
         batch_size: int = 8,
+        max_decode_seconds: float = MAX_DECODE_SECONDS,
         x_vector_only: bool = False,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.device = device
         self._dtype = dtype
         self.batch_size = max(1, int(batch_size))
+        #: The cap the user asked for, which the measured ceiling may shrink from.
+        self.max_batch_size = self.batch_size
+        #: Longest decoded audio one batch may ask for; see
+        #: :data:`MAX_DECODE_SECONDS`. A single line over budget still goes out
+        #: alone, because text cannot be split.
+        self.max_decode_seconds = max(1.0, float(max_decode_seconds))
+        #: Length of the clone prompt's reference, which the checkpoint decodes once
+        #: per line. Set by the ``prepare_*`` calls, and ``0.0`` when the prompt
+        #: carries no speech codes (x-vector mode), where nothing is decoded on the
+        #: line's behalf.
+        self.reference_seconds = 0.0
+        #: Seconds of output per character of text: seeded, then measured from what
+        #: the model actually produces. Only ever used to size a batch.
+        self._seconds_per_char = _SEED_SECONDS_PER_CHAR
+        #: How much of the card a batch may fill, resolved from the card on first
+        #: use. ``None`` off CUDA, where nothing is measured.
+        self.memory_ceiling: int | None = None
+        #: How often the run hit the ceiling or the allocator, and how often it
+        #: handed cached blocks back. A thrashing run used to leave artifacts that
+        #: looked clean, so these travel to ``report.json`` rather than the log.
+        self.oom_retries = 0
+        self.cache_releases = 0
+        self.ceiling_shrinks = 0
+        self.batches = 0
+        self.peak_batch_seconds = 0.0
+        self.peak_reserved = 0
         #: Use only the reference's speaker embedding, ignoring its speech codes.
         #: ICL mode (False) also conditions on the reference phonetics, which is
         #: what carries the speaker's *accent*; speaker-only mode drops those and
@@ -467,6 +552,7 @@ class TTSEngine:
             ref_text=donor.text,
             x_vector_only_mode=self.x_vector_only,
         )
+        self.reference_seconds = 0.0 if self.x_vector_only else donor.duration
 
     def prepare_prompt_from_file(self, ref_audio: Path | str, ref_text: str) -> None:
         """Build the clone prompt from an explicit reference file and transcript."""
@@ -479,6 +565,7 @@ class TTSEngine:
             ref_text=ref_text,
             x_vector_only_mode=self.x_vector_only,
         )
+        self.reference_seconds = 0.0 if self.x_vector_only else _audio_seconds(ref_audio)
 
     def prepare_hybrid_prompt(
         self,
@@ -554,6 +641,10 @@ class TTSEngine:
                 "version may have changed VoiceClonePromptItem."
             ) from exc
         self._prompt = [combined]
+        # The codes the decoder will be handed once per line come from the accent
+        # side, so that clip is what a batch has to be charged for - the timbre
+        # side is an embedding and contributes none.
+        self.reference_seconds = _audio_seconds(accent_audio)
         # Recorded from the items already in hand, so scoring candidate blends
         # against both sources costs no extra encoder pass. The accent item is
         # read after ``replace`` only because the two live in different items -
@@ -626,6 +717,9 @@ class TTSEngine:
                 ref_text="",
                 x_vector_only_mode=True,
             )
+            # x-vector mode carries no speech codes, so nothing is decoded on the
+            # line's behalf and the batch is charged for its own audio only.
+            self.reference_seconds = 0.0
             wavs = self.synthesize([accent_text], language=language)
             anchor = wavs[0] if wavs else None
             if anchor is None or not np.asarray(anchor).size:
@@ -878,19 +972,165 @@ class TTSEngine:
         if not pending:
             return results
 
-        for start in range(0, len(pending), self.batch_size):
-            batch = pending[start : start + self.batch_size]
+        while pending:
+            batch = self._take_batch(pending)
+            self._release_when_tight()
+            # Measured per batch, so the ceiling below reacts to what *this* call
+            # asked for rather than to a high-water mark from earlier in the run.
+            reset_peak_reserved(self.device)
             wavs, sample_rate = self._generate(batch, language)
             if len(wavs) != len(batch):
                 raise TTSError(
                     f"Model returned {len(wavs)} clips for a batch of {len(batch)} lines."
                 )
             self._sample_rate = int(sample_rate)
+            self._observe(batch, wavs, sample_rate)
+            self._adapt_batch_size(len(batch))
             for (index, _), wav in zip(batch, wavs):
                 results[index] = np.ascontiguousarray(
                     np.asarray(wav, dtype=np.float32).reshape(-1)
                 )
+            pending = pending[len(batch) :]
         return results
+
+    def _take_batch(
+        self, pending: Sequence[tuple[int, str]]
+    ) -> list[tuple[int, str]]:
+        """The next batch: bounded by line count *and* by what will be decoded.
+
+        The reference is charged **per line**, because that is how the checkpoint
+        uses it: it concatenates the prompt's speech codes onto every line's codes
+        and decodes the lot, trimming the reference off the waveform afterwards.
+        A 21 s reference therefore costs ~21 s of decoding *per line*, which dwarfed
+        the lines themselves on the 11-minute run and is why capping the lines' own
+        duration alone changed nothing.
+
+        Batches are taken one at a time rather than pre-computed, because the first
+        batch's outcome is what sizes the rest of the run: both an out-of-memory
+        error and the measured ceiling shrink ``batch_size``, and every later batch
+        has to respect the smaller size. A single line over budget still goes out
+        alone - text cannot be split.
+        """
+        batch: list[tuple[int, str]] = []
+        predicted = 0.0
+        for item in pending:
+            seconds = self.reference_seconds + len(item[1]) * self._seconds_per_char
+            if batch and (
+                len(batch) >= self.batch_size
+                or predicted + seconds > self.max_decode_seconds
+            ):
+                break
+            batch.append(item)
+            predicted += seconds
+        return batch
+
+    def _observe(
+        self,
+        batch: Sequence[tuple[int, str]],
+        wavs: Sequence[np.ndarray],
+        sample_rate: int,
+    ) -> None:
+        """Learn how long this text takes, from what was just produced.
+
+        A running average of seconds per character, which is what lets the next
+        batch be sized for the language and delivery actually in use instead of a
+        constant chosen for one of them.
+        """
+        rate = max(1, int(sample_rate))
+        produced = sum(int(np.asarray(wav).size) / rate for wav in wavs)
+        self.batches += 1
+        self.peak_batch_seconds = max(self.peak_batch_seconds, produced)
+        characters = sum(len(text) for _index, text in batch)
+        if characters <= 0 or produced <= 0.0:
+            return
+        observed = produced / characters
+        self._seconds_per_char = (
+            observed
+            if self.batches == 1
+            else ((self._seconds_per_char * (self.batches - 1)) + observed)
+            / self.batches
+        )
+
+    def _release_when_tight(self) -> None:
+        """Hand cached blocks back to the driver before they are needed.
+
+        The allocator keeps freed blocks at the shape they were requested, so after
+        a few hundred batches most of a card can be held in sizes nothing can use —
+        measured as a 1.6 GiB request failing against 1.1 GiB of free memory.
+        Releasing while there is still room is what stops that; waiting for the
+        out-of-memory error is waiting too long.
+        """
+        free = device_free_bytes(self.device)
+        if free is None or free >= MEMORY_FLOOR_BYTES:
+            return
+        if release_gpu_memory():
+            self.cache_releases += 1
+
+    def _resolve_ceiling(self) -> int | None:
+        """How much of the card one batch may fill, or ``None`` off CUDA."""
+        if self.memory_ceiling is None:
+            info = probe_device(self.device)
+            if info.kind not in {"cuda", "rocm"}:
+                return None
+            self.memory_ceiling = (
+                int(MEMORY_CEILING_FRACTION * info.total_memory)
+                if info.total_memory
+                else DEFAULT_MEMORY_CEILING_BYTES
+            )
+        return self.memory_ceiling
+
+    def _adapt_batch_size(self, taken: int) -> None:
+        """Resize the next batch from the memory this one actually used.
+
+        The peak cannot be predicted from the text: the checkpoint decodes the clone
+        prompt's reference once per line, so a batch cloned from a 21 s clip asks for
+        ~21 s of decoding per line however short the lines are. Measured on the
+        11-minute job (RTX 3060, bfloat16): batches of eight lines peaked at
+        9.55 GiB of an 11.87 GiB card and still failed 66 allocations, while batches
+        of four peaked at 6.74 GiB and failed none. Rather than encode that in a
+        constant that would be wrong on another card, dtype or reference length,
+        measure it: a batch that filled more of the card than the ceiling allows
+        halves the size of everything after it. It never grows back, so the run
+        cannot oscillate around the edge.
+
+        The halving applies to ``taken`` - the batch that actually did it - rather
+        than to the configured cap, because the two differ whenever the decoded-audio
+        budget is the binding constraint. On the 11-minute run the first overshoot
+        was a three-line batch against a cap of eight; halving the cap would have
+        left the next batch as large as the one that just overshot.
+        """
+        ceiling = self._resolve_ceiling()
+        peak = peak_reserved_bytes(self.device) if ceiling is not None else None
+        if ceiling is None or peak is None:
+            return
+        self.peak_reserved = max(self.peak_reserved, peak)
+        if peak <= ceiling or self.batch_size <= 1:
+            return
+        self.batch_size = max(1, min(self.batch_size, taken) // 2)
+        self.ceiling_shrinks += 1
+        _LOGGER.warning(
+            "A batch of %d line(s) filled %.1f GiB, past the %.1f GiB ceiling for "
+            "this card; using %d line(s) per batch from here on.",
+            taken,
+            peak / 1024**3,
+            ceiling / 1024**3,
+            self.batch_size,
+        )
+
+    def synthesis_stats(self) -> dict[str, Any]:
+        """What the batching did, for ``report.json``."""
+        return {
+            "batch_size": self.batch_size,
+            "max_decode_seconds": round(self.max_decode_seconds, 2),
+            "reference_seconds": round(self.reference_seconds, 2),
+            "seconds_per_char": round(self._seconds_per_char, 4),
+            "batches": self.batches,
+            "peak_batch_seconds": round(self.peak_batch_seconds, 2),
+            "oom_retries": self.oom_retries,
+            "cache_releases": self.cache_releases,
+            "ceiling_shrinks": self.ceiling_shrinks,
+            "peak_reserved_bytes": self.peak_reserved or None,
+        }
 
     def _generate(
         self,
@@ -919,11 +1159,108 @@ class TTSEngine:
                     ) from exc
                 raise
             release_gpu_memory()
+            self.oom_retries += 1
+            # Remembered rather than re-derived: a batch that did not fit is
+            # evidence about this job's budget, and without it every later batch
+            # asks for the same thing again - which on a long video means paying
+            # the failed allocation hundreds of times over.
+            self.batch_size = max(1, len(batch) // 2)
             _LOGGER.warning(
-                "GPU out of memory on a batch of %d; retrying as two smaller batches.",
+                "GPU out of memory on a batch of %d; retrying as two smaller batches "
+                "and using %d line(s) per batch from here on.",
                 len(batch),
+                self.batch_size,
             )
             midpoint = len(batch) // 2
             first_wavs, first_rate = self._generate(batch[:midpoint], language)
             second_wavs, second_rate = self._generate(batch[midpoint:], language)
             return [*first_wavs, *second_wavs], first_rate or second_rate
+
+
+class VoiceDesignEngine:
+    """Speech synthesiser backed by the Qwen3-TTS VoiceDesign checkpoint.
+
+    Where :class:`TTSEngine` needs a reference recording to clone, this model
+    generates speech from a natural-language *description* - which is what lets a
+    native accent anchor exist for every supported language without shipping a
+    voice per language. It is used only to produce anchors, never the dubbed
+    lines, so the base checkpoint and this one are never needed at the same time.
+    """
+
+    #: Only the VoiceDesign checkpoint implements ``generate_voice_design``.
+    SUPPORTED_MODEL_TYPES = ("voice_design",)
+
+    def __init__(
+        self,
+        model_dir: Path | str,
+        *,
+        device: str = "auto",
+        dtype: Any | None = None,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.device = device
+        self._dtype = dtype
+        self._model: Any | None = None
+
+    @property
+    def model(self) -> Any:
+        """Load the checkpoint on first use and keep it resident."""
+        if self._model is None:
+            self._model = self._load()
+        return self._model
+
+    def _load(self) -> Any:
+        try:
+            from qwen_tts import Qwen3TTSModel
+        except ImportError as exc:  # pragma: no cover - config dependent
+            raise DependencyError(
+                "qwen-tts is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+
+        from .config import resolve_device
+
+        device = resolve_device(self.device)
+        self.device = device
+        model = Qwen3TTSModel.from_pretrained(
+            str(self.model_dir),
+            device_map=device,
+            dtype=self._dtype if self._dtype is not None else resolve_dtype(device),
+            attn_implementation="sdpa",
+            local_files_only=True,
+        )
+        model_type = getattr(model.model, "tts_model_type", None)
+        if model_type not in self.SUPPORTED_MODEL_TYPES:
+            raise TTSError(
+                f"Checkpoint at {self.model_dir} has tts_model_type={model_type!r}, "
+                "which does not support voice design. Use the '-VoiceDesign' "
+                "checkpoint (download with: python dub.py models --download "
+                "tts_voice_design)."
+            )
+        return model
+
+    def generate(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+    ) -> tuple[np.ndarray, int]:
+        """Synthesise ``text`` in the style ``instruct`` describes.
+
+        Returns:
+            ``(samples, sample_rate)`` for a single mono clip.
+
+        Raises:
+            TTSError: If the model returns nothing usable.
+        """
+        wavs, sample_rate = self.model.generate_voice_design(
+            text=text,
+            instruct=instruct,
+            language=language,
+            non_streaming_mode=True,
+        )
+        if not wavs:
+            raise TTSError("The voice-design model returned no audio.")
+        samples = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            raise TTSError("The voice-design model returned an empty clip.")
+        return samples, int(sample_rate)

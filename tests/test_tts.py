@@ -940,6 +940,221 @@ class TestOutOfMemoryHandling:
             engine.synthesize(["a", "b"], language="French")
 
 
+class TestBatchedSynthesis:
+    """Batch sizing: bounded by predicted audio, and reshaped by a failure.
+
+    A long video is what exposes this. The checkpoint decodes a whole batch in one
+    call, so the peak tracks the total *seconds* in the request rather than the
+    number of lines: eight long lines can ask for several GB where eight short ones
+    ask for a few hundred MB, which is how an 11-minute run ended up asking for
+    1.6 GiB against 1.1 GiB of free memory (2026-09-28).
+    """
+
+    class SizedModel(FakeQwenModel):
+        """Produces audio proportional to the text, so the estimate stays put."""
+
+        def __init__(self, seconds_per_char: float = 0.1) -> None:
+            super().__init__()
+            self.seconds_per_char = seconds_per_char
+
+        def generate_voice_clone(self, **kwargs: Any) -> tuple[list[np.ndarray], int]:
+            self.calls.append(kwargs)
+            return [
+                audio(len(text) * self.seconds_per_char) for text in kwargs["text"]
+            ], SR
+
+    def _engine(
+        self, model: FakeQwenModel, device: str = "cpu", **kwargs: Any
+    ) -> TTSEngine:
+        engine = TTSEngine("models/fake", device=device, **kwargs)
+        engine._model = model  # inject, bypassing the heavy loader
+        engine.prepare_prompt_from_file("ref.wav", "bonjour")
+        return engine
+
+    def test_a_batch_is_split_by_predicted_audio(self) -> None:
+        """Ten characters a line at 0.1 s each cannot share a one-second batch."""
+        model = self.SizedModel(0.1)
+        engine = self._engine(model, batch_size=8, max_decode_seconds=1.0)
+        engine._seconds_per_char = 0.1
+
+        engine.synthesize(["abcdefghij"] * 3, language="French")
+
+        assert [len(call["text"]) for call in model.calls] == [1, 1, 1]
+
+    def test_the_reference_is_charged_to_every_line(self) -> None:
+        """The checkpoint decodes the prompt's reference once per line.
+
+        This is the cost that made an 11-minute run unfit on a 12 GB card: an 8-line
+        batch cloned from a 21 s reference decodes ~170 s of audio however short the
+        lines are, because ``ref_code`` is concatenated onto every line and trimmed
+        off the waveform afterwards.
+        """
+        model = self.SizedModel(0.1)
+        engine = self._engine(model, batch_size=8, max_decode_seconds=10.0)
+        engine._seconds_per_char = 0.1
+        engine.reference_seconds = 4.0
+
+        engine.synthesize(["abcdefghij"] * 4, language="French")
+
+        # 4 s reference + 1 s line = 5 s a line, so two lines fit the 10 s budget.
+        assert [len(call["text"]) for call in model.calls] == [2, 2]
+
+    def test_packing_still_respects_the_line_count(self) -> None:
+        model = self.SizedModel(0.001)
+        engine = self._engine(model, batch_size=2, max_decode_seconds=1000.0)
+        engine._seconds_per_char = 0.001
+
+        engine.synthesize(["short"] * 5, language="French")
+
+        assert [len(call["text"]) for call in model.calls] == [2, 2, 1]
+
+    def test_a_long_line_still_goes_out_alone(self) -> None:
+        """Text cannot be split, so an over-budget line must not be dropped."""
+        model = FakeQwenModel()
+        engine = self._engine(model, batch_size=8, max_decode_seconds=0.5)
+        engine._seconds_per_char = 1.0
+
+        result = engine.synthesize(["a" * 200], language="French")
+
+        assert len(result) == 1
+        assert [len(call["text"]) for call in model.calls] == [1]
+
+    def test_the_oom_shrink_covers_the_rest_of_the_run(self) -> None:
+        model = TestOutOfMemoryHandling.OomModel(fail_above=2)
+        engine = self._engine(model, batch_size=4, max_decode_seconds=1000.0)
+
+        result = engine.synthesize(
+            ["a", "b", "c", "d", "e", "f", "g", "h"], language="French"
+        )
+
+        assert all(item is not None for item in result)
+        # 4 failed, then 2+2; every later batch ran at the remembered size rather
+        # than asking for 4 again, which is the whole point of the shrink.
+        assert model.attempts == [4, 2, 2, 2, 2]
+        assert engine.batch_size == 2
+        assert engine.oom_retries == 1
+
+    def test_the_estimate_is_measured_from_what_was_produced(self) -> None:
+        """The seed only ever sizes the first batch; measurement takes over."""
+        model = FakeQwenModel()  # 0.4 s a line, whatever the text
+        engine = self._engine(model)
+        engine._seconds_per_char = 0.07
+
+        engine.synthesize(["abcdefghij"] * 2, language="French")
+
+        assert engine._seconds_per_char == pytest.approx(0.04)
+        assert engine.peak_batch_seconds == pytest.approx(0.8)
+        assert engine.batches == 1
+
+    def test_cached_memory_is_released_when_the_device_is_tight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine = self._engine(FakeQwenModel())
+        released: list[int] = []
+
+        def release() -> bool:
+            released.append(1)
+            return True
+
+        monkeypatch.setattr("pipeline.tts.device_free_bytes", lambda device: 10)
+        monkeypatch.setattr("pipeline.tts.release_gpu_memory", release)
+
+        engine.synthesize(["bonjour"], language="French")
+
+        assert engine.cache_releases == 1
+        assert released == [1]
+
+    def test_an_unknown_free_memory_is_not_a_reason_to_release(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``None`` means "no opinion", so the CPU path releases nothing."""
+        engine = self._engine(FakeQwenModel())
+        monkeypatch.setattr("pipeline.tts.device_free_bytes", lambda device: None)
+        monkeypatch.setattr(
+            "pipeline.tts.release_gpu_memory",
+            lambda: pytest.fail("released with no evidence of pressure"),
+        )
+
+        engine.synthesize(["bonjour"], language="French")
+
+        assert engine.cache_releases == 0
+
+    def test_the_stats_carry_what_the_report_needs(self) -> None:
+        engine = self._engine(FakeQwenModel(), batch_size=3)
+
+        engine.synthesize(["a", "b", "c", "d"], language="French")
+        stats = engine.synthesis_stats()
+
+        assert stats["batch_size"] == 3
+        assert stats["batches"] == 2
+        assert stats["max_decode_seconds"] > 0
+        assert stats["oom_retries"] == 0
+        assert stats["seconds_per_char"] is not None
+
+    def test_a_batch_past_the_ceiling_shrinks_the_rest_of_the_run(
+        self, monkeypatch: pytest.MonkeyPatch, torch_profile: Any
+    ) -> None:
+        """The ceiling is measured from the card, not configured for it."""
+        torch_profile(kind="cuda", memory=12 * 1024**3)
+        engine = self._engine(FakeQwenModel(), device="cuda", batch_size=8)
+        monkeypatch.setattr(
+            "pipeline.tts.peak_reserved_bytes", lambda device: 11 * 1024**3
+        )
+
+        engine.synthesize(["a", "b", "c", "d", "e", "f", "g", "h"], language="French")
+
+        assert engine.batch_size == 4
+        assert engine.ceiling_shrinks == 1
+        assert engine.peak_reserved == 11 * 1024**3
+
+    def test_the_shrink_follows_the_batch_that_overshot(
+        self, monkeypatch: pytest.MonkeyPatch, torch_profile: Any
+    ) -> None:
+        """Halving the *cap* would leave the next batch as large as the offender.
+
+        The decoded-audio budget, not the line cap, often decides how big a batch
+        is; on the 11-minute run the first overshoot was a three-line batch against
+        a cap of eight.
+        """
+        torch_profile(kind="cuda", memory=12 * 1024**3)
+        engine = self._engine(
+            FakeQwenModel(), device="cuda", batch_size=8, max_decode_seconds=1.0
+        )
+        engine._seconds_per_char = 1.0  # one line per batch
+        monkeypatch.setattr(
+            "pipeline.tts.peak_reserved_bytes", lambda device: 11 * 1024**3
+        )
+
+        engine.synthesize(["a", "b"], language="French")
+
+        assert engine.batch_size == 1
+        assert engine.ceiling_shrinks == 1
+
+    def test_a_batch_inside_the_ceiling_leaves_the_size_alone(
+        self, monkeypatch: pytest.MonkeyPatch, torch_profile: Any
+    ) -> None:
+        torch_profile(kind="cuda", memory=12 * 1024**3)
+        engine = self._engine(FakeQwenModel(), device="cuda", batch_size=8)
+        monkeypatch.setattr(
+            "pipeline.tts.peak_reserved_bytes", lambda device: 4 * 1024**3
+        )
+
+        engine.synthesize(["a", "b"], language="French")
+
+        assert engine.batch_size == 8
+        assert engine.ceiling_shrinks == 0
+
+    def test_nothing_is_measured_off_cuda(self) -> None:
+        """A CPU run has no ceiling to respect and must not change size."""
+        engine = self._engine(FakeQwenModel(), batch_size=4)
+
+        engine.synthesize(["a", "b", "c", "d"], language="French")
+
+        assert engine.batch_size == 4
+        assert engine.ceiling_shrinks == 0
+        assert engine.peak_reserved == 0
+
+
 class TestKnnSpeakerSelection:
     def test_reference_audio_requires_transcript_text(self) -> None:
         engine = engine_with(FakeQwenModel())

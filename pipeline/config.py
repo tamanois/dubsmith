@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .diarize import DEFAULT_THRESHOLD, MIN_SPEAKER_S
+from .diarize import DEFAULT_THRESHOLD
 from .errors import ConfigError
 from .mixing import (
     DEFAULT_ROOM_DUCK_DB,
@@ -20,18 +20,23 @@ from .mixing import (
 
 __all__ = [
     "ACCELERATORS",
+    "DEFAULT_MIN_SPEAKER_S",
     "DTYPE_ALIASES",
     "DeviceInfo",
     "LANGUAGE_ALIASES",
     "SUPPORTED_LANGUAGES",
     "available_accelerators",
+    "configure_allocator",
+    "device_free_bytes",
     "normalize_dtype",
     "normalize_language",
     "normalize_loudness_policy",
+    "peak_reserved_bytes",
     "pick_dtype",
     "preferred_dtype",
     "probe_device",
     "release_gpu_memory",
+    "reset_peak_reserved",
     "resolve_device",
     "supports_bf16",
     "supports_fp16",
@@ -142,6 +147,15 @@ def language_code_for_name(name: str | None) -> str | None:
 
 ENV_PREFIX = ""
 
+#: Default floor for how much speech a voice must own to be dubbed separately.
+#: ``diarize.MIN_SPEAKER_S`` (3 s) is the mechanical floor: below it there is no
+#: donor window at all. This one is the quality floor, measured on the 11-minute
+#: job where three voices with 3-6 s of speech produced 0.6-1.2 s donors, one of
+#: whose blends stalled at ``donor_ratio`` 0.23 - the dub kept the anchor's voice.
+#: Folding them into their neighbours left four voices with 4-5 s donors and
+#: blends at 0.79-0.86.
+DEFAULT_MIN_SPEAKER_S = 20.0
+
 #: Accepted spellings for the loudness policy, normalised to two canonical forms.
 _LOUDNESS_POLICIES: dict[str, str] = {
     "match-source": "match-source",
@@ -217,6 +231,11 @@ class Settings(BaseModel):
     models_dir: Path = Path("models")
     log_level: str = "INFO"
     log_json: bool = False
+    #: Also keep the run log in a file. ``None`` means the job's own folder, which
+    #: is what ``dub.py`` defaults to; ``--no-log-file`` writes no file at all.
+    #: Logging is not an input to the dub, so this lives here rather than in
+    #: ``JobConfig``: pointing the log somewhere else must not invalidate a cache.
+    log_file: Path | None = None
 
     @field_validator("loudness_target")
     @classmethod
@@ -264,6 +283,7 @@ class Settings(BaseModel):
             "models_dir": pick("MODELS_DIR", cls.model_fields["models_dir"].default),
             "log_level": pick("LOG_LEVEL", cls.model_fields["log_level"].default),
             "log_json": pick("LOG_JSON", cls.model_fields["log_json"].default),
+            "log_file": pick("LOG_FILE", cls.model_fields["log_file"].default),
         }
         return cls.model_validate(payload)
 
@@ -299,6 +319,12 @@ class JobConfig(BaseModel):
     dtype: str = "auto"
     whisper_model: str = "large-v3"
     llm_model: str | None = None  # overrides Settings.llm_model
+    #: Most lines synthesised in one model call. The engine additionally caps a
+    #: batch by the audio it predicts, because the checkpoint decodes a whole
+    #: batch at once and the peak therefore tracks the total *seconds* in the
+    #: request rather than the number of lines. This is the ceiling, and the
+    #: escape hatch for a machine with less headroom than the default assumes.
+    tts_batch: int = Field(default=8, ge=1, le=64)
 
     # Duration fitting.
     min_stretch: float = Field(default=0.85, gt=0.05, le=1.0)
@@ -315,10 +341,12 @@ class JobConfig(BaseModel):
     refine_threshold: float = Field(default=0.05, ge=0.0, le=5.0)
 
     # How the translator is told to size each line.
-    #   "off"   -> only the slot duration is given (the long-standing behaviour)
+    #   "off"   -> only the slot duration is given
     #   "words" -> also give a word ceiling derived from the measured speaking
-    #              rate, which a language model can actually act on
-    length_budget: str = "off"
+    #              rate, which a language model can actually act on. On by default
+    #              because every accent mode now has a target-language reference to
+    #              measure the rate from (the accent clip, or the native anchor).
+    length_budget: str = "words"
 
     # ASR gating: segments the model itself distrusts are dropped.
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
@@ -361,12 +389,19 @@ class JobConfig(BaseModel):
     )
 
     # Voice accent.
+    #   "native"           -> keep the speaker's timbre and take pronunciation from
+    #                         a generated native anchor (the default)
     #   "preserve"         -> clone the speaker's voice AND accent (ICL mode)
     #   "speaker-only"     -> keep only the speaker embedding, letting the model
     #                         use its own phonetics for the target language
     #   "reference-accent" -> keep the speaker's timbre but take pronunciation and
     #                         prosody from --accent-audio/--accent-text
-    accent_mode: str = "preserve"
+    accent_mode: str = "native"
+    #: How ``native`` shapes its anchor.
+    #   "off"    -> the plain per-language anchor
+    #   "rate"   -> a per-speaker anchor matching the source speaker's rate
+    #   "gender" -> the same, plus the source speaker's gender
+    accent_match: str = "off"
     #: Native target-language clip whose phonetics the dub should adopt.
     accent_audio: Path | None = None
     #: Exact transcript of ``accent_audio`` (required: it aligns the speech codes).
@@ -400,7 +435,14 @@ class JobConfig(BaseModel):
     speaker_threshold: float | None = None
     #: Clusters shorter than this are folded into their nearest neighbour, because
     #: a voice needs a few seconds of speech before it can be cloned.
-    min_speaker_seconds: float = Field(default=MIN_SPEAKER_S, ge=0.0, le=120.0)
+    #: A speaker has to own this much speech before they get their own voice.
+    #: ``diarize.MIN_SPEAKER_S`` is the mechanical floor - below it no donor window
+    #: exists at all - while this is the point below which the donor that does
+    #: exist is too short to describe a voice. Measured on the 11-minute job:
+    #: voices with under this much speech produced 0.6-1.2 s donors whose blends
+    #: stalled at ``donor_ratio`` 0.23, where the dub audibly kept the anchor's
+    #: voice; folding them into their neighbours left four clean voices.
+    min_speaker_seconds: float = Field(default=DEFAULT_MIN_SPEAKER_S, ge=0.0, le=120.0)
 
     # Overlapping speech: a segment that carries two voices at once.
     #   "dominant" -> dub the whole line in its dominant speaker's voice (v1)
@@ -422,6 +464,10 @@ class JobConfig(BaseModel):
     def _check_accent(cls, value: str) -> str:
         key = str(value).strip().lower().replace("_", "-")
         aliases = {
+            "native": "native",
+            "auto": "native",
+            "generated": "native",
+            "anchor": "native",
             "preserve": "preserve",
             "icl": "preserve",
             "source": "preserve",
@@ -437,8 +483,31 @@ class JobConfig(BaseModel):
             return aliases[key]
         except KeyError:
             raise ConfigError(
-                f"Unknown accent mode {value!r}. Use: preserve, speaker-only or "
-                "reference-accent"
+                f"Unknown accent mode {value!r}. Use: native, preserve, "
+                "speaker-only or reference-accent"
+            ) from None
+
+    @field_validator("accent_match")
+    @classmethod
+    def _check_accent_match(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "off": "off",
+            "none": "off",
+            "false": "off",
+            "rate": "rate",
+            "speed": "rate",
+            "pace": "rate",
+            "gender": "gender",
+            "voice": "gender",
+            "gender,rate": "gender",
+            "rate,gender": "gender",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown accent match {value!r}. Use: off, rate or gender"
             ) from None
 
     @field_validator("accent_blend")
@@ -658,18 +727,36 @@ class JobConfig(BaseModel):
                     "--accent-audio requires --accent-text (its exact transcript), "
                     "which aligns the accent clip's speech codes."
                 )
-        elif self.accent_audio is not None:
-            raise ConfigError(
-                "--accent-audio only applies to --accent-mode reference-accent; add "
-                "that flag or drop --accent-audio."
-            )
+            if self.accent_match != "off":
+                raise ConfigError(
+                    "--accent-match only applies to --accent-mode native; the supplied "
+                    "--accent-audio already fixes the borrowed delivery."
+                )
+        elif self.accent_mode == "native":
+            if self.accent_audio is not None or (self.accent_text or "").strip():
+                raise ConfigError(
+                    "--accent-audio only applies to --accent-mode reference-accent; "
+                    "--accent-mode native generates its own accent anchor."
+                )
+        else:
+            if self.accent_audio is not None:
+                raise ConfigError(
+                    "--accent-audio only applies to --accent-mode reference-accent; add "
+                    "that flag or drop --accent-audio."
+                )
+            if self.accent_match != "off":
+                raise ConfigError(
+                    f"--accent-match only applies to --accent-mode native, not "
+                    f"{self.accent_mode!r}."
+                )
 
-        # The blend knobs only mean anything in reference-accent mode, and a
-        # silently ignored knob is worse than a rejected one. "Asked for" is
-        # decided by the *value*, not by ``model_fields_set``: the CLI passes every
-        # flag explicitly, so a default of ``None`` would otherwise look like a
-        # request and reject the plain `dub.py --video in.mp4 --target fr`.
-        if self.accent_mode != "reference-accent":
+        # The blend knobs only mean anything for a blended accent (native or
+        # reference-accent), and a silently ignored knob is worse than a rejected
+        # one. "Asked for" is decided by the *value*, not by ``model_fields_set``:
+        # the CLI passes every flag explicitly, so a default of ``None`` would
+        # otherwise look like a request and reject the plain
+        # `dub.py --video in.mp4 --target fr`.
+        if self.accent_mode not in ("native", "reference-accent"):
             for field_name, flag in (
                 ("accent_blend", "--accent-blend"),
                 ("blend_takes", "--blend-takes"),
@@ -678,8 +765,8 @@ class JobConfig(BaseModel):
             ):
                 if getattr(self, field_name) is not None:
                     raise ConfigError(
-                        f"{flag} only applies to --accent-mode reference-accent; add "
-                        f"that flag or drop {flag}."
+                        f"{flag} only applies to --accent-mode native or "
+                        f"reference-accent; add that flag or drop {flag}."
                     )
         return self
 
@@ -702,13 +789,25 @@ class JobConfig(BaseModel):
 
     @property
     def resolved_blend_iters(self) -> int:
-        """Passes used to build the blend before giving up on the target (default 4)."""
-        return self.blend_iters if self.blend_iters is not None else 4
+        """Passes used to build the blend before giving up on the target (default 5).
+
+        Five is where the measured curve flattens: on the reference clip the best
+        pass arrived at the fifth, and passes six to eight neither improved the
+        donor ratio nor the margin while each cost a synthesis of the accent
+        transcript.
+        """
+        return self.blend_iters if self.blend_iters is not None else 5
 
     @property
     def resolved_blend_ratio(self) -> float:
-        """Donor ratio that ends iteration early (default 0.5, ``0`` disables)."""
-        return self.blend_ratio if self.blend_ratio is not None else 0.5
+        """Donor ratio that ends iteration early (default 0.85, ``0`` disables).
+
+        Raised from 0.7 after measuring both accent sources on the same clip: a
+        generated anchor is a full in-context performance and drags the blend much
+        harder than a human clip does, so a target that a human accent clears in
+        one pass can leave the speaker's voice audibly faint under a synthetic one.
+        """
+        return self.blend_ratio if self.blend_ratio is not None else 0.85
 
     @property
     def resolved_speaker_threshold(self) -> float:
@@ -740,6 +839,15 @@ class JobConfig(BaseModel):
         path = self.video if self.video is not None else self.audio
         assert path is not None  # guaranteed by the model validator
         return path
+
+    @property
+    def job_dir(self) -> Path:
+        """Folder this job's artifacts live in: one per input stem.
+
+        Kept here so the pipeline and anything that has to find a job's files
+        beforehand - the run log, for one - cannot disagree about where they are.
+        """
+        return self.output_dir / self.input_path.stem
 
     @property
     def is_video(self) -> bool:
@@ -1091,3 +1199,110 @@ def release_gpu_memory() -> bool:
             released = True
 
     return released
+
+
+#: Allocator option applied when a run will use CUDA and the user has not chosen
+#: one. PyTorch's caching allocator keeps freed blocks at the size they were
+#: requested, so a long job — hundreds of synthesis calls, each with its own
+#: transient tensors — ends up with a pool that has free memory in it but no block
+#: large enough for the next request. Measured on an 11-minute video
+#: (2026-09-28): a 1.53–1.61 GiB allocation failed against 1.13 GiB of free memory
+#: on a 12 GB RTX 3060, hundreds of times in a row. Expandable segments let the
+#: pool grow, shrink and be reused across sizes, which is what removes a failure
+#: that has free memory sitting next to it.
+DEFAULT_ALLOCATOR_CONF = "expandable_segments:True"
+
+#: Environment names torch reads that option from. Current versions accept both
+#: spellings, so finding either one already set means the user has decided.
+ALLOCATOR_ENV_NAMES = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+def configure_allocator(device: str = "auto") -> str | None:
+    """Apply the caching-allocator option a long CUDA job needs.
+
+    Entry points call this *before* any model loads, because torch reads the
+    setting at its first allocation — applying it later has no effect at all, and
+    says nothing about having been ignored.
+
+    Only CUDA is touched: the option is CUDA-specific, so ROCm, XPU and Metal keep
+    their defaults. A value already in the environment always wins, because a user
+    who has tuned the allocator should never be second-guessed.
+
+    Returns:
+        The value applied, or ``None`` when the user had already chosen one or the
+        device is not CUDA.
+    """
+    if any(os.environ.get(name) for name in ALLOCATOR_ENV_NAMES):
+        _LOGGER.debug("Allocator configuration already set; leaving it unchanged")
+        return None
+    if probe_device(device).kind != "cuda":
+        return None
+    os.environ["PYTORCH_ALLOC_CONF"] = DEFAULT_ALLOCATOR_CONF
+    _LOGGER.info("Allocator: PYTORCH_ALLOC_CONF=%s", DEFAULT_ALLOCATOR_CONF)
+    return DEFAULT_ALLOCATOR_CONF
+
+
+def device_free_bytes(device: str = "auto") -> int | None:
+    """Free memory on the accelerator behind ``device``, or ``None`` if unknown.
+
+    The number that decides *when* to hand cached blocks back: an allocator will
+    happily hold most of a card in shapes nothing can use, so waiting for an
+    out-of-memory error before releasing means releasing too late. ``None`` is
+    "no opinion", which callers treat as "there is room".
+    """
+    torch = _import_torch()
+    if torch is None:  # pragma: no cover - torch is a hard runtime dep
+        return None
+    info = probe_device(device)
+    if info.kind not in {"cuda", "rocm"}:
+        return None
+    try:
+        free, _total = torch.cuda.mem_get_info(info.index)
+    except Exception:  # a diagnostic must never fail the run it describes
+        _LOGGER.debug("Could not read free memory for %s", info.label, exc_info=True)
+        return None
+    return int(free)
+
+
+def peak_reserved_bytes(device: str = "auto") -> int | None:
+    """Most memory torch has held on ``device`` since the counter was last reset.
+
+    Reported so a run's headroom is a number in ``report.json`` rather than
+    something only the allocator's own log lines describe. Paired with
+    :func:`reset_peak_reserved`, which lets a caller measure one unit of work
+    rather than a whole process.
+    """
+    torch = _import_torch()
+    if torch is None:  # pragma: no cover - torch is a hard runtime dep
+        return None
+    info = probe_device(device)
+    if info.kind not in {"cuda", "rocm"}:
+        return None
+    try:
+        return int(torch.cuda.max_memory_reserved(info.index))
+    except Exception:
+        _LOGGER.debug(
+            "Could not read peak reserved memory for %s", info.label, exc_info=True
+        )
+        return None
+
+
+def reset_peak_reserved(device: str = "auto") -> bool:
+    """Zero the peak-reserved counter, so the next reading describes one batch.
+
+    Without this the counter is a high-water mark for the whole process and can
+    only ever grow, which says nothing about whether *this* batch was the one that
+    filled the card.
+    """
+    torch = _import_torch()
+    if torch is None:  # pragma: no cover - torch is a hard runtime dep
+        return False
+    info = probe_device(device)
+    if info.kind not in {"cuda", "rocm"}:
+        return False
+    try:
+        torch.cuda.reset_peak_memory_stats(info.index)
+    except Exception:
+        _LOGGER.debug("Could not reset the peak counter for %s", info.label, exc_info=True)
+        return False
+    return True

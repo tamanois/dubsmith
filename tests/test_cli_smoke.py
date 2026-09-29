@@ -9,11 +9,19 @@ pipeline test noticing.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from dub import build_dub_parser, job_config_from_args, main, render_environment
+from dub import (
+    build_dub_parser,
+    job_config_from_args,
+    log_file_from,
+    main,
+    render_environment,
+)
 from pipeline import __version__
-from pipeline.config import JobConfig
+from pipeline.config import JobConfig, Settings
 from pipeline.errors import ConfigError
 from pipeline.models import REGISTRY
 
@@ -75,6 +83,95 @@ def test_dtype_and_device_default_to_auto() -> None:
 
     assert job.dtype == "auto"
     assert job.device == "auto"
+
+
+def test_native_is_the_default_accent_mode() -> None:
+    args = build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
+    job = job_config_from_args(args)
+
+    assert job.accent_mode == "native"
+    assert job.accent_match == "off"
+
+
+def test_accent_match_reaches_the_job_config() -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--target", "fr", "--accent-match", "gender"]
+    )
+
+    assert job_config_from_args(args).accent_match == "gender"
+
+
+def test_accent_match_is_rejected_outside_native() -> None:
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-mode",
+            "preserve",
+            "--accent-match",
+            "rate",
+        ]
+    )
+    with pytest.raises(ConfigError, match="--accent-match only applies"):
+        job_config_from_args(args)
+
+
+def _log_destination(
+    extra: list[str], settings_file: Path | None = None
+) -> Path | None:
+    """Resolve a command line's run log the way ``cmd_dub`` does."""
+    args = build_dub_parser().parse_args(["--video", "input/talk.mp4", *extra])
+    settings = Settings(log_file=settings_file)
+    return log_file_from(args, settings, job_config_from_args(args))
+
+
+def test_the_run_log_lands_in_the_job_folder_by_default() -> None:
+    # One place to look for everything a run produced, including what it said.
+    assert _log_destination([]) == Path("output/talk/run.log")
+
+
+def test_an_explicit_log_file_wins() -> None:
+    assert _log_destination(["--log-file", "logs/nightly.log"]) == Path(
+        "logs/nightly.log"
+    )
+
+
+def test_the_environment_path_is_used_when_the_flag_is_absent() -> None:
+    assert _log_destination([], settings_file=Path("from-env.log")) == Path(
+        "from-env.log"
+    )
+
+
+def test_no_log_file_beats_both_other_destinations() -> None:
+    path = _log_destination(
+        ["--log-file", "logs/nightly.log", "--no-log-file"],
+        settings_file=Path("from-env.log"),
+    )
+
+    assert path is None
+
+
+def test_anchors_lists_without_a_model(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["anchors", "--list", "--models-dir", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "Accent anchors" in out
+    assert "none yet" in out
+
+
+def test_anchors_generate_without_the_model_names_the_download(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        ["anchors", "--generate", "--lang", "fr", "--models-dir", str(tmp_path)]
+    )
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "tts_voice_design" in err
+    assert "dub.py models --download" in err
 
 
 def test_an_unknown_dtype_is_rejected_by_the_cli() -> None:

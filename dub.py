@@ -29,25 +29,37 @@ from typing import Sequence
 from pipeline import __version__
 from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
+    DEFAULT_MIN_SPEAKER_S,
     SUPPORTED_LANGUAGES,
     JobConfig,
     Settings,
     available_accelerators,
+    normalize_language,
     pick_dtype,
     probe_device,
+    release_gpu_memory,
 )
 from pipeline.errors import DubbingError, ModelNotFoundError
-from pipeline.logging_utils import setup_logging
+from pipeline.logging_utils import DEFAULT_MAX_LOG_BYTES, setup_logging
 from pipeline.mixing import (
     DEFAULT_ROOM_DUCK_DB,
     DEFAULT_ROOM_TONE_GAIN_DB,
     DEFAULT_ROOM_WET_DB,
 )
-from pipeline.models import MVP_REQUIRED, REGISTRY, download_many, registry_status
+from pipeline.models import (
+    MVP_REQUIRED,
+    REGISTRY,
+    download_many,
+    registry_status,
+    resolve_model,
+)
 from pipeline.orchestrate import Pipeline
 
 _PROG = "dub.py"
 _STOP = 0
+
+#: Name of the run log kept inside a job folder when no path is given.
+_LOG_NAME = "run.log"
 
 #: Optional dependencies and what each one unlocks. Reported by ``dub.py info``
 #: because a missing one degrades one feature rather than failing a run.
@@ -82,6 +94,51 @@ def build_models_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--force", action="store_true", help="Re-download even when already present."
+    )
+    parser.add_argument(
+        "--models-dir", type=Path, default=None, help="Override the models directory."
+    )
+    return parser
+
+
+def build_anchors_parser() -> argparse.ArgumentParser:
+    """Parser for the ``anchors`` subcommand."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_PROG} anchors",
+        description=(
+            "List or generate the native accent anchors used by the default "
+            "'native' accent mode. An anchor is a short native-language narration "
+            "synthesised by the VoiceDesign model; one per language is enough, and "
+            "it is generated once and cached."
+        ),
+    )
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help="Generate the requested anchors (without it, list what is cached).",
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="List cached anchors (the default)."
+    )
+    parser.add_argument(
+        "--lang",
+        action="append",
+        default=None,
+        metavar="LANG",
+        help=(
+            "Language to generate, by code or name (repeatable). Defaults to every "
+            "supported language."
+        ),
+    )
+    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Precision for the VoiceDesign checkpoint (default: auto).",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Regenerate anchors that already exist."
     )
     parser.add_argument(
         "--models-dir", type=Path, default=None, help="Override the models directory."
@@ -141,6 +198,18 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
     parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
+    parser.add_argument(
+        "--tts-batch",
+        type=int,
+        default=8,
+        help=(
+            "Most lines synthesised in one model call. The engine also caps a "
+            "batch by the audio it predicts, because memory tracks the total "
+            "seconds in the request rather than the number of lines; this is the "
+            "ceiling, and the escape hatch for a machine with less headroom. "
+            "Lower it if a long video still runs out of GPU memory."
+        ),
+    )
     parser.add_argument(
         "--stretcher",
         default="auto",
@@ -259,13 +328,26 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--accent-mode",
         dest="accent_mode",
-        default="preserve",
-        choices=["preserve", "speaker-only", "reference-accent"],
+        default="native",
+        choices=["native", "preserve", "speaker-only", "reference-accent"],
         help=(
-            "'preserve' clones the speaker's accent along with their voice; "
-            "'speaker-only' keeps only the timbre embedding so the model uses its "
-            "own phonetics for the target language; 'reference-accent' keeps the "
-            "speaker's timbre but takes pronunciation from --accent-audio."
+            "'native' (default) keeps the speaker's timbre and takes pronunciation "
+            "from a generated native accent anchor; 'preserve' clones the speaker's "
+            "accent along with their voice; 'speaker-only' keeps only the timbre "
+            "embedding so the model uses its own phonetics for the target language; "
+            "'reference-accent' keeps the speaker's timbre but takes pronunciation "
+            "from --accent-audio."
+        ),
+    )
+    parser.add_argument(
+        "--accent-match",
+        dest="accent_match",
+        default="off",
+        choices=["off", "rate", "gender"],
+        help=(
+            "With --accent-mode native, generate a per-speaker accent anchor that "
+            "fits the source voice: 'rate' matches its speaking rate, 'gender' also "
+            "matches its gender. (default: off)"
         ),
     )
     parser.add_argument(
@@ -315,7 +397,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
             "re-encodes the previous blend and re-injects the speaker's embedding, "
             "pulling the voice back toward the speaker; it stops early once "
             "--blend-ratio is reached. Raise it if the speaker still sounds too "
-            "faint. 1 keeps the single-pass behaviour. (default: 4)"
+            "faint. 1 keeps the single-pass behaviour. (default: 5)"
         ),
     )
     parser.add_argument(
@@ -326,7 +408,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         help=(
             "How far toward the speaker's own voice the blend should reach, from 0 "
             "(the accent clip's voice) to 1 (a French utterance in the speaker's own "
-            "voice). Iteration stops there. 0 disables the search. (default: 0.5)"
+            "voice). Iteration stops there. 0 disables the search. (default: 0.85)"
         ),
     )
     parser.add_argument(
@@ -347,7 +429,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Cosine distance at which two voices count as different speakers "
-            "(default: 0.4). Raise it if one speaker is split in two; lower it if "
+            "(default: 0.7). Raise it if one speaker is split in two; lower it if "
             "two speakers are merged into one."
         ),
     )
@@ -355,11 +437,13 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--min-speaker-seconds",
         dest="min_speaker_seconds",
         type=float,
-        default=3.0,
+        default=DEFAULT_MIN_SPEAKER_S,
         help=(
-            "Clusters with less speech than this are folded into the nearest "
-            "speaker, since a voice needs a few seconds before it can be cloned. "
-            "(default: 3.0)"
+            "A voice must own at least this much speech to be dubbed separately; "
+            "a shorter cluster is folded into its nearest neighbour. Well above "
+            "the 3 s needed to clone at all, because a donor of a second or two "
+            "does not describe a voice and its blend stays near the accent. "
+            "0 keeps every cluster."
         ),
     )
     parser.add_argument(
@@ -422,19 +506,45 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--length-budget",
         dest="length_budget",
-        default="off",
+        default="words",
         choices=["off", "words"],
         help=(
-            "'words' also tells the translator how many words fit each slot, "
-            "measured from a target-language reference clip; 'off' sends only the "
-            "duration, as before. Needs --accent-audio or a target-language "
-            "--ref-audio. (default: off)"
+            "'words' (default) also tells the translator how many words fit each "
+            "slot, measured from a target-language reference (the accent anchor or "
+            "clip); 'off' sends only the duration."
         ),
     )
     parser.add_argument(
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
     )
     parser.add_argument("--force", action="store_true", help="Ignore cached stages.")
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        type=Path,
+        default=None,
+        help=(
+            "Also write the run log to this file, appended to across runs. "
+            "Defaults to <job folder>/run.log; LOG_FILE sets the same default."
+        ),
+    )
+    parser.add_argument(
+        "--no-log-file",
+        dest="log_file",
+        action="store_false",
+        help="Log to stderr only, writing no file.",
+    )
+    parser.add_argument(
+        "--log-max-bytes",
+        dest="log_max_bytes",
+        type=int,
+        default=DEFAULT_MAX_LOG_BYTES,
+        help=(
+            "Roll the log file aside to a timestamped name once it reaches this "
+            "many bytes, so it cannot grow without bound; 0 keeps one file "
+            "forever."
+        ),
+    )
     parser.add_argument(
         "--version",
         action="version",
@@ -626,6 +736,51 @@ def cmd_models(argv: Sequence[str]) -> int:
     return _STOP
 
 
+def cmd_anchors(argv: Sequence[str]) -> int:
+    """Handle ``dub.py anchors``."""
+    from pipeline.anchors import AnchorSpec, ensure_anchor, list_anchors
+    from pipeline.models import anchors_dir
+    from pipeline.tts import VoiceDesignEngine
+
+    args = build_anchors_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    root = anchors_dir(models_dir)
+
+    if args.list or not args.generate:
+        cached = list_anchors(root)
+        print(f"Accent anchors: {root}\n")
+        if not cached:
+            print(
+                "  (none yet - generate with: python dub.py anchors --generate)"
+            )
+            return _STOP
+        for key, path, seconds in cached:
+            print(f"  {key:<16}{seconds:6.1f}s  {path.name}")
+        return _STOP
+
+    requested = args.lang or [
+        name for name in sorted(SUPPORTED_LANGUAGES) if name != "Auto"
+    ]
+    languages = [normalize_language(name) for name in requested]
+    if any(language == "Auto" for language in languages):
+        print("--lang must be an explicit language, not 'auto'.", file=sys.stderr)
+        return 2
+
+    model_dir = resolve_model("tts_voice_design", models_dir)
+    engine = VoiceDesignEngine(
+        model_dir, device=args.device, dtype=pick_dtype(args.device, args.dtype)
+    )
+    for language in languages:
+        wav, _transcript = ensure_anchor(
+            root, AnchorSpec(language), lambda: engine, force=args.force
+        )
+        print(f"  {language:<12}{wav.name}")
+    release_gpu_memory()
+    print(f"\nAnchors ready in {root}")
+    return _STOP
+
+
 def job_config_from_args(args: argparse.Namespace) -> JobConfig:
     """Build the :class:`JobConfig` for a parsed set of dub options.
 
@@ -646,6 +801,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         dtype=args.dtype,
         whisper_model=args.whisper_model,
         llm_model=args.llm_model,
+        tts_batch=args.tts_batch,
         min_stretch=args.min_stretch,
         max_stretch=args.max_stretch,
         loudness_target=args.loudness_target,
@@ -659,6 +815,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         room_duck_db=args.room_duck_db,
         room_tone_gain_db=args.room_tone_gain_db,
         accent_mode=args.accent_mode,
+        accent_match=args.accent_match,
         accent_audio=args.accent_audio,
         accent_text=args.accent_text,
         accent_blend=args.accent_blend,
@@ -679,13 +836,38 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
     )
 
 
+def log_file_from(
+    args: argparse.Namespace, settings: Settings, job: JobConfig
+) -> Path | None:
+    """Where this run's log goes, if anywhere.
+
+    ``--log-file`` wins, then ``LOG_FILE``, then the job's own folder - which is
+    where every other artifact of the run already lives, so the default is one
+    place to look rather than a flag to remember. ``--no-log-file`` is the only
+    way back to stderr alone.
+    """
+    if args.log_file is False:
+        return None
+    if isinstance(args.log_file, Path):
+        return args.log_file
+    if settings.log_file is not None:
+        return settings.log_file
+    return job.job_dir / _LOG_NAME
+
+
 def cmd_dub(argv: Sequence[str]) -> int:
     """Handle the default dubbing command."""
     args = build_dub_parser().parse_args(list(argv))
     settings = Settings.from_env()
-    setup_logging("DEBUG" if args.verbose else settings.log_level, settings.log_json)
-
+    # Built before logging starts because the job knows which folder the log
+    # belongs in. Nothing in here logs, so the reordering loses no record.
     job = job_config_from_args(args)
+    setup_logging(
+        "DEBUG" if args.verbose else settings.log_level,
+        settings.log_json,
+        log_file=log_file_from(args, settings, job),
+        max_bytes=args.log_max_bytes,
+    )
 
     result = Pipeline(job, settings, stretcher_preference=args.stretcher).run()
     print()
@@ -699,6 +881,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args and args[0] in {"models", "download-models"}:
         handler = cmd_models
+        payload = args[1:]
+    elif args and args[0] == "anchors":
+        handler = cmd_anchors
         payload = args[1:]
     elif args and args[0] == "info":
         handler = cmd_info

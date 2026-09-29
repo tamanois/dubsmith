@@ -160,7 +160,7 @@ class TestClusterSpeakers:
         assert labels == ["SPK_0", "SPK_1", "SPK_1"]
 
     def test_defaults_match_the_calibrated_constants(self) -> None:
-        assert DEFAULT_THRESHOLD == 0.40
+        assert DEFAULT_THRESHOLD == 0.70
         assert MIN_SPEAKER_S == 3.0
 
 

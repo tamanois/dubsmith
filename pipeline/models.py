@@ -21,6 +21,7 @@ __all__ = [
     "ModelSpec",
     "REGISTRY",
     "MVP_REQUIRED",
+    "anchors_dir",
     "download_model",
     "download_many",
     "resolve_model",
@@ -91,8 +92,26 @@ REGISTRY: dict[str, ModelSpec] = {
     ),
 }
 
-#: Models the MVP cannot run without.
-MVP_REQUIRED: tuple[str, ...] = ("whisper_large_v3", "tts_base")
+#: Models the MVP cannot run without. The default ``native`` accent mode needs
+#: the VoiceDesign checkpoint to generate its per-language accent anchor, so it
+#: is required rather than optional.
+MVP_REQUIRED: tuple[str, ...] = (
+    "whisper_large_v3",
+    "tts_base",
+    "tts_voice_design",
+)
+
+#: Subdirectory of the models directory holding generated accent anchors.
+ANCHORS_DIR_NAME = "anchors"
+
+
+def anchors_dir(models_dir: Path | str = "models") -> Path:
+    """Where generated accent anchors are cached.
+
+    Kept beside the weights because it is derived data from a model and is
+    similarly excluded from version control.
+    """
+    return Path(models_dir) / ANCHORS_DIR_NAME
 
 
 def download_hint(name: str = "all") -> str:

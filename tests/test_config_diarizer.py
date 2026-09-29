@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.config import JobConfig
-from pipeline.diarize import DEFAULT_THRESHOLD, MIN_SPEAKER_S
+from pipeline.config import DEFAULT_MIN_SPEAKER_S, JobConfig
+from pipeline.diarize import DEFAULT_THRESHOLD
 from pipeline.errors import ConfigError
 
 
@@ -26,7 +26,7 @@ class TestDiarizerOption:
     def test_the_default_threshold_and_minimum_are_the_calibrated_ones(self) -> None:
         resolved = job()
         assert resolved.resolved_speaker_threshold == DEFAULT_THRESHOLD
-        assert resolved.min_speaker_seconds == MIN_SPEAKER_S
+        assert resolved.min_speaker_seconds == DEFAULT_MIN_SPEAKER_S
 
     @pytest.mark.parametrize(
         ("raw", "expected"),

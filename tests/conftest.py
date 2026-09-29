@@ -132,6 +132,10 @@ def make_fake_torch(
             get_device_capability=lambda index=0: capability,
             empty_cache=lambda: None,
             ipc_collect=lambda: None,
+            # Half of the card free, a quarter ever reserved: enough for the
+            # pipeline's memory-pressure checks to have something to read.
+            mem_get_info=lambda index=None: (memory // 2, memory),
+            max_memory_reserved=lambda index=0: memory // 4,
         )
     elif kind == "xpu":
         torch.xpu = SimpleNamespace(

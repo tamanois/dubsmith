@@ -166,6 +166,7 @@ def thresholds_from(args: argparse.Namespace) -> QCThresholds:
 
 def _load_engine(models_dir: Path | None, device: str = "auto"):
     """Load the TTS engine, imported lazily so a cheap run stays cheap."""
+    from pipeline.config import configure_allocator
     from pipeline.tts import TTSEngine
 
     resolved = models_dir or DEFAULT_MODEL_DIR
@@ -175,6 +176,9 @@ def _load_engine(models_dir: Path | None, device: str = "auto"):
             "--timbre to check the cheap gates only."
         )
     print(f"Loading {resolved.name} ...", file=sys.stderr, flush=True)
+    # Before the model loads: torch reads the allocator setting at the first
+    # allocation, so a long audit would otherwise never see it.
+    configure_allocator(device)
     return TTSEngine(resolved, device=device)
 
 

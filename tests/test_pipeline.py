@@ -19,12 +19,12 @@ import soundfile as sf
 from pipeline import media
 from pipeline.asr import Segment, Transcript
 from pipeline.config import JobConfig, Settings
-from pipeline.errors import MediaError, TranslationError
+from pipeline.errors import MediaError, ModelNotFoundError, TranslationError
 from pipeline.mixing import RT60_BOUNDS
 from pipeline.orchestrate import Pipeline
 from pipeline.timing import IdentityStretcher
 from pipeline.translate import ShortenRequest, TranslationRequest
-from pipeline.tts import BlendedReference
+from pipeline.tts import MAX_DECODE_SECONDS, BlendedReference
 
 SR = 48_000
 
@@ -169,6 +169,8 @@ class FakeTranslator:
     def __init__(self, blank_ids: Sequence[int] = ()) -> None:
         self.blank_ids = set(blank_ids)
         self.calls = 0
+        #: The most recent batch of requests, so budgets can be asserted.
+        self.requests: list[TranslationRequest] = []
 
     def translate(
         self,
@@ -178,6 +180,7 @@ class FakeTranslator:
         target_language: str,
     ) -> dict[int, str]:
         self.calls += 1
+        self.requests = list(requests)
         return {
             request.id: ("" if request.id in self.blank_ids else f"[{target_language}] {request.text}")
             for request in requests
@@ -189,6 +192,7 @@ class FakeTTSEngine:
 
     def __init__(self, sample_rate: int = 24_000) -> None:
         self.sample_rate = sample_rate
+        self.batch_size = 8
         self.prompt_kind: str | None = None
         self.prompt_calls = 0
         self.synth_calls = 0
@@ -281,6 +285,38 @@ class FakeTTSEngine:
             out.append((0.3 * np.sin(2 * np.pi * 300 * t)).astype(np.float32))
         return out
 
+    def synthesis_stats(self) -> dict[str, Any]:
+        """The real counters, mirrored: the report block is exercised too."""
+        return {
+            "batch_size": self.batch_size,
+            "max_decode_seconds": MAX_DECODE_SECONDS,
+            "reference_seconds": None,
+            "seconds_per_char": None,
+            "batches": self.synth_calls,
+            "peak_batch_seconds": 0.0,
+            "oom_retries": 0,
+            "cache_releases": 0,
+            "ceiling_shrinks": 0,
+            "peak_reserved_bytes": None,
+        }
+
+
+class FakeVoiceDesignEngine:
+    """Mimics VoiceDesignEngine: deterministic audio from a description."""
+
+    def __init__(self, sample_rate: int = 24_000) -> None:
+        self.sample_rate = sample_rate
+        #: Every (text, instruct, language) requested, so the anchor is assertable.
+        self.calls: list[tuple[str, str, str]] = []
+
+    def generate(
+        self, text: str, instruct: str, language: str
+    ) -> tuple[np.ndarray, int]:
+        self.calls.append((text, instruct, language))
+        seconds = 2.0
+        t = np.linspace(0.0, seconds, int(seconds * self.sample_rate), endpoint=False)
+        return (0.2 * np.sin(2 * np.pi * 180 * t)).astype(np.float32), self.sample_rate
+
 
 def make_pipeline(
     tmp_path: Path,
@@ -288,6 +324,7 @@ def make_pipeline(
     *,
     translator: FakeTranslator | None = None,
     tts: FakeTTSEngine | None = None,
+    anchor_engine: Any | None = None,
     separator: Any | None = None,
     labeler: Any | None = None,
     speaker_separator: Any | None = None,
@@ -296,6 +333,9 @@ def make_pipeline(
 ) -> tuple[Pipeline, FakeTranscriber, FakeTranslator, FakeTTSEngine]:
     audio = job_kwargs.pop("input_path", None) or write_input(tmp_path)
     output_dir = job_kwargs.pop("output_dir", None) or (tmp_path / "output")
+    # Most pipeline tests exercise the long-standing preserve path; the native
+    # default is covered by its own tests, which supply an anchor engine.
+    job_kwargs.setdefault("accent_mode", "preserve")
     job = JobConfig(audio=audio, output_dir=output_dir, **job_kwargs)
     transcriber = FakeTranscriber(transcript)
     translator = translator or FakeTranslator()
@@ -306,6 +346,7 @@ def make_pipeline(
         transcriber=transcriber,
         translator=translator,
         tts_engine=tts,
+        anchor_engine=anchor_engine,
         stretcher=IdentityStretcher(),
         separator=separator,
         # Named apart from JobConfig.diarizer, which is the *preference* string.
@@ -417,10 +458,12 @@ class TestAudioJob:
         report = pipeline.run().report
         assert report["accent_mode"] == "speaker-only"
 
-    def test_default_accent_mode_preserves_the_source_accent(
+    def test_preserve_mode_is_reported(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
-        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, accent_mode="preserve"
+        )
         assert pipeline.run().report["accent_mode"] == "preserve"
 
     def test_the_device_and_precision_are_recorded(
@@ -598,8 +641,8 @@ class TestReferenceAccentMode:
         blend = report["donor"]["blend"]
         assert blend["strategy"] == "two-stage"
         assert blend["takes"] == 3  # the default
-        assert blend["iters"] == 4
-        assert blend["target_ratio"] == 0.5
+        assert blend["iters"] == 5
+        assert blend["target_ratio"] == 0.85
         assert blend["donor_ratio"] == 0.8
         assert blend["timbre_similarity"] == 0.95
         assert blend["accent_similarity"] == 0.70
@@ -638,6 +681,84 @@ class TestReferenceAccentMode:
         pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
         donor = pipeline.run().report["donor"]
         assert "accent" not in donor
+
+
+class TestNativeAccentMode:
+    """The default mode borrows a generated anchor's accent, keeping the timbre."""
+
+    def build(self, tmp_path: Path, transcript: Transcript, **kwargs: Any):
+        anchor = FakeVoiceDesignEngine()
+        pipeline, _, translator, tts = make_pipeline(
+            tmp_path,
+            transcript,
+            accent_mode="native",
+            anchor_engine=anchor,
+            **kwargs,
+        )
+        return pipeline, translator, tts, anchor
+
+    def test_a_generated_anchor_supplies_the_accent(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, tts, anchor = self.build(tmp_path, simple_transcript)
+        report = pipeline.run().report
+
+        assert report["accent_mode"] == "native"
+        assert report["donor"]["accent"]["source"] == "anchor"
+        # Generated once, in the target language, from the language's passage.
+        assert len(anchor.calls) == 1
+        text, _instruct, language = anchor.calls[0]
+        assert language == "French"
+        assert text.strip()
+        # Stage 1 reconciles the anchor with the donor; stage 2 clones from it.
+        assert tts.prompt_history == ["hybrid", "file"]
+        assert tts.hybrid is not None
+        assert Path(tts.hybrid["accent_audio"]).name == "fr.wav"
+
+    def test_the_anchor_is_cached_between_runs(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, anchor = self.build(tmp_path, simple_transcript)
+        pipeline.run()
+        pipeline.run()
+        # The second run reuses the cached anchor instead of regenerating it.
+        assert len(anchor.calls) == 1
+        assert (pipeline.settings.models_dir / "anchors" / "fr.wav").is_file()
+
+    def test_a_missing_voice_design_model_is_an_actionable_error(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        # No anchor engine injected: the real resolver must fail with a remedy.
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, accent_mode="native"
+        )
+        with pytest.raises(ModelNotFoundError, match="tts_voice_design"):
+            pipeline.run()
+
+    def test_accent_match_shapes_the_generated_anchor(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, anchor = self.build(
+            tmp_path, simple_transcript, accent_match="gender"
+        )
+        report = pipeline.run().report
+
+        assert anchor.calls
+        instruct = anchor.calls[0][1]
+        assert "voice" in instruct  # the gender phrase reached the description
+        record = report["donor"]["accent"]
+        assert record["source"] == "anchor-matched"
+        assert record["rate_band"] in {"slow", "normal", "fast"}
+
+    def test_the_word_budget_is_sized_from_the_anchor(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, translator, _, _ = self.build(tmp_path, simple_transcript)
+        pipeline.run()
+
+        assert translator.requests
+        assert all(request.max_words is not None for request in translator.requests)
+        assert all(request.max_words >= 1 for request in translator.requests)
 
 
 class TestEdgeCases:
@@ -1185,7 +1306,7 @@ class TestVideoJob:
 
         monkeypatch.setattr(media, "mux_audio", fake_mux)
 
-        job = JobConfig(video=video, output_dir=tmp_path / "output")
+        job = JobConfig(video=video, output_dir=tmp_path / "output", accent_mode="preserve")
         pipeline = Pipeline(
             job,
             Settings(models_dir=tmp_path / "models"),
