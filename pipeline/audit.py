@@ -43,7 +43,13 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 import numpy as np
 
 from . import media
+from .config import DEFAULT_MAX_OVERRUN
 from .errors import AuditError
+
+#: Slack on the lateness limit: the timeline flags a move only past its own guard
+#: (``timing.SHIFT_FLAG_GUARD_S``), so a run sitting exactly on the limit must not
+#: fail on the last sample of rounding.
+SHIFT_TOLERANCE_S = 0.02
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module import-light
     from .tts import TTSEngine
@@ -405,14 +411,18 @@ class GateResult:
 class QCThresholds:
     """Limits the quality gate applies.
 
-    The defaults are the levels the roadmap's measurements treated as acceptable:
-    sync is exact, a line may lose at most a tenth of its words, and the delivered
-    level stays within 1.5 dB of the track it replaced.
+    The defaults are the levels the roadmap's measurements treated as acceptable: a
+    line may start at most ``DEFAULT_MAX_OVERRUN`` seconds late, may lose at most a
+    tenth of its words, and the delivered level stays within 1.5 dB of the track it
+    replaced.
     """
 
-    #: Lines allowed to be pushed later than their slot. Any shift is a desync,
-    #: because overrunning into a pause is handled separately and never shifts.
-    max_shifted_segments: int = 0
+    #: Seconds a line may start later than its source. The mixer deliberately buys
+    #: a fraction of a second of lateness per line rather than deleting the last
+    #: word of it, so this is how much lateness counts as inside policy. It is
+    #: independent of what a run was configured with: a run that borrows more than
+    #: the policy allows fails here, which is the point.
+    max_shift_seconds: float = DEFAULT_MAX_OVERRUN
     #: Largest share of a single line that may be trimmed away.
     max_worst_line_deleted_ratio: float = 0.10
     #: Lines allowed to lose more than 10% of their speech.
@@ -425,21 +435,24 @@ class QCThresholds:
 
 
 def _sync_gate(report: Mapping[str, Any], limits: QCThresholds) -> GateResult:
-    """Gate on being late; report spilling into pauses as context.
+    """Gate on how late the dub runs; report spilling into pauses as context.
 
     ``overrun`` is by design: a line may use the silence before the next utterance,
-    which costs nothing. Only ``shifted_segments`` means the dub no longer lines up
-    with the picture, so only that is gated — a threshold on overrun would fail
-    legitimate lines that filled a long pause.
+    which costs nothing. Lateness is the real sync risk, and it is gated on the
+    *amount* rather than on a count of moved lines - a run that borrowed 0.1 s of a
+    line's time is not the same defect as one that started a line a second late.
     """
     shifted = int(report.get("shifted_segments") or 0)
+    worst = float(report.get("shifted_seconds_max") or 0.0)
     overrun = float(report.get("overrun_seconds_total") or 0.0)
     trimmed = float(report.get("trimmed_seconds_total") or 0.0)
+    limit = limits.max_shift_seconds
+    passed = worst <= limit + SHIFT_TOLERANCE_S
     return GateResult(
         "sync",
-        "pass" if shifted <= limits.max_shifted_segments else "fail",
-        f"{shifted} line(s) shifted late (limit {limits.max_shifted_segments}); "
-        f"{overrun:.2f}s spilled into pauses; {trimmed:.2f}s trimmed",
+        "pass" if passed else "fail",
+        f"worst line {worst:.2f}s late (limit {limit:.2f}s); {shifted} line(s) "
+        f"moved; {overrun:.2f}s spilled into pauses; {trimmed:.2f}s trimmed",
     )
 
 

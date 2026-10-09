@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from pipeline.asr import Segment
 from pipeline.errors import DependencyError
 from pipeline.timing import (
     IdentityStretcher,
@@ -15,8 +16,10 @@ from pipeline.timing import (
     build_timeline,
     compute_ratio,
     detect_stretcher,
+    distribute_seconds,
     fit_line,
     fit_ratio,
+    redistribute_packed,
     trim_silence,
 )
 
@@ -265,6 +268,90 @@ class TestFitLine:
         )
         assert ratio == pytest.approx(0.75)
         assert result.size == int(round(2.4 * SR))
+
+
+class TestDistributeSeconds:
+    """Splitting a stretch of time between lines by their word counts."""
+
+    def test_time_follows_the_words(self) -> None:
+        assert distribute_seconds([1, 1, 2], 4.0) == pytest.approx([1.0, 1.0, 2.0])
+
+    def test_the_total_is_preserved(self) -> None:
+        assert sum(distribute_seconds([5, 1, 1], 3.0)) == pytest.approx(3.0)
+        assert sum(distribute_seconds([10, 1], 2.0)) == pytest.approx(2.0)
+
+    def test_a_short_line_still_gets_a_usable_floor(self) -> None:
+        # One word against ten would earn 0.18s of a 2s stretch, which no subtitle
+        # and no spoken word fits in.
+        shares = distribute_seconds([10, 1], 2.0)
+        assert shares[1] >= 0.3 - 1e-9
+
+    def test_an_impossible_floor_falls_back_to_an_even_split(self) -> None:
+        shares = distribute_seconds([1, 1, 1, 1], 0.4)
+        assert shares == pytest.approx([0.1, 0.1, 0.1, 0.1])
+
+    def test_unusable_input_is_all_zeros(self) -> None:
+        assert distribute_seconds([], 1.0) == []
+        assert distribute_seconds([1, 2], 0.0) == [0.0, 0.0]
+        assert distribute_seconds([0, 0], 1.0) == pytest.approx([0.5, 0.5])
+
+
+class TestRedistributePacked:
+    """Whisper's impossible boundaries are repaired; plausible ones are not."""
+
+    @staticmethod
+    def line(segment_id: int, start: float, end: float, text: str) -> Segment:
+        return Segment(id=segment_id, start=start, end=end, text=text)
+
+    def test_a_plausible_timeline_is_left_alone(self) -> None:
+        lines = [self.line(0, 0.0, 2.0, "one two three four five six seven eight")]
+        assert redistribute_packed(lines) == []
+        assert (lines[0].start, lines[0].end) == (0.0, 2.0)
+
+    def test_a_slow_speaker_is_not_repaired(self) -> None:
+        # 5.5 words/s is fast but speakable, and above the anchors' "fast" band.
+        lines = [self.line(0, 0.0, 2.0, "one two three four five six seven eight nine ten eleven")]
+        assert redistribute_packed(lines) == []
+
+    def test_an_impossible_run_is_retimed(self) -> None:
+        # Nine words in 0.9s - an over-packed stretch, as measured on a real job,
+        # followed by a long pause the repair may spend.
+        lines = [
+            self.line(0, 0.0, 0.18, "Okay."),
+            self.line(1, 0.24, 0.40, "What's the next snack?"),
+            self.line(2, 0.42, 0.90, "I'm getting off track."),
+            self.line(3, 2.90, 4.00, "And then something ordinary happens."),
+        ]
+        changes = redistribute_packed(lines)
+
+        assert len(changes) == 1
+        assert changes[0]["from_id"] == 1
+        assert changes[0]["to_id"] == 2
+        assert changes[0]["worst_wps"] == pytest.approx(25.0, abs=0.1)
+        # The run ends where the next line starts, and that line never moved.
+        assert lines[2].end == pytest.approx(2.90)
+        assert lines[3].start == pytest.approx(2.90)
+        # Every re-timed line can now be spoken at a believable rate.
+        for segment in lines[1:3]:
+            assert segment.duration > 0.3
+            assert len(segment.text.split()) / segment.duration < 6.5
+
+    def test_the_first_line_of_a_run_keeps_its_start(self) -> None:
+        lines = [
+            self.line(0, 1.00, 1.10, "Four words inside a tenth of a second."),
+            self.line(1, 3.00, 3.50, "A normal line afterwards."),
+        ]
+        redistribute_packed(lines)
+        assert lines[0].start == pytest.approx(1.00)
+
+    def test_a_trailing_run_is_left_alone(self) -> None:
+        """There is nothing after it to borrow from, so nothing can be fixed."""
+        lines = [self.line(0, 0.0, 0.10, "Four words inside a tenth of a second.")]
+        assert redistribute_packed(lines) == []
+        assert lines[0].end == pytest.approx(0.10)
+
+    def test_an_empty_timeline_is_fine(self) -> None:
+        assert redistribute_packed([]) == []
 
 
 class TestBuildTimeline:

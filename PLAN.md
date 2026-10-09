@@ -32,18 +32,22 @@
 Verification performed:
 
 - **Never lose a word** (2026-09-29, `input/louisavy-11m.mp4`, 11 min, 2 voices,
-  English → French, `native`): speech deleted **40.63 s → 6.74 s**, lines that lost
-  speech 179 → 52, lines losing >10% 135 → 34, `shifted_segments` 0 → 0, and the
-  synthesis stage 699 s → 497 s. The delivery-rate probe measured the cloned
-  voices at 3.52 / 3.60 words/s against the accent clip's 2.97, which is the
-  ~20% the word ceiling had been under-estimating; translations then landed on
-  the ceiling (words ÷ ceiling: median 1.00, mean 0.95, against 1.5–1.8× before),
-  the pre-synthesis check reworded 41 of 152 remaining offenders (985 of 1100
-  words kept), and clipping dead air off the synthesised lines recovered 31.6 s
-  that had been charged to the compression budget. ASR re-segmented between the
-  two runs (489 vs 471 lines), so the deltas are indicative, not controlled. The
-  residual 6.74 s sits entirely in lines whose *source* slot is impossible
-  (`needed_ratio` from 0.15): id 211 is four words in 0.16 s.
+  English → French, `native`): speech deleted **40.63 s → 4.69 s**, lines that lost
+  speech 179 → **31**, lines losing >10% 135 → **23**, worst single line 97.5% →
+  51.4%, synthesis 699 s → **461 s**, and the sync gate still passes with lateness
+  bounded at `--max-overrun` (0.25 s; `shifted_seconds_max` 0.25). Four changes did
+  it: the delivery-rate probe (cloned voices measured at 3.57 / 4.00 words/s against
+  the accent clip's 2.97, so translations landed on the ceiling — words ÷ ceiling
+  median 1.00, mean 0.95 — instead of 1.5–1.8× over it); the pre-synthesis word
+  check (39 of 144 offenders reworded, 945 of 1047 words kept); dead-air trimming
+  (74 s removed); and a bounded overrun instead of a cut. ASR re-segmented between
+  runs (489 / 471 / 478 lines), so the deltas are indicative, not controlled.
+- **A cascade found on the way**: with the allowance spent per *step*, a run of
+  tight lines pushed the stream steadily later (27 lines in a row, worst 1.89 s).
+  The allowance is now bounded per *line* — a line that is already late loses it and
+  is cut instead — and the mix stage tracks the placement cursor to know. Priced on
+  the job's own durations: allowance 0 → 66 lines / 8.90 s cut; 0.25 → 31 / 4.69 s;
+  0.5 → 15 / 2.63 s; 0.75 → 4 / 0.40 s.
 - Full pytest suite green (no GPU, models or ffmpeg needed — heavy parts are faked).
 - **Blend strength A/B** (2026-09-29, `input/veo-studio-creation.mp4`, 8 s, 2 lines,
   same 4.7 s donor, `native` unless stated): a human accent clip clears a
@@ -121,8 +125,10 @@ design:
   A dub 5 s behind the video is worse than a missing syllable.
 - **Final design.** `fit_line(max_overrun=…)` receives the *gap* before the next
   utterance. A line may spill into that silence for free; only the residue is
-  trimmed, because overrunning it would desync the video. Lines are never shifted
-  late (`shifted_segments: 0`), so sync is exact.
+  trimmed, because overrunning it would desync the video. A line may now borrow up
+  to `--max-overrun` seconds of the next line's time before anything is deleted, so
+  `shifted_segments` is non-zero by design and the gate judges `shifted_seconds_max`
+  rather than the count (see the P3 follow-up).
 
 | Metric | Before | After |
 |---|---|---|
@@ -384,11 +390,47 @@ What shipped (all default-on, each measured):
    one's start can land a sample past it; that is rounding, not desync, and calling
    it a shift would fail the QC gate on arithmetic.
 
-Verified on the 11-minute job (numbers in §0). The remaining 6.74 s is confined to
+Verified on the 11-minute job (numbers in §0). The remaining 6.74 s was confined to
 lines whose source slot is impossible — `needed_ratio` down to 0.15, e.g. four
-words in 0.16 s because Whisper squeezed that stretch of speech. Neither tempo nor
-wording can fix those; the candidates are a bounded late shift (desync) or
-upstream re-segmentation of over-packed regions. Not taken.
+words in 0.16 s because Whisper squeezed that stretch of speech — so two further
+rounds followed, both measured first:
+
+**Lateness instead of deletion.** The 52 remaining lines each missed their window by
+a *median of 0.11 s* (p90 0.22, p99 0.39), in 43 chains whose longest was four
+lines, so lateness rarely compounds. Two remedies were priced against the real
+fitted durations:
+
+- *Compress deeper* cannot do it: the median stubborn line needs 0.64 (56% faster),
+  and even a 0.65 floor still cuts 28 lines / 3.02 s.
+- *Allow an overrun* `B` seconds per line: 0.15 → 1.82 s cut, **0.25 → 0.70 s**,
+  0.35 → 0.41 s, unlimited → 0 with one line 1.15 s late.
+
+Shipped `max_overrun` = 0.25 s (`--max-overrun`; `0` restores the old exact sync).
+`_stage_mix` passes `max_overrun = gap + allowance` and
+`available = window + allowance`, and `_overrun_seconds` mirrors both through
+`fit_ratio` so the repair no longer fires for a line the mixer can now fit. The sync
+gate had to change with it: `max_shifted_segments` (a count, limit 0) is now
+`max_shift_seconds` (`audit_qc.py --max-shift`), with a 0.02 s tolerance so a run
+sitting exactly on its policy does not fail on rounding.
+
+**The first run taught the difference between per-step and per-line.** Spending the
+allowance per step let a run of tight lines push the stream steadily later: 248
+lines late, a chain of 27, the worst 1.89 s. The allowance is now bounded *per line*
+— `_stage_mix` tracks the placement cursor, a line that is already late loses its
+allowance, and it is cut instead — so no chain can exceed it. The final run: 31 lines
+losing 4.69 s, lateness bounded at 0.25 s, sync gate pass. The curve, simulated on
+the job's own fitted durations and confirmed against the run: allowance 0 → 66 lines
+/ 8.90 s; 0.25 → 31 / 4.69 s; 0.5 → 15 / 2.63 s; 0.75 → 4 / 0.40 s.
+
+**The timing was wrong, not the text.** Whisper squeezed consecutive lines into less
+time than their words need — 9 words in 0.9 s, and on the real job **60 runs over 94
+lines, worst 70.0 words/s** against a 4.7 w/s speaker. `timing.redistribute_packed`
+re-times such a run before translation: each line takes a share of the run's span
+plus the pause after it, proportional to its words (`distribute_seconds`, with a
+0.3 s floor). The run keeps its start and never passes the next line's start, so
+nothing outside it moves and **no sync is traded** — it only fixes boundaries that
+were impossible, and widens the word budget for the lines that had none. Reported in
+`report.json` → `packed`, absent when the boundaries were already plausible.
 
 Deviations from the original plan (deliberate, documented):
 - **`silero-vad` dependency dropped.** faster-whisper bundles an ONNX Silero VAD
@@ -990,7 +1032,7 @@ exits non-zero when one fails.
 
 | Gate | Checks | Default |
 |---|---|---|
-| `sync` | No line pushed later than its slot | `shifted_segments == 0` |
+| `sync` | No line more than the allowance late | `shifted_seconds_max <= 0.25` |
 | `truncation` | No line loses a meaningful share of its words | worst ≤ 10%, none over 10% |
 | `loudness` | The dub sits at the source's level | within 1.5 dB |
 | `timbre` | No line followed the accent voice | 0% of lines (needs `--timbre`) |
@@ -1000,10 +1042,12 @@ Three decisions worth recording:
 - **It never blocks the pipeline.** The dub is written before the gate runs, so a
   failure is a verdict on the delivery rather than a reason to discard the work —
   which is also what makes it usable in CI and by hand on any completed job.
-- **Overrun is not gated.** A line spilling into the pause before the next utterance
-  costs nothing and is *how* sync is preserved, so a threshold there would fail
-  legitimate lines that filled a long silence. Only `shifted_segments` means desync;
-  overrun is reported as context.
+- **Overrun is not gated, and lateness is gated by *amount*.** A line spilling into
+  the pause before the next utterance costs nothing and is *how* sync is preserved.
+  Since the mixer may also borrow up to `--max-overrun` seconds from the next line's
+  time rather than delete a word, the sync gate compares `shifted_seconds_max`
+  against that policy instead of counting moved lines — a run that borrowed 0.1 s is
+  not the same defect as one that started a line a second late.
 - **A gate that cannot run is `skip`, never `pass`.** Missing timbre data or an
   unmeasurable source level must not read as a clean bill of health.
 
@@ -1398,7 +1442,13 @@ video.mp4
    │     re-transcribe it (the second voice is not in Whisper's single output)
    ▼
 02d_overlap_segments.json    # [{parent_id, speaker, start, end, text}]
-   │  ⑤ blend — reference-accent only: accent codes + each speaker's embedding
+   │  ⑤ re-time impossible stretches: a run of consecutive lines whose words could
+   │     not have been spoken at 6.5 w/s or more is redistributed over its own span
+   │     plus the pause after it, so the word budget and the slots agree with reality.
+   │     Nothing outside the run moves, so no sync is traded (see P3 follow-up)
+   ▼
+lines (in memory; 02_transcript.json keeps what ASR said)
+   │  ⑤b blend — reference-accent only: accent codes + each speaker's embedding
    │     rendered once per voice, then re-iterated toward that speaker until
    │     `donor_ratio` reaches --blend-ratio (see P3c)
    ▼
@@ -1421,8 +1471,9 @@ video.mp4
    ▼
 04_dubbed/seg_*.wav
    │  ⑧ drop each line's dead air, fit it to its window (rubberband → sox →
-   │     librosa) compressing to the floor and spending the following pause
-   │     before more tempo, place on the timeline, duck the bed under dialogue,
+   │     librosa) compressing to the floor, spending the following pause before
+   │     more tempo, and borrowing up to --max-overrun from the next line's time
+   │     before anything is cut; place on the timeline, duck the bed under dialogue,
    │     match EBU R128 loudness (`--room match` also convolves the source's
    │     measured decay and adds a room-tone floor, before the bed is ducked
    │     more gently)
@@ -1511,6 +1562,7 @@ overlap_separator: auto          # auto | sepformer | none
 # Timing
 min_stretch: 0.75                # compression floor: past it the wording gives, not the audio
 max_stretch: 1.18
+max_overrun: 0.25                # lateness a line may borrow from the next line's time
 length_budget: words             # off | words
 budget_speedup: 0.85             # tempo the per-line word ceiling is willing to spend
 
@@ -1594,7 +1646,9 @@ enforced; that gap sits outside this roadmap and is tracked separately.
 - Same voice timbre as the source speaker — subjective listen ✅ **plus** SECS ✅
   (`audit_timbre.py`, run by hand).
 - Audio synchronized to the source timeline within ~100 ms at segment anchors ✅
-  (measured drift 0.000 s; lines are never shifted late).
+  (measured drift 0.000 s at the time of this check, i.e. before the bounded
+  overrun existed; a line may now start up to `--max-overrun` late, and
+  `report.json` → `shifted_seconds_max` says what a run actually used).
 - Quality signals thresholded into a gate rather than inspected by hand ✅
   (`audit_qc.py`, P3e). The gate reports; it does not block delivery, so a
   failure is a verdict on the finished job rather than a lost run.

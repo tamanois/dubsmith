@@ -63,6 +63,7 @@ from .timing import (
     detect_stretcher,
     fit_line,
     fit_ratio,
+    redistribute_packed,
     trim_silence,
 )
 from .translate import (
@@ -378,6 +379,8 @@ class Pipeline:
         #: already loaded is not rebuilt. The rate probe primes every voice and the
         #: synthesis that follows starts on the voice it left off on.
         self._primed_speaker: str | None = None
+        #: Runs of lines whose ASR timing was impossible, and what the repair did.
+        self._packed_runs: list[dict[str, Any]] = []
         #: Donor per speaker and its report record, resolved once and shared by the
         #: blend and synthesis stages. ``None`` until either of them needs it.
         self._donors_resolved: (
@@ -424,6 +427,25 @@ class Pipeline:
             # segment replaced by one line per voice. Donor selection and the source
             # subtitles keep using the original ASR segments.
             lines = self._dub_lines(transcript)
+            # Whisper's boundaries occasionally squeeze consecutive lines into a
+            # fraction of the time their words need (measured: nine words in 0.9 s,
+            # four of them in 0.16 s). The text is right and the timing is not, so
+            # the slots are re-timed here - before the word budget is derived from
+            # them - and never past the next line's start, so nothing downstream
+            # moves and no sync is traded away.
+            self._packed_runs = redistribute_packed(lines)
+            if self._packed_runs:
+                self.log.info(
+                    "Re-timed %d run(s) of impossible ASR timing (%d line(s), worst "
+                    "%.1f words/s): %s.",
+                    len(self._packed_runs),
+                    int(sum(run["lines"] for run in self._packed_runs)),
+                    max(run["worst_wps"] for run in self._packed_runs),
+                    ", ".join(
+                        f"{int(run['from_id'])}-{int(run['to_id'])}"
+                        for run in self._packed_runs[:5]
+                    ),
+                )
             # Free the ASR model's cache before TTS loads its own weights;
             # otherwise the two multi-GB models contend for the same GPU.
             release_gpu_memory()
@@ -944,6 +966,25 @@ class Pipeline:
         )
         stats.pop("lines", None)
         return stats
+
+    def _packed_stats(self) -> dict[str, Any] | None:
+        """What the ASR-timing repair changed, or ``None`` when nothing needed it.
+
+        Absent rather than empty for the usual case, so a job whose boundaries were
+        already plausible reports exactly what it did before the repair existed.
+        """
+        if not self._packed_runs:
+            return None
+        return {
+            "runs": len(self._packed_runs),
+            "lines": int(sum(run["lines"] for run in self._packed_runs)),
+            "worst_wps": max(run["worst_wps"] for run in self._packed_runs),
+            "seconds_added": round(
+                sum(run["now_seconds"] - run["was_seconds"] for run in self._packed_runs),
+                2,
+            ),
+            "detail": self._packed_runs,
+        }
 
     def _refine_stats(self) -> dict[str, Any]:
         """What the length repair achieved, or zeros when it did not run."""
@@ -2295,9 +2336,12 @@ class Pipeline:
     def _overflow_seconds(self, raw_seconds: float, index: int) -> float:
         """How far a line of ``raw_seconds`` would overflow its window.
 
-        Mirrors the mix stage exactly - both go through ``fit_ratio`` - so what
-        this predicts is what the mixer will actually have to trim. The final line
-        has no successor to protect, so it may run freely.
+        Mirrors the mix stage - both go through ``fit_ratio`` - so what this predicts
+        is close to what the mixer will have to trim. It assumes the full overrun
+        allowance is available, which is optimistic for a line the timeline has
+        already pushed late; that only means the repair fires slightly less often
+        than it could, never that it makes a line worse. The final line has no
+        successor to protect, so it may run freely.
         """
         segments = self._segments_for_refine
         segment = segments[index]
@@ -2306,7 +2350,8 @@ class Pipeline:
             return 0.0
         if index + 1 >= len(segments) and not segment.overlay:
             return 0.0
-        window = _available_seconds(segments, index)
+        allowance = 0.0 if segment.overlay else self.job.max_overrun
+        window = _available_seconds(segments, index) + allowance
         ratio = fit_ratio(
             slot,
             window,
@@ -2400,7 +2445,8 @@ class Pipeline:
                 raw = spoken_seconds_of(wavs[index])
                 ratio = fit_ratio(
                     segment.duration,
-                    _available_seconds(segments, index),
+                    _available_seconds(segments, index)
+                    + (0.0 if segment.overlay else self.job.max_overrun),
                     raw,
                     min_ratio=self.job.min_stretch,
                     max_ratio=self.job.max_stretch,
@@ -2507,6 +2553,15 @@ class Pipeline:
             silence_trimmed: dict[int, float] = {}
             segments = lines
 
+            # Lateness is bounded in *total*, not per line. ``build_timeline`` places
+            # each line after the previous one's audio, so an uninterrupted run of
+            # tight lines would otherwise push the stream steadily later - measured
+            # on a real job, 27 lines in a row with the last one 1.9s late. A line
+            # that is already late therefore loses its allowance and has its tail
+            # cut instead: the sync budget belongs to the line, not to the chain.
+            # The cursor mirrors ``build_timeline`` exactly, which is why it is kept
+            # here rather than derived afterwards.
+            cursor = 0.0
             for index, segment in enumerate(segments):
                 path = dubbed.get(segment.id)
                 synth: np.ndarray | None = None
@@ -2524,18 +2579,18 @@ class Pipeline:
                         / float(sample_rate),
                     )
 
-                # A line may spill into the silence before the next utterance:
-                # that costs nothing (nobody is talking) and avoids cutting
-                # words - and the gap is spent before tempo, so the mixer speeds
-                # speech up only as far as it must. Anything beyond the gap would
-                # push the next line late, so the residue is trimmed. The last
-                # line may run freely. An overlay line shares its slot with the
-                # dominant line, so it must not spill.
+                start = segment.start if segment.overlay else max(segment.start, cursor)
+                allowance = max(
+                    0.0, self.job.max_overrun - max(0.0, start - segment.start)
+                )
+                # An overlay line shares its slot with the dominant line, so it may
+                # not spill at all. The last line has nothing after it to protect, so
+                # it may run freely - which also means it cannot push anything.
                 window = _available_seconds(segments, index)
                 if segment.overlay:
                     max_overrun: float | None = 0.0
                 elif index + 1 < len(segments):
-                    max_overrun = _gap_seconds(segments, index)
+                    max_overrun = _gap_seconds(segments, index) + allowance
                 else:
                     max_overrun = None
 
@@ -2547,7 +2602,7 @@ class Pipeline:
                     min_ratio=self.job.min_stretch,
                     max_ratio=self.job.max_stretch,
                     max_overrun=max_overrun,
-                    available=window,
+                    available=window + (0.0 if segment.overlay else allowance),
                 )
                 ratios[segment.id] = ratio
                 kept = len(fitted) / float(sample_rate)
@@ -2572,6 +2627,10 @@ class Pipeline:
                     needed[segment.id] = 1.0
 
                 items.append((segment.id, segment.start, fitted))
+                if not segment.overlay:
+                    # Exactly what build_timeline will place next: a padded line is as
+                    # long as its slot, a compressed one as long as it came out.
+                    cursor = start + len(fitted) / float(sample_rate)
 
             overlay_ids = {segment.id for segment in segments if segment.overlay}
             timeline = build_timeline(
@@ -2864,6 +2923,10 @@ class Pipeline:
             effective_duck = None
         ratios = [p.ratio for p in timeline.placements]
         shifted = sum(1 for p in timeline.placements if p.shifted)
+        #: How late each line actually starts, which is what the eye notices. The
+        #: mixer may borrow `max_overrun` seconds from the next line's time, so a
+        #: run with a non-zero count is expected now; the amount is what is judged.
+        lates = [max(0.0, p.start - p.source_start) for p in timeline.placements]
         overruns = [p.overrun for p in timeline.placements]
         trimmed = [p.trimmed for p in timeline.placements]
         deficits = [p.deficit for p in timeline.placements]
@@ -2998,6 +3061,11 @@ class Pipeline:
                 round(words / spoken_total, 2) if spoken_total > 0 else None
             ),
             "shifted_segments": shifted,
+            "shifted_seconds_total": round(sum(lates), 2),
+            "shifted_seconds_max": round(max(lates), 3) if lates else 0.0,
+            #: The lateness policy in force, so a report states the limit its own
+            #: shift numbers should be read against.
+            "max_overrun": self.job.max_overrun,
             # Lines that used the gap before the next utterance instead of being
             # cut. Speech is only dropped when it would have desynchronised the
             # video, which `trimmed_seconds_total` measures.
@@ -3038,6 +3106,11 @@ class Pipeline:
         overlap = self._overlap_stats()
         if overlap is not None:
             report["overlap"] = overlap
+        #: Present only when ASR timing had to be repaired, so an ordinary report is
+        #: unchanged by this feature.
+        packed = self._packed_stats()
+        if packed is not None:
+            report["packed"] = packed
         # Present only when room matching was requested, so a dry run's report
         # stays byte-for-byte what it was before this feature existed.
         if room is not None:

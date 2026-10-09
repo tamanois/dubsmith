@@ -30,6 +30,7 @@ from pipeline import __version__
 from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
     DEFAULT_BUDGET_SPEEDUP,
+    DEFAULT_MAX_OVERRUN,
     DEFAULT_MIN_SPEAKER_S,
     SUPPORTED_LANGUAGES,
     JobConfig,
@@ -232,6 +233,17 @@ def build_dub_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.18,
         help="Maximum slow-down applied to fill a slot.",
+    )
+    parser.add_argument(
+        "--max-overrun",
+        dest="max_overrun",
+        type=float,
+        default=DEFAULT_MAX_OVERRUN,
+        help=(
+            "Seconds a line may run past its window - into the next line's time - "
+            "before the excess is cut. A fraction of a second of lateness is "
+            "cheaper than a deleted word; 0 restores exact sync and cuts instead."
+        ),
     )
     parser.add_argument(
         "--loudness",
@@ -817,6 +829,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         tts_batch=args.tts_batch,
         min_stretch=args.min_stretch,
         max_stretch=args.max_stretch,
+        max_overrun=args.max_overrun,
         loudness_target=args.loudness_target,
         target_lufs=args.target_lufs,
         keep_background=args.keep_background,

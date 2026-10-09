@@ -21,13 +21,16 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Collection, Protocol, Sequence
 
 import numpy as np
 import soundfile as sf
 
 from .errors import DependencyError, TimingError
 from .media import limit_peaks, run_command, write_audio
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module import-light
+    from .asr import Segment
 
 __all__ = [
     "TimeStretcher",
@@ -38,6 +41,8 @@ __all__ = [
     "detect_stretcher",
     "compute_ratio",
     "fit_ratio",
+    "redistribute_packed",
+    "MAX_SOURCE_WPS",
     "fit_line",
     "trim_silence",
     "Placement",
@@ -319,6 +324,134 @@ def trim_silence(
         # returning a stub would turn a long line into a stretched click.
         return data
     return np.ascontiguousarray(data[start:stop])
+
+
+#: Words per second above which a stretch of speech cannot have been spoken, so its
+#: *timestamps* are wrong rather than its content being fast. Measured on the
+#: 11-minute job: the speaker averages 4.7 w/s and the segments that lose words
+#: read 8-25 w/s. Nothing downstream can fit those - the words are real, the timing
+#: is not - so the slot is what gets repaired, not the text.
+MAX_SOURCE_WPS = 6.5
+
+#: Shortest slot a re-flow will hand a line. Below this a subtitle is unreadable and
+#: the line has no room to be spoken at all, so the run is better left evenly split.
+_MIN_REDISTRIBUTED_S = 0.3
+
+
+def distribute_seconds(weights: Sequence[float], total: float) -> list[float]:
+    """Split ``total`` seconds in proportion to ``weights``, with a floor each.
+
+    Kept separate from :func:`redistribute_packed` so the arithmetic is testable on
+    its own. The floor wins where it must, and whatever the floored shares take is
+    removed from the ones that still have room - so the total is preserved exactly.
+    """
+    if not weights or total <= 0.0:
+        return [0.0 for _ in weights]
+    positive = [max(0.0, float(weight)) for weight in weights]
+    if sum(positive) <= 0.0:
+        positive = [1.0 for _ in weights]
+    # Infeasible floors would never converge, so cap it at an even split.
+    floor = min(_MIN_REDISTRIBUTED_S, total / len(weights))
+    shares = [max(floor, total * weight / sum(positive)) for weight in positive]
+    for _ in range(len(shares)):
+        excess = sum(shares) - total
+        if excess <= 1e-9:
+            break
+        room = [max(0.0, share - floor) for share in shares]
+        if sum(room) <= 0.0:
+            break
+        shares = [share - excess * free / sum(room) for share, free in zip(shares, room)]
+        shares = [max(floor, share) for share in shares]
+    return [max(0.0, share) for share in shares]
+
+
+def redistribute_packed(
+    segments: Sequence[Segment],
+    *,
+    max_wps: float = MAX_SOURCE_WPS,
+) -> list[dict[str, Any]]:
+    """Re-time runs of lines whose words could not have fitted their span.
+
+    Whisper's boundaries occasionally squeeze consecutive segments into a fraction
+    of the time their words need: measured, four words in 0.16 s with the next
+    segment starting 0.02 s later, inside a stretch holding nine words in 0.9 s.
+    The text is right and the timing is impossible, so the *slot* is repaired: a
+    run keeps its start and may use the pause that follows it, and each line is
+    given a share of that time in proportion to its own words.
+
+    The run never passes the next line's start, so no line outside it moves and
+    sync is not traded away - only boundaries that were impossible are changed.
+    Segments are mutated in place, like the diarization labels, and the caller is
+    expected to run this before translating so the word budget sees the new slots.
+
+    Args:
+        segments: The lines to inspect, in timeline order.
+        max_wps: Words per second above which a span is treated as broken timing.
+
+    Returns:
+        One record per run that was re-timed, for the log and the report.
+    """
+    ordered = list(segments)
+    changes: list[dict[str, Any]] = []
+    index = 0
+    while index < len(ordered):
+        words = len(ordered[index].text.split())
+        span = ordered[index].duration
+        if span <= 0.0 or words / span <= max_wps:
+            index += 1
+            continue
+
+        # Grow the run while the words collected still do not fit the region they
+        # occupy. It stops at the first line that brings the region back to a
+        # plausible pace, which is where the boundaries start making sense again.
+        last = index
+        while last + 1 < len(ordered):
+            candidate = ordered[last + 1]
+            grown = words + len(candidate.text.split())
+            grown_span = candidate.end - ordered[index].start
+            if grown_span <= 0.0 or grown / grown_span <= max_wps:
+                break
+            words, last = grown, last + 1
+
+        first_segment = ordered[index]
+        if last + 1 < len(ordered):
+            available = ordered[last + 1].start - first_segment.start
+        else:
+            # Nothing after the run to borrow from: the mixer already lets the last
+            # line run freely, so there is nothing to fix here.
+            index = last + 1
+            continue
+
+        run = ordered[index : last + 1]
+        weights = [len(segment.text.split()) for segment in run]
+        if available <= 0.0 or sum(weights) <= 0.0:
+            index = last + 1
+            continue
+        before = [segment.duration for segment in run]
+        cursor = first_segment.start
+        for segment, share in zip(run, distribute_seconds(weights, available)):
+            segment.start = round(cursor, 3)
+            segment.end = round(cursor + share, 3)
+            cursor += share
+        changes.append(
+            {
+                "from_id": run[0].id,
+                "to_id": run[-1].id,
+                "lines": float(len(run)),
+                "words": float(sum(weights)),
+                "was_seconds": round(sum(before), 3),
+                "now_seconds": round(cursor - first_segment.start, 3),
+                "worst_wps": round(
+                    max(
+                        (len(s.text.split()) / d if d > 0 else 0.0)
+                        for s, d in zip(run, before)
+                    ),
+                    1,
+                ),
+            }
+        )
+        index = last + 1
+    return changes
 
 
 def _fit_length(

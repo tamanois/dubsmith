@@ -848,6 +848,7 @@ a space.
 |---|---|---|
 | `--min-stretch RATIO` | `0.75` | Compression floor: how much faster than natural a line may be played to fit its slot. It is a clarity limit rather than the point where words are cut — past it the wording has to give instead, because the alternative is deleting speech. Lower = faster speech, and it can start to sound hurried. |
 | `--max-stretch RATIO` | `1.18` | Most a line may be slowed to fill its slot. Raising this makes speech sound unnatural, so prefer fixing the translation. |
+| `--max-overrun SECONDS` | `0.25` | How far a line may run past its window — into the next line's time — before the excess is cut. The pause after the line is spent first (free); this covers the rest, because a fraction of a second of lateness is a smaller defect than a deleted word. `0` restores exact sync and cuts the tails instead. |
 | `--stretcher BACKEND` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none`. `none` disables stretching (lines then only overrun or trim). Falls back automatically if a binary is missing. |
 
 **Length repair** — fixes a long translation by wording rather than by cutting audio.
@@ -909,6 +910,12 @@ length and a cut, in the order they apply.
 4. **The measured repair** (`--refine`, default on). Lines that still overrun are
    reworded against *real* audio: their spoken length, the time actually available,
    and a ceiling derived from that measurement. Only those lines are re-synthesised.
+5. **A bounded overrun** (`--max-overrun`, default `0.25 s`). A line that still does
+   not fit may run up to a quarter of a second past its window, which the next line
+   absorbs by starting that much later. This is the last guard before the cut: on
+   the 11-minute job it is what stands between 52 damaged lines and four. It is
+   lateness, not clarity — the alternatives were a 0.64 tempo on half those lines
+   (audible) or deleting their last word.
 
 Dead air goes first, for every line: a synthesised clip often opens with a tenth to
 a third of a second of digital silence (`silence_trimmed_seconds_total` reports
@@ -920,6 +927,26 @@ The writes are all kept separate so a run explains itself: `03_script.json` is w
 the model said, `03d_prefit.json` what the pre-synthesis check changed, and
 `03b_spoken.json` what the measured repair changed. The subtitles follow the last
 of those, so they never display words the viewer cannot hear.
+
+#### When the *source* timing is the problem
+
+Whisper's boundaries occasionally squeeze consecutive lines into less time than
+their words need — measured on the 11-minute job, nine words in 0.9 s, four of them
+in 0.16 s with the next line starting 0.02 s later. No tempo, wording or allowance
+fits that, because the text is right and the timing is not.
+
+Those stretches are repaired **before** anything is translated: a run of
+consecutive lines whose words could not have been spoken at 6.5 words/s or more
+(the speaker on that job averages 4.7) is re-timed, each line taking a share of the
+run's span and of the pause that follows it, in proportion to its own word count.
+The run keeps its start, never passes the next line's start, and every line outside
+it keeps its own time — so the repair **trades no sync at all**, it only fixes
+boundaries that were impossible. `report.json` → `packed` records what it did, and
+the block is absent when the boundaries were already plausible.
+
+The repair also widens the word budget for those lines: a slot that held four words
+in 0.16 s now holds a sentence, which is what stops the translator being asked for
+the impossible.
 
 Three properties make it safe to leave on:
 
@@ -955,33 +982,45 @@ lines) and the deltas are indicative rather than perfectly controlled:
 
 | Metric | Before | After |
 |---|---|---|
-| Speech deleted | 40.63 s | **6.74 s** |
-| Lines that lost speech | 179 | **52** |
-| Lines losing >10% of their speech | 135 | **34** |
-| Worst single line deleted | 97.5% | 80% |
-| Speech fitted into the following pauses | 43.97 s | 30.35 s |
-| Dead air removed from clip ends | — | 31.59 s (277 lines) |
-| Synthesis stage | 699 s | **497 s** |
-| Desync (`shifted_segments`) | 0 | 0 |
+| Speech deleted | 40.63 s | **4.69 s** |
+| Lines that lost speech | 179 | **31** |
+| Lines losing >10% of their speech | 135 | **23** |
+| Worst single line deleted | 97.5% | 51.4% |
+| Speech fitted into the following pauses | 43.97 s | 26.82 s |
+| Dead air removed from clip ends | — | 74.12 s (277 lines) |
+| Lines starting within `--max-overrun` of their source | 0 | 228 (worst 0.25 s) |
+| Synthesis stage | 699 s | **461 s** |
+| Sync gate | pass | **pass** |
 
-Three things did most of the work: the probe measured the cloned voices at 3.52
-and 3.60 words/s where the accent clip reads 2.97, so the ceilings sent to the
-translator rose by about a fifth and the translations landed **on** them
-(words ÷ ceiling: median 1.00, mean 0.95, against 1.5–1.8× before); the
-pre-synthesis check reworded 41 of the 152 lines that still missed, keeping 985 of
-their 1100 words; and dropping the dead air from clip ends removed 31.6 s that had
-been charged to the compression budget. Synthesis got *faster* despite the extra
+Four things did most of the work: the probe measured the cloned voices at 3.57 and
+4.00 words/s where the accent clip reads 2.97, so the ceilings sent to the
+translator rose and the translations landed **on** them (words ÷ ceiling: median
+1.00, mean 0.95, against 1.5–1.8× before); the pre-synthesis check reworded 39 of
+the 144 lines that still missed, keeping 945 of their 1047 words; dropping dead air
+from clip ends removed 74 s that had been charged to the compression budget; and
+`--max-overrun` turned the lines that could still not fit into a quarter-second of
+lateness instead of a deleted tail. Synthesis got *faster* despite the extra
 translator call, because 192 lines used to be spoken twice.
 
-What is left is not a translation problem. All 52 remaining lines are ones whose
-*source* slot is physically too short — `worst_trimmed_lines` starts at
-`needed_ratio 0.15`, i.e. a line that would have to be compressed to under a sixth
-of its natural length. `id 211` is four words given 0.16 s, with the next segment
-starting 0.02 s later: Whisper's boundaries squeezed that stretch of speech until
-it holds nine words in 0.9 s, which no speaker could say. The mixer cannot invent
-the time, the wording cannot shrink "What's the next snack?" much further, and the
-only remaining answers are shifting those lines late (desync) or fixing the
-segmentation upstream. None of them is taken here.
+#### Trading deletions for lateness
+
+The remaining lines are ones whose **source** region is genuinely over-packed: the
+dub needs about 1.5× the time the original had, so either its tail is cut or it
+starts late. `--max-overrun` moves along that curve, and the lateness is bounded
+*per line* — a line that is already late loses its allowance and is cut instead, so
+a long stretch of tight lines cannot walk the dub out of sync. Simulated over the
+job's own fitted durations (and confirmed by the run at 0.25 s):
+
+| `--max-overrun` | Lines that lose speech | Speech lost | Worst lateness |
+|---|---|---|---|
+| `0` (exact sync) | 66 | 8.90 s | 0 |
+| `0.25` (default) | 31 | 4.69 s | 0.25 s |
+| `0.5` | 15 | 2.63 s | 0.50 s |
+| `0.75` | 4 | 0.40 s | 0.75 s |
+
+Raising it is a one-flag decision per job, and the sync gate judges the result:
+`audit_qc.py --max-shift 0.75` accepts 0.75 s of lateness, and `shifted_seconds_max`
+says what a run actually used.
 
 ### Verified commands
 These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
@@ -1000,6 +1039,22 @@ figures come from each run's `report.json`.
 The last row is the configuration to aim for: a fast-paced native clip as the
 accent source gives near-native pronunciation with almost no speech lost. Full
 run takes about 2 minutes 45 seconds.
+
+The timing knobs were measured on a longer, harder job: an 11-minute English →
+French video with two speakers (`input/louisavy-11m.mp4`), where the source talks
+at 4.7 words/s and the French clone delivers 3.6. `--max-overrun` is the knob that
+decides whether a line that still does not fit loses its tail or starts late:
+
+| Command | Result |
+|---|---|
+| `--video louisavy-11m.mp4 --target fr` (defaults) | **run**: 4.69 s of speech deleted across **31** lines; lateness bounded at `shifted_seconds_max` 0.25 s; synthesis 461 s; `audit_qc.py` passes sync |
+| `… --max-overrun 0` | **simulated** on the same job's fitted durations: 8.90 s deleted across 66 lines, every line exactly on its source time |
+| `… --max-overrun 0.75` | **simulated** on the same durations: 0.40 s deleted across 4 lines, worst line 0.75 s late (`audit_qc.py --max-shift 0.75` accepts it) |
+
+The simulations are the same model that reproduced the run's own 0.25 s result to
+the line (31 lines, 4.67 s predicted against 31 and 4.69 s measured), which is why
+they are quoted — but they are predictions, not runs. The full curve is in
+[When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot).
 
 ---
 
@@ -1091,7 +1146,10 @@ output/talk/
 | `lines_over_10pct_deleted` | Lines that lost more than a tenth of their speech |
 | `speech_rate_wps` | Words per second the cloned voice actually delivered, measured on the placed audio (dead air excluded, stretch included) — compare it with `delivery_wps` to see whether the probe was right |
 | `refine` | What the length repair did: offenders, improved, seconds reclaimed |
-| `shifted_segments` | Lines pushed later to avoid overlapping another |
+| `shifted_segments` | Lines that start later than their source, because they used the overrun allowance |
+| `shifted_seconds_total` / `shifted_seconds_max` | How late they run, in total and at worst. `max` is the number the sync gate judges |
+| `max_overrun` | The lateness policy this run was given (`--max-overrun`) |
+| `packed` | Present only when ASR timing had to be repaired: how many runs of lines Whisper squeezed into less time than their words need, how many lines that was, the worst words/second and the seconds added back. Absent — not `null` — when the boundaries were already plausible |
 
 Two of these deserve attention:
 
@@ -1111,7 +1169,10 @@ if it does not, the material was too dynamic to reach the target cleanly.
   remainder at zero, in order: the word ceiling the translator is given, the
   pre-synthesis check that rewords whatever still misses it, and the floor itself.
   `needed_below_floor_segments` counts the lines that got past all three, and
-  `worst_trimmed_lines` names them. Nothing is ever shifted late: sync is exact.
+  `worst_trimmed_lines` names them. What is left is what the overrun allowance could
+  not cover: a line may run up to `--max-overrun` seconds past its window instead of
+  losing its tail, and the lines that do are counted in `shifted_segments` with their
+  lateness in `shifted_seconds_max`.
 
 ### Caching
 
@@ -1265,14 +1326,14 @@ python audit_qc.py "output/<input-stem>" --json        # machine-readable
 
 | Gate | Checks | Default limit |
 |---|---|---|
-| `sync` | No line pushed later than its slot | `shifted_segments == 0` |
+| `sync` | No line starts more than the allowance late | `shifted_seconds_max <= 0.25` (override with `--max-shift`) |
 | `truncation` | No line loses a meaningful share of its words | worst line ≤ 10%, no line over 10% |
 | `loudness` | The dub sits at the source's level | within 1.5 dB (skipped if unmeasurable) |
 | `timbre` | No line followed the accent voice instead of the speaker's | 0% (needs `--timbre`) |
 
 Filling the pause after a line is *not* a failure — overrunning into silence costs
 nothing and is how sync is preserved — so `overrun` is reported as context rather
-than gated. Every limit can be overridden (`--max-shifted`, `--max-deleted-ratio`,
+than gated. Every limit can be overridden (`--max-shift`, `--max-deleted-ratio`,
 `--max-deleted-lines`, `--max-loudness-delta`, `--max-accent-share`). A gate that
 could not run (no timbre measurement, unmeasurable source loudness) is reported as
 **skipped**, never as a pass.
@@ -1308,7 +1369,7 @@ could not run (no timbre measurement, unmeasurable source loudness) is reported 
 | Lines sound slow or have gaps | `report.json` → `deficit_seconds_total`: the translation is shorter than its slot, i.e. the word ceiling was conservative. Check `delivery_wps` (the probe's measurement) against `speech_rate_wps` (what the voice actually delivered): if the probe reads well under the delivery, raise `--budget-speedup`. See also [Reference pacing](#reference-pacing) |
 | A rewrite did not help | Check `report.json` → `refine` (the measured pass) and → `prefit` (the pre-synthesis one). `attempted: false` means no line overflowed, or the translator cannot rewrite; `improved: 0` means the rewrites did not fit either, and the pre-fit check was skipped or its candidates were not shorter |
 | `delivery_wps` looks wrong for my video | It is measured from one 40-word probe render per voice, so a very expressive or very short-spoken video can differ from `speech_rate_wps` (what the lines actually delivered). Delete `<job>/03a_rate.json` to re-probe, or set `--budget-speedup`/`--min-stretch` yourself and leave the budget out of it with `--length-budget off` |
-| Dub drifts out of sync | Should not happen — lines are never shifted late. If `shifted_segments > 0`, check `timing.json` for genuinely overlapping source speech |
+| Dub drifts out of sync | Up to `--max-overrun` seconds per line is deliberate: it keeps the last word of a line that would otherwise lose it. Check `shifted_seconds_max` — if it is over the limit, the source speech genuinely overlaps itself, and `--max-overrun 0` restores exact sync at the cost of the line tails |
 | Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
 | Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
 | Music fights the voice | Raise `--duck-db` (default 6 dB) |

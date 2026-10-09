@@ -22,6 +22,7 @@ __all__ = [
     "ACCELERATORS",
     "DEFAULT_MIN_SPEAKER_S",
     "DEFAULT_BUDGET_SPEEDUP",
+    "DEFAULT_MAX_OVERRUN",
     "DTYPE_ALIASES",
     "DeviceInfo",
     "LANGUAGE_ALIASES",
@@ -162,6 +163,13 @@ DEFAULT_MIN_SPEAKER_S = 20.0
 #: than ``JobConfig.min_stretch``, so most lines land at or above 0.85 and only the
 #: stubborn ones reach the floor instead of the whole dub sounding rushed.
 DEFAULT_BUDGET_SPEEDUP = 0.85
+
+#: Seconds a line may run past its window - i.e. into the next line's time - before
+#: the excess is cut. A pause covers most of it (a line spills into the following
+#: gap first, which costs nothing); this covers the rest. Measured on the 11-minute
+#: job: at 0 s, 52 lines lost 6.74 s of speech; at 0.25 s, 4 lines lost 0.70 s,
+#: with the 46 lines that used the allowance starting a mean 0.12 s late.
+DEFAULT_MAX_OVERRUN = 0.25
 
 #: Accepted spellings for the loudness policy, normalised to two canonical forms.
 _LOUDNESS_POLICIES: dict[str, str] = {
@@ -342,6 +350,12 @@ class JobConfig(BaseModel):
     #: line needed more than 0.73 and none lost more than 1s.
     min_stretch: float = Field(default=0.75, gt=0.05, le=1.0)
     max_stretch: float = Field(default=1.18, ge=1.0, le=3.0)
+    #: Seconds a line may run past its window before the excess is deleted. The
+    #: following pause is spent first; this is what lets a line that needs a
+    #: fraction of a second more keep its last word instead of losing it. It costs
+    #: lateness, not clarity: the lines that use it start later than their source,
+    #: by at most this much.
+    max_overrun: float = Field(default=DEFAULT_MAX_OVERRUN, ge=0.0, le=2.0)
 
     # Length repair. Translations routinely come out longer than their slot;
     # re-wording the offending lines fits them without deleting speech.

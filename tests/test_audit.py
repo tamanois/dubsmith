@@ -67,6 +67,7 @@ def clean_report(**overrides: object) -> dict:
     """A report that passes every cheap gate, so a test can break one field."""
     report: dict = {
         "shifted_segments": 0,
+        "shifted_seconds_max": 0.0,
         "overrun_seconds_total": 0.4,
         "trimmed_seconds_total": 0.05,
         "worst_line_deleted_ratio": 0.0,
@@ -253,9 +254,14 @@ class TestEvaluate:
         assert gate(results, "loudness").status == "pass"
         assert gate(results, "timbre").status == "skip"  # not measured
 
-    def test_shifted_lines_fail_the_sync_gate(self) -> None:
-        results = evaluate(clean_report(shifted_segments=1))
+    def test_an_overdue_line_fails_the_sync_gate(self) -> None:
+        results = evaluate(clean_report(shifted_segments=1, shifted_seconds_max=0.6))
         assert gate(results, "sync").status == "fail"
+
+    def test_lateness_inside_the_allowance_passes(self) -> None:
+        """A fraction of a second of lateness is bought on purpose, not a defect."""
+        results = evaluate(clean_report(shifted_segments=46, shifted_seconds_max=0.25))
+        assert gate(results, "sync").status == "pass"
 
     def test_spilling_into_pauses_is_not_a_sync_failure(self) -> None:
         """Overrun is the designed behaviour, so it must not fail the gate."""
@@ -286,10 +292,10 @@ class TestEvaluate:
         assert "limited" in result.detail
 
     def test_thresholds_are_overridable(self) -> None:
-        report = clean_report(shifted_segments=2, worst_line_deleted_ratio=0.2)
-        limits = QCThresholds(
-            max_shifted_segments=2, max_worst_line_deleted_ratio=0.25
+        report = clean_report(
+            shifted_segments=2, shifted_seconds_max=0.5, worst_line_deleted_ratio=0.2
         )
+        limits = QCThresholds(max_shift_seconds=0.6, max_worst_line_deleted_ratio=0.25)
         results = evaluate(report, thresholds=limits)
         assert gate(results, "sync").status == "pass"
         assert gate(results, "truncation").status == "pass"
@@ -341,7 +347,9 @@ class TestSummarize:
         )
 
     def test_names_the_failed_gates(self) -> None:
-        payload = summarize(evaluate(clean_report(shifted_segments=3)))
+        payload = summarize(
+            evaluate(clean_report(shifted_segments=3, shifted_seconds_max=0.8))
+        )
         assert payload["passed"] is False
         assert payload["failed"] == ["sync"]
 
@@ -389,7 +397,7 @@ class TestQc:
     def test_the_other_gates_still_report_when_timbre_cannot_run(
         self, tmp_path: Path
     ) -> None:
-        write_report(tmp_path, shifted_segments=2)
+        write_report(tmp_path, shifted_segments=2, shifted_seconds_max=0.8)
         payload = qc(tmp_path, engine=FakeEncoder())
 
         assert payload["failed"] == ["sync"]

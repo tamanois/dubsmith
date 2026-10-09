@@ -97,10 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable results and nothing else.",
     )
     parser.add_argument(
-        "--max-shifted",
-        type=int,
+        "--max-shift",
+        type=float,
         default=None,
-        help="Maximum lines allowed to be shifted late. (default: 0)",
+        help=(
+            "Seconds a line may start later than its source before the sync gate "
+            "fails. (default: 0.25)"
+        ),
     )
     parser.add_argument(
         "--max-deleted-ratio",
@@ -136,10 +139,10 @@ def thresholds_from(args: argparse.Namespace) -> QCThresholds:
     """Apply only the overrides the user passed, so the defaults stay in code."""
     defaults = QCThresholds()
     return QCThresholds(
-        max_shifted_segments=(
-            args.max_shifted
-            if args.max_shifted is not None
-            else defaults.max_shifted_segments
+        max_shift_seconds=(
+            args.max_shift
+            if args.max_shift is not None
+            else defaults.max_shift_seconds
         ),
         max_worst_line_deleted_ratio=(
             args.max_deleted_ratio

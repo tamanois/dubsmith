@@ -884,7 +884,12 @@ class TestCaching:
 
 
 class TestLongTranslationUsesTheGap:
-    """A verbose translation may spill into silence, but never desynchronise."""
+    """A verbose translation may spill into silence, but never desynchronise.
+
+    With ``max_overrun=0``, which is what "exact sync" means now: the default buys
+    a fraction of a second of lateness instead of cutting. See
+    :class:`TestOverrunAllowance` for that side of the trade.
+    """
 
     @staticmethod
     def long_tone(seconds: float, sample_rate: int) -> np.ndarray:
@@ -909,7 +914,9 @@ class TestLongTranslationUsesTheGap:
     def test_gap_is_used_and_excess_is_reported(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
-        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript, tts=self.LongTTS())
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, tts=self.LongTTS(), max_overrun=0.0
+        )
         result = pipeline.run()
         report = result.report
 
@@ -923,8 +930,10 @@ class TestLongTranslationUsesTheGap:
     def test_no_timing_drift_is_introduced(
         self, tmp_path: Path, simple_transcript: Transcript
     ) -> None:
-        """Every line still starts exactly where the speaker did."""
-        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript, tts=self.LongTTS())
+        """With no allowance, every line still starts where the speaker did."""
+        pipeline, _, _, _ = make_pipeline(
+            tmp_path, simple_transcript, tts=self.LongTTS(), max_overrun=0.0
+        )
         pipeline.run()
         source_starts = {s.id: s.start for s in simple_transcript.segments}
         for placement in self.placements(pipeline):
@@ -1436,10 +1445,17 @@ def refine_pipeline(
     translator: Any | None = None,
     refine: bool = True,
     output_dir: Path | None = None,
+    **job_kwargs: Any,
 ) -> tuple[Pipeline, Any, ScriptedTTSEngine, ShorteningTranslator]:
-    """Build a pipeline whose TTS durations are scripted, so overflow is exact."""
+    """Build a pipeline whose TTS durations are scripted, so overflow is exact.
+
+    Defaults to ``max_overrun=0`` - no lateness allowance - because the tests built
+    on it were written against "fit the window or cut the residue". The allowance
+    has its own tests, which pass it explicitly.
+    """
     tts = ScriptedTTSEngine(rows)
     translator = translator or ShorteningTranslator(shortenings={0: "Bref."})
+    job_kwargs.setdefault("max_overrun", 0.0)
     pipeline, _, _, _ = make_pipeline(
         tmp_path,
         refine_transcript(),
@@ -1447,6 +1463,7 @@ def refine_pipeline(
         tts=tts,
         refine=refine,
         output_dir=output_dir or (tmp_path / "output"),
+        **job_kwargs,
     )
     return pipeline, translator, tts, translator
 
@@ -1590,6 +1607,115 @@ class TestLengthRepair:
         assert request.available_seconds == pytest.approx(2.5, abs=0.02)
         # 7 words in "[French] A long English sentence." scaled by 2.5/2.625
         assert 0 < request.max_words <= 6
+
+
+class TestImpossibleAsrTiming:
+    """A stretch Whisper squeezed into less time than its words need."""
+
+    @staticmethod
+    def packed_transcript() -> Transcript:
+        return Transcript(
+            language="en",
+            segments=[
+                Segment(id=0, start=0.0, end=0.20, text="Okay."),
+                Segment(id=1, start=0.24, end=0.40, text="What's the next snack?"),
+                Segment(id=2, start=0.42, end=0.90, text="I'm getting off track."),
+                Segment(id=3, start=2.90, end=4.00, text="And then a normal line."),
+            ],
+        )
+
+    def test_the_run_is_retimed_and_reported(self, tmp_path: Path) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, self.packed_transcript())
+        report = pipeline.run().report
+
+        assert report["packed"]["runs"] == 1
+        assert report["packed"]["lines"] == 2
+        assert report["packed"]["worst_wps"] == pytest.approx(25.0, abs=0.1)
+        assert report["packed"]["seconds_added"] > 1.0
+        # The line after the run keeps its own time: the repair only redistributes
+        # the stretch that was impossible, it never shifts a line out of its place.
+        timing = json.loads((pipeline.job_dir / "timing.json").read_text())
+        assert timing[3]["source_start"] == pytest.approx(2.90, abs=0.01)
+
+    def test_the_wider_slots_reach_the_word_budget(self, tmp_path: Path) -> None:
+        """A line that held one word now holds a sentence, which is the point."""
+        pipeline, _, translator, _ = make_pipeline(tmp_path, self.packed_transcript())
+        pipeline.run()
+
+        budgets = {request.id: request.max_words for request in translator.requests}
+        # 0.16s of slot was one word at any rate; ~1.3s is a sentence.
+        assert budgets[1] >= 5
+        assert budgets[2] >= 5
+        # The untouched line before the run keeps its own, smaller ceiling.
+        assert budgets[0] < budgets[1]
+
+    def test_an_ordinary_timeline_reports_no_repair(
+        self, tmp_path: Path, simple_transcript: Transcript
+    ) -> None:
+        pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
+        assert "packed" not in pipeline.run().report
+
+
+class TestOverrunAllowance:
+    """A line that needs a fraction of a second more keeps its words, and runs late.
+
+    Measured on a real 11-minute job: at a zero allowance 52 lines lost 6.74 s of
+    speech; at 0.25 s, four lines lost 0.70 s and the lines that used it started a
+    mean 0.12 s late. Lateness is a smaller defect than a deleted word.
+    """
+
+    def test_a_stubborn_line_keeps_its_words_and_runs_late(
+        self, tmp_path: Path
+    ) -> None:
+        # 3.6s of speech in a 2.0s slot with a 0.5s pause: at the 0.75 floor the
+        # line needs 2.70s, and the allowance lets it use 2.75s, so it is played at
+        # 0.76 painlessly rather than losing 0.20s of its tail.
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.6, 1.0], [1.8]], refine=False, max_overrun=0.25
+        )
+        report = pipeline.run().report
+
+        assert report["max_overrun"] == pytest.approx(0.25)
+        assert report["trimmed_seconds_total"] == 0.0
+        assert report["shifted_segments"] == 1
+        assert report["shifted_seconds_max"] == pytest.approx(0.25, abs=0.02)
+        timing = json.loads((pipeline.job_dir / "timing.json").read_text())
+        # The line that pays is the *next* one, pushed to the end of the spill.
+        assert timing[1]["placed_start"] == pytest.approx(2.75, abs=0.02)
+
+    def test_the_allowance_is_bounded(self, tmp_path: Path) -> None:
+        # 4.5s of speech needs 3.375s at the floor: 0.625s past a window it may
+        # stretch by only 0.25s, so the rest is still cut.
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[4.5, 1.0], [1.8]], refine=False, max_overrun=0.25
+        )
+        report = pipeline.run().report
+
+        assert report["trimmed_seconds_total"] == pytest.approx(0.625, abs=0.02)
+        assert report["shifted_seconds_max"] == pytest.approx(0.25, abs=0.02)
+
+    def test_zero_allowance_trims_instead(self, tmp_path: Path) -> None:
+        """The escape hatch: exact sync, paid for with the tail of the line."""
+        pipeline, _, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.6, 1.0], [1.8]], refine=False, max_overrun=0.0
+        )
+        report = pipeline.run().report
+
+        assert report["trimmed_seconds_total"] == pytest.approx(0.2, abs=0.02)
+        assert report["shifted_segments"] == 0
+        assert report["shifted_seconds_max"] == 0.0
+
+    def test_a_line_inside_the_allowance_is_not_an_offender(
+        self, tmp_path: Path
+    ) -> None:
+        """The repair must predict what the mixer will do, not what it used to."""
+        pipeline, translator, _, _ = refine_pipeline(
+            tmp_path, rows=[[3.6, 1.0], [1.8]], max_overrun=0.25
+        )
+        report = pipeline.run().report
+
+        assert translator.shorten_calls == 0
+        assert report["refine"]["attempted"] is False
 
 
 class TestTimingDirectionSplit:
