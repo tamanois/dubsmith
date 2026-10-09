@@ -148,6 +148,15 @@ def build_anchors_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _device_list(value: str) -> list[str]:
+    """Parse the comma-separated device list ``--devices`` takes.
+
+    Cleaning and validation live in :class:`JobConfig`, so there is one rule for
+    what a device list may contain rather than two that can disagree.
+    """
+    return [part.strip() for part in value.split(",")]
+
+
 def build_dub_parser() -> argparse.ArgumentParser:
     """Parser for the default (dubbing) command."""
     parser = argparse.ArgumentParser(
@@ -187,6 +196,22 @@ def build_dub_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
     parser.add_argument("--device", default="auto", help="auto, cuda:0, cuda:1, mps, or cpu.")
+    parser.add_argument(
+        "--devices",
+        type=_device_list,
+        default=None,
+        metavar="DEV[,DEV...]",
+        help=(
+            "Spread synthesis over several devices, one worker process per device, "
+            "e.g. cuda:0,cuda:1. Stages still run one at a time; the heavy blend "
+            "and synthesis stages hand each piece to whichever worker is free, and "
+            "the first device carries the stages that cannot be split (ASR, "
+            "diarization, separation, accent anchors). Repeating a name "
+            "(cpu,cpu) is allowed and is how the fan-out is exercised on a "
+            "single-processor machine. Omit it to keep --device as the whole "
+            "answer."
+        ),
+    )
     parser.add_argument(
         "--dtype",
         default="auto",
@@ -596,6 +621,13 @@ def build_info_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="auto", help="Device to report on.")
     parser.add_argument(
+        "--devices",
+        type=_device_list,
+        default=None,
+        metavar="DEV[,DEV...]",
+        help="Report the fan-out these devices would produce, e.g. cuda:0,cuda:1.",
+    )
+    parser.add_argument(
         "--dtype",
         default="auto",
         choices=["auto", "bf16", "fp16", "fp32"],
@@ -639,17 +671,27 @@ def _dtype_label(device: str, requested: str) -> str:
 
 
 def render_environment(
-    models_dir: Path | str, *, device: str = "auto", dtype: str = "auto"
+    models_dir: Path | str,
+    *,
+    device: str = "auto",
+    dtype: str = "auto",
+    devices: Sequence[str] | None = None,
 ) -> str:
     """The text printed by ``dub.py info``.
 
     Returned rather than printed so it is testable and can be pasted whole into a
     bug report. The first question on unfamiliar hardware is "what did it pick, and
     why?", and every answer belongs here.
+
+    ``devices`` is the ``--devices`` fan-out when one was asked for. The stages
+    that cannot be spread over cards still run on a single device, so the
+    capability lines below describe that one - the first of the list.
     """
     import platform
     import shutil
 
+    requested = list(devices) if devices else []
+    device = requested[0] if requested else device
     info = probe_device(device)
     lines: list[str] = [
         f"python           {platform.python_version()}  (>=3.10 required)",
@@ -682,6 +724,15 @@ def render_environment(
         lines.append(f"device           cpu  {info.name}")
 
     lines.append(f"resolved         {info.label}   (requested: {info.requested})")
+    if len(requested) > 1:
+        lines.append(
+            f"synthesis        {len(requested)} workers, one per device: "
+            + ", ".join(requested)
+        )
+        lines.append(
+            "                 (blend and synthesis are spread over them; ASR, "
+            "diarization and separation stay on the first)"
+        )
     lines.append(f"tts dtype        {_dtype_label(device, dtype)}")
     lines.append(
         f"asr device       {asr_device(device)}  "
@@ -716,7 +767,11 @@ def cmd_info(argv: Sequence[str]) -> int:
     args = build_info_parser().parse_args(list(argv))
     settings = Settings.from_env()
     models_dir = args.models_dir or settings.models_dir
-    print(render_environment(models_dir, device=args.device, dtype=args.dtype))
+    print(
+        render_environment(
+            models_dir, device=args.device, dtype=args.dtype, devices=args.devices
+        )
+    )
     return _STOP
 
 
@@ -823,6 +878,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         ref_text=args.ref_text,
         output_dir=args.output_dir,
         device=args.device,
+        devices=args.devices,
         dtype=args.dtype,
         whisper_model=args.whisper_model,
         llm_model=args.llm_model,

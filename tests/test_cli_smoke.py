@@ -77,6 +77,40 @@ def test_dtype_reaches_the_job_config() -> None:
     assert job_config_from_args(args).dtype == "fp16"
 
 
+def test_devices_reach_the_job_config() -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--devices", "cuda:0,cuda:1"]
+    )
+
+    job = job_config_from_args(args)
+    assert job.devices == ["cuda:0", "cuda:1"]
+    assert job.primary_device == "cuda:0"
+
+
+def test_devices_default_to_the_single_device_path() -> None:
+    args = build_dub_parser().parse_args(["--video", "in.mp4"])
+
+    job = job_config_from_args(args)
+    assert job.devices is None
+    assert job.resolved_devices == [job.device]
+
+
+def test_devices_reject_a_mixed_auto() -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--devices", "auto,cuda:1"]
+    )
+
+    with pytest.raises(ConfigError, match="cannot mix 'auto'"):
+        job_config_from_args(args)
+
+
+def test_info_reports_the_fan_out(tmp_path) -> None:
+    text = render_environment(tmp_path, devices=["cuda:0", "cuda:1"])
+
+    assert "2 workers" in text
+    assert "cuda:0, cuda:1" in text
+
+
 def test_dtype_and_device_default_to_auto() -> None:
     args = build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
     job = job_config_from_args(args)

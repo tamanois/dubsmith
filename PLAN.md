@@ -27,7 +27,7 @@
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 975 passing | `tests/` |
+| Tests | ✅ 1051 passing | `tests/` |
 
 Verification performed:
 
@@ -1300,16 +1300,81 @@ calls and a full card. On a card with room the controller never fires and nothin
 changes; on this 12 GB card a long job now costs ~55% more synthesis time than the
 version that failed 66 allocations.
 
-### Still open (verified against the code, 2026-09-28)
+### P9 — Multi-device synthesis (IMPLEMENTED)
+
+**The gap.** Synthesis is the stage that decides how long a job takes - 616 s on the
+11-minute run, and 217 s of the 318 s on the *short* accent run, where the blend
+dominates - and it ran on one card. A second RTX 3060 sat idle while the first halved
+its batches to stay inside its own memory ceiling (P8), and the one recorded
+reproduction of a synthesis failure was a batch that bottomed out at a single line
+while the other card did nothing.
+
+**What ships.** `--devices cuda:0,cuda:1` (`JobConfig.devices`). Each device gets its
+own worker *process* with its own copy of the checkpoint, and the stages that dominate
+the clock hand work to whichever worker is free:
+
+| Stage | Work unit |
+|---|---|
+| Blend | One task per voice - the voices share nothing, so nothing has to be split |
+| Synthesis | One task per voice, or per *piece* of a voice's lines when there are fewer voices than devices |
+| Rate probe | One task per prompt, so a voice shared by several speakers is measured once, not once per card |
+
+The split is by **work**, not by model: nothing is sharded inside a checkpoint,
+because a clone prompt belongs to the device that built it. The parent keeps ownership
+of the job folder, the manifest and the stage cache and never loads an engine of its
+own, so a worker that dies cannot corrupt a cache entry. Dispatch is a pull - a worker
+is handed the next task the moment it reports a result - so a voice with unusually
+long lines cannot leave a card idle behind it, and a task that a card refuses (a
+single line past its ceiling) is retried on another card before the job fails.
+
+**What deliberately did not move.** ASR, diarization, separation and the accent
+anchors each run once, so they take the first device of the list - that is what
+`primary_device` means, and it is why `--devices cuda:1,cuda:0` also decides which
+card they use. Chunking ASR across cards was costed and dropped: Whisper re-segments
+its own chunk boundaries, so it would need a seam merge and would change the
+transcript, and the stage is a small share of the wall clock.
+
+**Verified.**
+
+- **The 994 existing tests pass unchanged.** A job without `--devices` resolves to a
+  one-element list and takes the inline path, so the single-device behaviour is the
+  *same* code, not a reimplementation beside it.
+- **A real end-to-end dub ran on two RTX 3060s** (`input/change-the-world.mp4`, 22 s,
+  `--accent-mode preserve`, `--devices cuda:0,cuda:1`). `report.json` → `tts.devices`
+  lists both cards; the work split three lines to one card and two to the other
+  (`batches` 2 and 1); the per-card peaks were 5.31 GiB and 4.93 GiB, each well inside
+  its own 8.3 GiB ceiling and independent of the other; `oom_retries` and
+  `ceiling_shrinks` were 0; and `audit_qc.py` exited 0 (sync, truncation and loudness
+  pass, timbre skipped).
+- **A controlled A/B measured the split itself**: the same five synthesis tasks, same
+  texts, reference and model, changing only the number of workers - **19.4 s on one
+  card, 14.9 s on two**. The remaining fixed cost is the checkpoint load (~7-8 s per
+  worker, paid once per job), which is a large share of a 19 s job and a rounding error
+  on the 11-minute one; on this run it landed inside the rate-probe stage, which took
+  18.3 s for a single render, leaving synthesis itself at 10.0 s.
+- **The pool is tested without a model**: dispatch across devices, retry on another
+  card, the all-cards-failed error, a card that cannot open its engine, and
+  teardown-on-close all run against stub workers in spawned processes, so CI covers
+  them on one CPU.
+
+**Still unmeasured.** The same A/B on a *long* job is where the split should approach
+its ceiling: at 22 s the per-task work is smaller than the model load, so the measured
+gain was 23% rather than the ~50% the design targets. A many-voice job on two cards
+(the blend, one task per voice) is also unrun - the blend is the stage that costs the
+most per voice, and it is the one case where no splitting is needed at all.
+before the field existed, so the feature invalidated no existing cache.
+
+### Still open (verified against the code, 2026-10-09)
 
 The capability work is implemented; this is the verified remainder, so the table
 above is not read as "finished".
 
 **Verification not yet closed**
 
-- **DoD §3.6 remains unverified.** No run longer than 4:47 has been attempted, and
-  that run hit `CUDACachingAllocator` OOM retries (absorbed by batch halving, and
-  not reproducible from a warm cache, so it looks like transient allocator state).
+- **The multi-device fan-out has not been measured on a long job** (P9). It is
+  verified on two GPUs for a 22 s clip, where the 23% it saved is bounded by the
+  checkpoint load; on a long job the split has the room to approach 50%, and a
+  many-voice job (the blend, one task per voice) has not been run on two cards at all.
 - **P3f has not been re-listened to.** The fix is measured, but by its own admission
   only an ear can confirm it — which is why the reverb tail is opt-in.
 - **P1c's happy path is unvalidated on real audio.** Only the false-positive guard has
@@ -1593,6 +1658,7 @@ target_lufs: null
 
 # Models, device and output
 device: auto                     # auto | cpu | cuda | cuda:N | mps | xpu
+devices: null                    # list to spread blend+synthesis over (--devices)
 dtype: auto                      # auto | bf16 | fp16 | fp32
 whisper_model: large-v3
 llm_model: null                  # overrides LLM_MODEL for this run
@@ -1622,6 +1688,8 @@ qwen-tts/
 │   ├── mixing.py             # ducking, bed mix and room matching (pure numpy)
 │   ├── translate.py          # OpenAI-compatible client, chunking, shorten()
 │   ├── tts.py                # Qwen3-TTS wrapper, donor selection, blend
+│   ├── voice.py              # one voice: the facts that build its clone prompt
+│   ├── parallel.py           # fan-out: tasks, worker pool, per-device counters
 │   ├── timing.py             # stretching backends, timeline assembly
 │   ├── subtitles.py          # SRT writer
 │   ├── audit.py              # timbre measurement + quality gates
@@ -1778,6 +1846,7 @@ faster-whisper), or `".[full]"` for all of them.
 | **P5** | Multi-source-language | Per-utterance LID, per-segment source language | S–M |
 | **P6** | Service-ification | FastAPI + Celery/Redis, model residency, consent gate | L |
 | **P7** | Portability & distribution | Device capability probing, `dub.py info`, `--dtype`, packaging + console scripts, CI, Apache-2.0 licence | S–M |
+| **P9** | Multi-device synthesis | **done** — one worker process per card for the blend and the synthesis; the stages that run once stay on the first device | S–M |
 
 ### P1 — Multi-speaker & background preservation
 

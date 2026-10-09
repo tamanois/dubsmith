@@ -755,3 +755,65 @@ class TestCliJobConfig:
         base = JobConfig(audio=Path("a.wav"), room="match")
         louder = JobConfig(audio=Path("a.wav"), room="match", room_wet_db=-6.0)
         assert base.fingerprint() != louder.fingerprint()
+
+
+class TestDevices:
+    """``--devices``: several cards sharing a stage, a worker process each."""
+
+    def test_no_list_means_the_single_device_path(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), device="cuda:1")
+        assert job.resolved_devices == ["cuda:1"]
+        assert job.primary_device == "cuda:1"
+        assert job.multi_device is False
+
+    def test_a_list_is_used_in_order_with_the_first_as_primary(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), devices=["cuda:1", "cuda:0"])
+        assert job.resolved_devices == ["cuda:1", "cuda:0"]
+        # The stages that cannot be split - ASR, diarization, separation, anchors -
+        # run on the device the user named first.
+        assert job.primary_device == "cuda:1"
+        assert job.multi_device is True
+
+    def test_blanks_are_dropped(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), devices=[" cpu ", "", "cpu:0"])
+        assert job.resolved_devices == ["cpu", "cpu:0"]
+
+    def test_an_empty_list_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="at least one device"):
+            JobConfig(audio=Path("a.wav"), devices=["", "  "])
+
+    def test_auto_cannot_name_a_second_card(self) -> None:
+        with pytest.raises(ConfigError, match="cannot mix 'auto'"):
+            JobConfig(audio=Path("a.wav"), devices=["auto", "cuda:1"])
+
+    def test_auto_alone_is_allowed(self) -> None:
+        assert JobConfig(audio=Path("a.wav"), devices=["auto"]).multi_device is False
+
+    def test_the_same_device_may_be_repeated(self) -> None:
+        # Two workers on one device is how the fan-out is exercised on a machine
+        # with a single card, so it must not be deduplicated away.
+        job = JobConfig(audio=Path("a.wav"), devices=["cpu", "cpu"])
+        assert job.resolved_devices == ["cpu", "cpu"]
+
+    def test_an_absent_list_hashes_as_before_the_field_existed(self) -> None:
+        # Adding the field must not invalidate every existing cache: the hashed
+        # payload is the one a job produced before the field was introduced.
+        import hashlib
+        import json
+
+        job = JobConfig(audio=Path("a.wav"), device="cpu")
+        payload = job.model_dump(mode="json")
+        payload.pop("output_dir", None)
+        payload.pop("force", None)
+        payload.pop("devices")
+        blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+        expected = hashlib.sha256(blob).hexdigest()[:16]
+
+        assert job.fingerprint() == expected
+
+    def test_fingerprint_changes_when_a_list_is_given(self) -> None:
+        single = JobConfig(audio=Path("a.wav"), device="cpu")
+        spread = JobConfig(audio=Path("a.wav"), devices=["cpu", "cpu"])
+        # Per-worker batching differs from a single worker's, exactly as the batch
+        # size already did, so the cache must not be reused across the change.
+        assert single.fingerprint() != spread.fingerprint()

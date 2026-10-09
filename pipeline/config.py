@@ -328,6 +328,13 @@ class JobConfig(BaseModel):
 
     output_dir: Path = Path("output")
     device: str = "auto"
+    #: Extra devices a single job may spread its synthesis over, e.g.
+    #: ``["cuda:0", "cuda:1"]``. Each becomes its own worker process with its own
+    #: copy of the checkpoint, so the cards share the *stage*; a model is never
+    #: sharded, because a clone prompt is bound to the device that built it.
+    #: ``None`` (the default) keeps the single-device path exactly as it was,
+    #: with every stage on :attr:`primary_device`.
+    devices: list[str] | None = None
     #: torch dtype for the TTS checkpoint. ``auto`` reads the device's capability:
     #: bfloat16 on Ampere and newer, float16 on older accelerators, float32 on
     #: CPU. An explicit value is honoured unless the device cannot run it.
@@ -707,6 +714,30 @@ class JobConfig(BaseModel):
     def _check_dtype(cls, value: str) -> str:
         return normalize_dtype(value)
 
+    @field_validator("devices")
+    @classmethod
+    def _check_devices(cls, value: list[str] | None) -> list[str] | None:
+        """Clean the device list, rejecting the one spelling that cannot work.
+
+        ``auto`` means "whichever card this machine has", which is a statement
+        about *one* device, so mixing it with others would silently collapse the
+        fan-out to a single card. Duplicates are kept on purpose: ``--devices
+        cpu,cpu`` is how the fan-out is tested on a machine with one processor.
+        """
+        if value is None:
+            return None
+        cleaned = [str(item).strip() for item in value]
+        cleaned = [item for item in cleaned if item]
+        if not cleaned:
+            raise ConfigError("--devices needs at least one device.")
+        if "auto" in cleaned and len(cleaned) > 1:
+            raise ConfigError(
+                "--devices cannot mix 'auto' with explicit devices: 'auto' means "
+                "whichever card this machine has, so it cannot name a second one. "
+                "Name them (e.g. --devices cuda:0,cuda:1) or pass a single --device."
+            )
+        return cleaned
+
     @field_validator("target_language")
     @classmethod
     def _check_target(cls, value: str) -> str:
@@ -866,6 +897,30 @@ class JobConfig(BaseModel):
         return self.room == "match"
 
     @property
+    def resolved_devices(self) -> list[str]:
+        """Every device this run may use, the primary one first.
+
+        ``--device`` stays the whole answer unless ``--devices`` was given, so a
+        run that never asked for more than one card resolves to exactly the list
+        it resolved to before this field existed.
+        """
+        return list(self.devices) if self.devices else [self.device]
+
+    @property
+    def primary_device(self) -> str:
+        """The device for the stages that cannot be spread over several cards.
+
+        Speech recognition, diarization, separation and the accent anchors each
+        load one model and run once, so they take the first device of the list.
+        """
+        return self.resolved_devices[0]
+
+    @property
+    def multi_device(self) -> bool:
+        """True when synthesis may be spread over more than one card."""
+        return len(self.resolved_devices) > 1
+
+    @property
     def input_path(self) -> Path:
         """The single input path (video or audio)."""
         path = self.video if self.video is not None else self.audio
@@ -898,6 +953,13 @@ class JobConfig(BaseModel):
         payload = self.model_dump(mode="json")
         for volatile in ("output_dir", "force"):
             payload.pop(volatile, None)
+        # A run that does not spread its work over several cards hashes exactly
+        # what it hashed before the field existed, so adding it invalidates no
+        # existing cache. A run that *does* spread the work re-synthesises once:
+        # per-worker batching differs from a single worker's, and the batch is
+        # already a fingerprint input for the same reason.
+        if not payload.get("devices"):
+            payload.pop("devices", None)
         blob = json.dumps(payload, sort_keys=True).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()[:16]
 

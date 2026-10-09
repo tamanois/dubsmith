@@ -13,6 +13,7 @@ and no GPU, models, or binaries.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -55,6 +56,18 @@ from .logging_utils import job_logger
 from .models import anchors_dir, resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
 from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
+from .parallel import (
+    BLEND,
+    PROBE,
+    SYNTH,
+    InlineRunner,
+    ProcessRunner,
+    Runner,
+    Task,
+    WorkerConfig,
+    merge_tts_stats,
+    split_evenly,
+)
 from .separation import NullSeparator, detect_separator
 from .timing import (
     Placement,
@@ -80,6 +93,7 @@ from .tts import (
     resolve_dtype,
     select_donor,
 )
+from .voice import VoiceSpec
 
 __all__ = ["Pipeline", "JobResult", "Manifest"]
 
@@ -375,10 +389,11 @@ class Pipeline:
         self._primary_accent: tuple[Any, str] | None = None
         #: Name of the speaker that :attr:`_primary_accent` belongs to.
         self._primary_speaker_name: str | None = None
-        #: Whose clone prompt the engine currently holds, so a speaker who is
-        #: already loaded is not rebuilt. The rate probe primes every voice and the
-        #: synthesis that follows starts on the voice it left off on.
-        self._primed_speaker: str | None = None
+        #: Execution backend for the fan-out stages. Built once per run so the
+        #: blend stage and the synthesis that follows it share their workers, and
+        #: therefore load each device's checkpoint once between them rather than
+        #: once per stage.
+        self._runner_instance: Runner | None = None
         #: Runs of lines whose ASR timing was impossible, and what the repair did.
         self._packed_runs: list[dict[str, Any]] = []
         #: Donor per speaker and its report record, resolved once and shared by the
@@ -398,7 +413,7 @@ class Pipeline:
 
         # Before any model loads: torch reads the allocator setting at its first
         # allocation, so applying it later does nothing and says nothing.
-        configure_allocator(self.job.device)
+        configure_allocator(self.job.primary_device)
         self.job_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir = self.job_dir / _TMP_DIR
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -477,6 +492,7 @@ class Pipeline:
             timeline = self._stage_mix(audio_path, transcript, lines, dubbed, tmp_dir)
             return self._stage_deliver(timeline, transcript, lines, script)
         finally:
+            self._close_runner()
             # Never leak scratch space, even on failure.
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -518,8 +534,8 @@ class Pipeline:
     def _resolve_tts(self) -> TTSEngine:
         if self._tts is None:
             model_dir = resolve_model("tts_base", self.settings.models_dir)
-            info = probe_device(self.job.device)
-            dtype = resolve_dtype(self.job.device, self.job.dtype)
+            info = probe_device(self.job.primary_device)
+            dtype = resolve_dtype(self.job.primary_device, self.job.dtype)
             # Logged because "which device did it actually use?" is the first
             # question on unfamiliar hardware, and the answer decides the runtime.
             self.log.info(
@@ -530,12 +546,64 @@ class Pipeline:
             )
             self._tts = TTSEngine(
                 model_dir,
-                device=self.job.device,
+                device=self.job.primary_device,
                 dtype=dtype,
                 batch_size=self.job.tts_batch,
                 x_vector_only=self.job.accent_mode == "speaker-only",
             )
         return self._tts
+
+    # -- execution backend -------------------------------------------------- #
+
+    def _runner(self) -> Runner:
+        """The backend the fan-out stages hand their work to.
+
+        One device - or an injected engine, which is how tests drive the pipeline
+        - means :class:`InlineRunner`: the work runs here, on the engine this
+        process already resolved. That is not a fallback but the definition of the
+        single-device path, so a ``--device`` run synthesises exactly what it did
+        before ``--devices`` existed, and the fan-out *planning* stays fully
+        testable with a fake engine and no subprocess.
+
+        Several devices means one worker process each. A worker builds its own
+        engine on its own card, which is why the parent never loads a second copy
+        of the checkpoint.
+        """
+        if self._runner_instance is not None:
+            return self._runner_instance
+        devices = self.job.resolved_devices
+        if len(devices) <= 1 or self._tts is not None:
+            self._runner_instance = InlineRunner(self._resolve_tts(), self.log)
+        else:
+            self._runner_instance = ProcessRunner(
+                [self._worker_config(device) for device in devices], log=self.log
+            )
+            self.log.info(
+                "Blend and synthesis are spread over %d devices: %s",
+                len(devices),
+                ", ".join(devices),
+            )
+        return self._runner_instance
+
+    def _worker_config(self, device: str) -> WorkerConfig:
+        """What one worker needs to build its own copy of the checkpoint."""
+        return WorkerConfig(
+            model_dir=resolve_model("tts_base", self.settings.models_dir),
+            device=device,
+            dtype=self.job.dtype,
+            batch_size=self.job.tts_batch,
+            x_vector_only=self.job.accent_mode == "speaker-only",
+        )
+
+    def _close_runner(self) -> None:
+        """Stop the workers, if any were started.
+
+        Called from ``run``'s ``finally`` so a failed job cannot leave several
+        processes holding several GB of VRAM each.
+        """
+        if self._runner_instance is not None:
+            self._runner_instance.close()
+            self._runner_instance = None
 
     def _resolve_anchor_engine(self) -> Any:
         """The VoiceDesign engine used to build accent anchors.
@@ -552,14 +620,16 @@ class Pipeline:
             self.log.info("Generating an accent anchor with the VoiceDesign model.")
             self.__anchor_engine_resolved = VoiceDesignEngine(
                 model_dir,
-                device=self.job.device,
-                dtype=resolve_dtype(self.job.device, self.job.dtype),
+                device=self.job.primary_device,
+                dtype=resolve_dtype(self.job.primary_device, self.job.dtype),
             )
         return self.__anchor_engine_resolved
 
     def _resolve_separator(self) -> Any:
         if self._separator is None:
-            self._separator = detect_separator(self.job.separator, device=self.job.device)
+            self._separator = detect_separator(
+                self.job.separator, device=self.job.primary_device
+            )
         return self._separator
 
     def _resolve_speaker_separator(self) -> Any:
@@ -573,7 +643,7 @@ class Pipeline:
             return self._speaker_separator
         if self.__speaker_separator_resolved is None:
             self.__speaker_separator_resolved = detect_speaker_separator(
-                self.job.overlap_separator, device=self.job.device
+                self.job.overlap_separator, device=self.job.primary_device
             )
         return self.__speaker_separator_resolved
 
@@ -591,7 +661,7 @@ class Pipeline:
         if self.__diarizer_resolved is None:
             self.__diarizer_resolved = detect_diarizer(
                 self.job.diarizer,
-                device=self.job.device,
+                device=self.job.primary_device,
                 threshold=self.job.resolved_speaker_threshold,
                 min_seconds=self.job.min_speaker_seconds,
             )
@@ -1016,7 +1086,7 @@ class Pipeline:
                 transcript = transcribe(
                     audio_path,
                     model_dir,
-                    device=self.job.device,
+                    device=self.job.primary_device,
                     language=language_code_for_name(self.job.source_language),
                     no_speech_threshold=self.job.no_speech_threshold,
                 )
@@ -1267,7 +1337,7 @@ class Pipeline:
         return transcribe_many(
             paths,
             model_dir,
-            device=self.job.device,
+            device=self.job.primary_device,
             language=language_code_for_name(self.job.source_language),
             no_speech_threshold=self.job.no_speech_threshold,
         )
@@ -1455,17 +1525,19 @@ class Pipeline:
         speakers = self._speaker_order(transcript.segments)
 
         def build() -> dict[str, float]:
-            engine = self._resolve_tts()
+            runner = self._runner()
             donors = self._resolve_donors(audio_path, transcript)
             measured: dict[str, float] = {}
             #: One prompt is one voice, so one measurement serves every speaker who
             #: shares it - a pinned reference voice is measured once, not once per
             #: speaker.
             by_prompt: dict[str, float] = {}
+            tasks: list[Task] = []
+            owners: list[tuple[str, str]] = []
             for name in speakers:
-                key = self._prompt_key(name, blends)
-                if key in by_prompt:
-                    measured[name] = by_prompt[key]
+                spec = self._voice_spec(name, donors, blends)
+                if spec.key in by_prompt:
+                    measured[name] = by_prompt[spec.key]
                     continue
                 text = _probe_text(accents.get(name), self.job.target_language)
                 if not text:
@@ -1476,20 +1548,27 @@ class Pipeline:
                     )
                     continue
                 # The prompt *is* the voice, so the probe has to be rendered
-                # through the same one the lines will be.
-                self._ensure_speaker_prompt(engine, name, donors.get(name), blends)
-                rate = engine.measure_delivery_rate(
-                    text, language=self.job.target_language
+                # through the same one the lines will be. The runner guarantees
+                # that: a worker that already holds this voice reuses it.
+                tasks.append(
+                    Task(
+                        kind=PROBE,
+                        spec=spec,
+                        language=self.job.target_language,
+                        text=text,
+                    )
                 )
-                if rate <= 0:
+                owners.append((name, text))
+            for (name, text), result in zip(owners, runner.run(tasks)):
+                if result.rate <= 0:
                     self.log.warning("Rate probe for %s produced no audio.", name)
                     continue
-                by_prompt[key] = measured[name] = round(rate, 3)
+                by_prompt[result.key] = measured[name] = round(result.rate, 3)
                 self.log.info(
                     "Delivery rate for %s: %.2f words/s (%.1fs of probe audio).",
                     name,
-                    rate,
-                    len(text.split()) / rate,
+                    result.rate,
+                    len(text.split()) / result.rate,
                 )
             out.write_text(json.dumps(measured, indent=2), encoding="utf-8")
             return measured
@@ -2016,24 +2095,28 @@ class Pipeline:
         info_path = self.job_dir / _BLEND_INFO_NAME
 
         def build() -> dict[str, Path]:
-            engine = self._resolve_tts()
+            runner = self._runner()
             donors = self._resolve_donors(audio_path, transcript)
             target_ratio = self.job.resolved_blend_ratio
-            rendered: dict[str, Path] = {}
-            stats: dict[str, Any] = {}
-            for name in speakers:
-                donor, _donor_info = donors[name]
-                accent_audio, accent_text = resolved[name]
-                blended = engine.build_blended_reference(
-                    accent_audio=accent_audio,
-                    accent_text=accent_text,
+            # One voice per task. The passes for different speakers share nothing,
+            # so this is the parallel axis that needs no splitting at all - and on
+            # the job where the blend costs most (a voice apiece for five people)
+            # it is also the one that pays.
+            tasks = [
+                Task(
+                    kind=BLEND,
+                    spec=self._voice_spec(name, donors, {}, resolved),
                     language=self.job.target_language,
-                    timbre=donor,
-                    timbre_audio=self.job.ref_audio,
                     takes=self.job.resolved_blend_takes,
                     iters=self.job.resolved_blend_iters,
                     ratio=target_ratio,
                 )
+                for name in speakers
+            ]
+            rendered: dict[str, Path] = {}
+            stats: dict[str, Any] = {}
+            for name, result in zip(speakers, runner.run(tasks)):
+                blended = result.blend
                 out = outputs[name]
                 out.parent.mkdir(parents=True, exist_ok=True)
                 media.write_audio(out, blended.samples, blended.sample_rate)
@@ -2091,26 +2174,27 @@ class Pipeline:
         expected = {segment.id: out_dir / f"seg_{segment.id:04d}.wav" for segment in lines}
 
         def build() -> dict[int, Path]:
-            engine = self._resolve_tts()
-
             # Resolved once and shared with the blend stage, so both necessarily
             # agree about which voice belongs to which speaker.
             donors = self._resolve_donors(audio_path, transcript)
             self._write_voices(transcript, donors, blends)
 
-            produced = self._synthesize_grouped(
-                engine, lines, script, donors, blends
-            )
-            wavs = self._refine_overlong(
-                engine,
-                lines,
-                script,
-                [produced.get(segment.id) for segment in lines],
-                tmp_dir,
-                resynthesize=lambda owned, texts: self._retry_lines(
-                    engine, owned, texts, donors, blends
-                ),
-            )
+            produced, sample_rate = self._synthesize_all(lines, script, donors, blends)
+            if sample_rate > 0:
+                wavs = self._refine_overlong(
+                    sample_rate,
+                    lines,
+                    script,
+                    [produced.get(segment.id) for segment in lines],
+                    tmp_dir,
+                    resynthesize=lambda owned, texts: self._retry_lines(
+                        owned, texts, donors, blends
+                    ),
+                )
+            else:
+                # Nothing was synthesised (every line blank), so there is nothing
+                # to measure an overflow against.
+                wavs = [produced.get(segment.id) for segment in lines]
 
             written: dict[int, Path] = {}
             for segment, wav in zip(lines, wavs):
@@ -2123,8 +2207,8 @@ class Pipeline:
                 # and cannot dominate the mix with a transient peak.
                 media.write_audio(
                     path,
-                    media.limit_peaks(wav, engine.sample_rate, ceiling=_LINE_CEILING),
-                    engine.sample_rate,
+                    media.limit_peaks(wav, sample_rate, ceiling=_LINE_CEILING),
+                    sample_rate,
                 )
                 written[segment.id] = path
             # An earlier run of this input may have produced more lines, since ASR
@@ -2145,76 +2229,42 @@ class Pipeline:
 
     # -- per-speaker synthesis --------------------------------------------- #
 
-    def _prompt_key(self, name: str, blends: Mapping[str, Path]) -> str:
-        """Identity of the prompt a speaker needs, for the loaded-prompt cache.
-
-        A pinned reference voice is one prompt for every speaker, so it is keyed by
-        something other than the speaker's name - otherwise ``SPK_1`` would look
-        like a different voice than ``SPK_0`` and rebuild the identical prompt.
-        """
-        return "*shared*" if self._prompt_is_shared(blends) else name
-
-    def _ensure_speaker_prompt(
+    def _voice_spec(
         self,
-        engine: TTSEngine,
         name: str,
-        donor_entry: tuple[DonorClip | None, dict[str, Any]] | None,
+        donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
         blends: Mapping[str, Path],
-    ) -> None:
-        """Build ``name``'s clone prompt unless that voice is already loaded.
+        accents: Mapping[str, tuple[Any, str]] | None = None,
+    ) -> VoiceSpec:
+        """The facts that build one speaker's clone prompt.
 
-        Switching speakers means rebuilding the prompt, because the prompt *is* the
-        voice - but building the same one twice in a row costs a reference encode
-        for nothing, and the rate probe hands the speaker it primed straight to the
-        synthesis that follows it.
+        The rule itself lives in :mod:`pipeline.voice`, because a worker process
+        has to build the very same prompt from the very same facts and the two
+        must not be able to drift apart. This only gathers them from wherever the
+        pipeline happens to keep them.
         """
-        key = self._prompt_key(name, blends)
-        if self._primed_speaker == key:
-            return
-        self._prepare_speaker_prompt(engine, name, donor_entry, blends)
-        self._primed_speaker = key
-
-    def _prepare_speaker_prompt(
-        self,
-        engine: TTSEngine,
-        name: str,
-        donor_entry: tuple[DonorClip | None, dict[str, Any]] | None,
-        blends: Mapping[str, Path],
-    ) -> None:
-        """Build the clone prompt for one speaker, honouring the accent mode.
-
-        The prompt *is* the voice, so this has to run again every time the speaker
-        changes - which is the whole cost of multi-speaker synthesis.
-        """
-        donor, info = donor_entry if donor_entry else (None, {})
-        if self.job.accent_mode in ("native", "reference-accent"):
-            # The accent source is resolved once by the accent stage; a speaker's
-            # own matched anchor (or the shared supplied clip) lives in ``_accents``.
-            accent_audio, accent_text = self._accents.get(
-                name, (self.job.accent_audio, self.job.accent_text or "")
-            )
-            blend = blends.get(name)
-            if blend is not None:
-                engine.prepare_prompt_from_file(blend, accent_text)
-                return
-            self.log.info(
-                "Hybrid voice for %s: timbre from %s, accent from %s",
-                name,
-                info.get("path") or f"segment {info.get('segment_id')}",
-                accent_audio,
-            )
-            engine.prepare_hybrid_prompt(
-                accent_audio=accent_audio,
-                accent_text=accent_text,
-                timbre=donor,
-                timbre_audio=self.job.ref_audio,
-            )
-            return
-        if self.job.ref_audio is not None:
-            engine.prepare_prompt_from_file(self.job.ref_audio, self.job.ref_text or "")
-            return
-        assert donor is not None  # guaranteed by _resolve_donors
-        engine.prepare_prompt(donor)
+        donor, info = donors.get(name, (None, {}))
+        resolved = dict(accents) if accents is not None else self._accents
+        # The accent source is resolved once by the accent stage; a speaker's own
+        # matched anchor (or the shared supplied clip) lives in ``_accents``.
+        accent_audio, accent_text = resolved.get(
+            name, (self.job.accent_audio, self.job.accent_text or "")
+        )
+        label = ""
+        if info:
+            label = str(info.get("path") or f"segment {info.get('segment_id')}")
+        return VoiceSpec(
+            speaker=name,
+            accent_mode=self.job.accent_mode,
+            accent_audio=accent_audio,
+            accent_text=accent_text or "",
+            blend=blends.get(name),
+            ref_audio=self.job.ref_audio,
+            ref_text=self.job.ref_text or "",
+            donor=donor,
+            timbre_label=label,
+            shared=self._prompt_is_shared(blends),
+        )
 
     def _prompt_is_shared(self, blends: Mapping[str, Path]) -> bool:
         """True when one prompt serves every speaker, so it need not be rebuilt.
@@ -2225,45 +2275,66 @@ class Pipeline:
         """
         return self.job.ref_audio is not None and not blends
 
-    def _synthesize_grouped(
+    def _synthesize_all(
         self,
-        engine: TTSEngine,
         segments: Sequence[Segment],
         texts: Mapping[int, str],
         donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
         blends: Mapping[str, Path],
-    ) -> dict[int, np.ndarray]:
-        """Synthesise segments grouped by speaker, building each prompt once.
+    ) -> tuple[dict[int, np.ndarray], int]:
+        """Synthesise every line, spread over the run's devices.
 
-        Grouping is what makes multi-speaker cloning affordable: one prompt per
-        speaker instead of one per line, with batching preserved inside a group so
-        throughput matches the single-speaker path.
+        Work is grouped by speaker because the prompt *is* the voice: building it
+        once per speaker rather than once per line is what makes multi-speaker
+        cloning affordable, and it is also the natural unit for the fan-out, since
+        one voice's lines cannot influence another's.
+
+        A single-voice video would leave every card but one idle under that split,
+        so when there are fewer speakers than devices each speaker's lines are cut
+        into pieces as well. The pieces stay contiguous because they are line
+        ranges: a worker then reads its text in order, which keeps its log
+        readable and one line's overrun predictable.
+
+        Returns:
+            ``(segment_id -> samples, sample_rate)``. The rate is handed back
+            because the caller writes the files and must not load an engine - on
+            another card - just to learn it.
         """
-        produced: dict[int, np.ndarray] = {}
-        shared = self._prompt_is_shared(blends)
-        prompt_ready = False
-        for name in self._speaker_order(segments):
-            owned = [
-                segment for segment in segments if self._speaker_of(segment) == name
-            ]
-            if not prompt_ready or not shared:
-                # The prompt *is* the voice, so it has to match the group about to
-                # be synthesised - but rebuilding it for the speaker the rate probe
-                # just primed would be pure waste.
-                self._ensure_speaker_prompt(engine, name, donors.get(name), blends)
-                prompt_ready = True
-            wavs = engine.synthesize(
-                [texts.get(segment.id, "") for segment in owned],
-                language=self.job.target_language,
+        runner = self._runner()
+        grouped = [
+            (
+                name,
+                [segment for segment in segments if self._speaker_of(segment) == name],
             )
-            for segment, wav in zip(owned, wavs):
+            for name in self._speaker_order(segments)
+        ]
+        width = len(self.job.resolved_devices)
+        per_speaker = max(1, math.ceil(width / max(1, len(grouped))))
+        tasks: list[Task] = []
+        for name, owned in grouped:
+            spec = self._voice_spec(name, donors, blends)
+            items = [(segment.id, texts.get(segment.id, "")) for segment in owned]
+            for piece in split_evenly(items, per_speaker):
+                tasks.append(
+                    Task(
+                        kind=SYNTH,
+                        spec=spec,
+                        language=self.job.target_language,
+                        lines=tuple(piece),
+                    )
+                )
+
+        produced: dict[int, np.ndarray] = {}
+        sample_rate = 0
+        for result in runner.run(tasks):
+            sample_rate = sample_rate or result.sample_rate
+            for segment_id, wav in result.wavs:
                 if wav is not None and np.asarray(wav).size:
-                    produced[segment.id] = np.asarray(wav, dtype=np.float32).reshape(-1)
-        return produced
+                    produced[segment_id] = np.asarray(wav, dtype=np.float32).reshape(-1)
+        return produced, sample_rate
 
     def _retry_lines(
         self,
-        engine: TTSEngine,
         segments: Sequence[Segment],
         texts: Sequence[str],
         donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
@@ -2271,7 +2342,7 @@ class Pipeline:
     ) -> list[np.ndarray | None]:
         """Re-synthesise rewritten lines, each in its own speaker's voice."""
         by_id = {segment.id: text for segment, text in zip(segments, texts)}
-        produced = self._synthesize_grouped(engine, segments, by_id, donors, blends)
+        produced, _rate = self._synthesize_all(segments, by_id, donors, blends)
         return [produced.get(segment.id) for segment in segments]
 
     def _write_voices(
@@ -2363,14 +2434,18 @@ class Pipeline:
 
     def _refine_overlong(
         self,
-        engine: TTSEngine,
+        sample_rate: int,
         segments: Sequence[Segment],
         script: dict[int, str],
         wavs: list[np.ndarray | None],
         tmp_dir: Path,
-        resynthesize: Resynthesize | None = None,
+        resynthesize: Resynthesize,
     ) -> list[np.ndarray | None]:
         """Rewrite and re-synthesise only the lines that would lose words.
+
+        ``sample_rate`` is the rate the lines were produced at, passed in rather
+        than read off an engine: with several workers behind the stage there is no
+        single engine here to ask, and the caller already has the number.
 
         Translated speech is routinely longer than its slot, and the stretch
         clamp cannot always absorb the difference — what is left over gets cut.
@@ -2410,7 +2485,6 @@ class Pipeline:
 
         segments = list(segments)
         self._segments_for_refine = segments
-        sample_rate = engine.sample_rate
         spoken: dict[int, str] = {}
 
         def spoken_seconds_of(wav: np.ndarray | None) -> float:
@@ -2483,14 +2557,10 @@ class Pipeline:
             ]
             retry_segments = [segments[index] for index, _ in offenders]
             try:
-                if resynthesize is None:
-                    retried = engine.synthesize(
-                        texts, language=self.job.target_language
-                    )
-                else:
-                    # Rebuilt per speaker: a rewritten line has to come back in its
-                    # own voice, which means its own clone prompt.
-                    retried = resynthesize(retry_segments, texts)
+                # Rebuilt per speaker: a rewritten line has to come back in its own
+                # voice, which means its own clone prompt - and, when the job has
+                # more than one card, its own task on whichever worker is free.
+                retried = resynthesize(retry_segments, texts)
             except Exception as exc:  # noqa: BLE001 - repair is best-effort
                 self.log.warning("Re-synthesis failed: %s. Keeping existing audio.", exc)
                 break
@@ -2859,20 +2929,22 @@ class Pipeline:
         cannot claim a precision the synthesis did not use. Recorded because a
         run on unfamiliar hardware has to be diagnosable from the report alone.
         """
-        info = probe_device(self.job.device)
+        info = probe_device(self.job.primary_device)
         return {
-            "requested": self.job.device,
+            "requested": self.job.primary_device,
             "resolved": info.label,
             "kind": info.kind,
             "name": info.name,
             "total_memory": info.total_memory,
             "capability": list(info.capability) if info.capability else None,
-            "dtype": str(resolve_dtype(self.job.device, self.job.dtype)).replace(
-                "torch.", ""
-            ),
+            "dtype": str(
+                resolve_dtype(self.job.primary_device, self.job.dtype)
+            ).replace("torch.", ""),
             # Speech recognition runs on CTranslate2, which accepts CUDA and CPU
             # only, whatever device the torch stages were given.
-            "asr_compute_type": resolve_compute_type(asr_device(self.job.device)),
+            "asr_compute_type": resolve_compute_type(
+                asr_device(self.job.primary_device)
+            ),
         }
 
     def _tts_stats(self) -> dict[str, Any]:
@@ -2897,8 +2969,19 @@ class Pipeline:
             "ceiling_shrinks": 0,
             "peak_reserved_bytes": None,
         }
-        if self._tts is not None:
-            stats.update(self._tts.synthesis_stats())
+        reports: list[dict[str, Any]] = []
+        if self._runner_instance is not None:
+            reports = self._runner_instance.stats()
+        elif self._tts is not None:
+            reports = [self._tts.synthesis_stats()]
+        merged = merge_tts_stats(reports)
+        if merged:
+            stats.update(merged)
+        if self.job.multi_device:
+            # The cards the stage actually used. Kept beside the merged peak,
+            # because "9.3 GiB on one card and 2 GiB on the other" and "5.6 GiB on
+            # each" share a maximum and are very different runs.
+            stats["devices"] = list(self.job.resolved_devices)
         return stats
 
     def _build_report(

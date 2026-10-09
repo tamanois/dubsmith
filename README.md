@@ -197,6 +197,39 @@ The rules, and the reasoning behind them:
 | ROCm | float16, or bfloat16 on CDNA2 and newer |
 | Intel XPU | bfloat16 |
 
+### Using more than one card
+
+```bash
+python dub.py --video talk.mp4 --target fr --devices cuda:0,cuda:1
+python dub.py --video talk.mp4 --target fr --devices cuda:1,cuda:0  # cuda:1 leads
+```
+
+`--devices` spreads the two stages that dominate the wall clock - the blend and the
+synthesis - over several cards. Each device gets its own worker process with its own
+copy of the checkpoint, and each takes work as soon as it is free, so the split is by
+*work*, not by model: nothing is sharded inside a model, because a clone prompt
+belongs to the device that built it.
+
+| | |
+|---|---|
+| Spread over the cards | The blend (one task per voice) and the synthesis (one task per voice, or per piece of a voice's lines when there are fewer voices than cards) |
+| Stays on the first device | ASR, diarization, separation and the accent anchors - each runs once, so there is nothing to split |
+| Voice | Unchanged. Every worker builds the same prompt from the same facts, and the reference is encoded once per worker rather than once per run |
+| Memory per card | Unchanged. Each worker keeps its own measured ceiling, so a card sees the peak it would have seen on its own |
+| Wall clock | Measured on two RTX 3060s. A controlled A/B - the same five synthesis tasks, same texts, reference and model, only the worker count changed - went from **19.4 s on one card to 14.9 s on two**. The gain is bounded by the checkpoint load (~7-8 s per worker, paid once per job), which dominates a job this short; on the 11-minute job, where synthesis measured 616 s, the per-task work is the whole cost and the split has the room it needs |
+| Cost | One checkpoint load per worker per job (workers are kept alive across the blend and the synthesis), and one full re-synthesis when you switch to a list, because per-worker batching differs from a single worker's |
+
+The first device in the list carries the stages that cannot be split, so
+`--devices cuda:1,cuda:0` also decides which card ASR and diarization use.
+`--device` is unchanged and is the whole answer when `--devices` is absent: a run
+that does not ask for a fan-out does exactly what it did before. Repeating a name is
+allowed (`--devices cpu,cpu`), which is how the fan-out is tested on a machine with
+one processor.
+
+A full dub was run this way (`input/change-the-world.mp4`, 22 s, `--accent-mode
+preserve`): both cards took work, the peaks were 5.31 GiB and 4.93 GiB — each inside
+its own ceiling and independent of the other — and `audit_qc.py` exited 0.
+
 If you ask for a precision the device cannot run, the pipeline uses the best it
 can and says so in the log rather than failing the job. `report.json` → `device`
 records what was actually used, so a run on unfamiliar hardware is diagnosable
@@ -255,6 +288,11 @@ Five things now keep a long job off that ceiling, and all are on by default:
 ```bash
 python dub.py --video long.mp4 --target fr --tts-batch 2
 ```
+
+With `--devices` there is one set of counters per worker: the counts are summed,
+`peak_reserved_bytes` is the worst card, and `per_device` keeps each card's own
+numbers. A card that is smaller than the others shows up there rather than in the
+peak alone.
 
 A shorter reference is the other lever, and it is the cheap one: the reference is
 charged per line, so halving it halves that term for the whole job. `--ref-text`
@@ -865,6 +903,7 @@ a space.
 
 | Option | Default | What it achieves ||---|---|---|
 | `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps`, or `xpu`. `cuda:1` pins a specific GPU. `cpu` is much slower but proves the GPU is not the problem. See [Devices and precision](#devices-and-precision) |
+| `--devices DEV[,DEV...]` | unset | Spreads the blend and the synthesis over several devices, one worker process each: `--devices cuda:0,cuda:1`. A worker takes the next piece of work as it frees up, so the split is by work rather than by model. The first device carries the stages that cannot be split (ASR, diarization, separation, anchors). Repeating a name is allowed and is how the fan-out is tested on one machine. Unset leaves `--device` as the whole answer. See [Using more than one card](#using-more-than-one-card) |
 | `--dtype DTYPE` | `auto` | Precision for the voice-cloning checkpoint: `auto`, `bf16`, `fp16`, or `fp32`. `auto` reads the device's capability. An explicit value is honoured unless the device cannot run it |
 | `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate — the main lever on a CPU-only machine. |
 | `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
@@ -1120,7 +1159,7 @@ output/talk/
 | `donor.speakers` | Per-voice detail: the donor segment chosen for each, how many segments they own, how long they speak, and the accent and blend records for that voice. This is the job's voice bible |
 | `donor.accent` | Present in `native` and `reference-accent` modes: for a supplied clip, its path and whether a transcript was provided; for a generated anchor, `source` (`anchor` or `anchor-matched`), the `language`, and the matched `rate_band` / `gender` |
 | `donor.blend` | Present in every blending mode (`native` and `reference-accent`): the strategy used, the passes and takes considered, and how the kept clip scored. `donor_ratio` places it between the accent voice (`0`) and the speaker's own voice (`1`) — the field to watch, and the one to raise `--blend-iters` for. `margin` only ranks takes against each other; a negative value is not by itself evidence of a problem |
-| `tts` | How synthesis batched and what memory it reached: `batch_size`, `max_decode_seconds`, `reference_seconds` (the clone clip, charged per line), `seconds_per_char` (measured, not assumed), `batches`, `peak_batch_seconds`, `oom_retries`, `cache_releases`, `ceiling_shrinks`, and `peak_reserved_bytes`. `oom_retries` or `ceiling_shrinks` above zero means the run touched the memory ceiling — lower `--tts-batch`. See [Memory on a long video](#memory-on-a-long-video) |
+| `tts` | How synthesis batched and what memory it reached: `batch_size`, `max_decode_seconds`, `reference_seconds` (the clone clip, charged per line), `seconds_per_char` (measured, not assumed), `batches`, `peak_batch_seconds`, `oom_retries`, `cache_releases`, `ceiling_shrinks`, and `peak_reserved_bytes`. `oom_retries` or `ceiling_shrinks` above zero means the run touched the memory ceiling — lower `--tts-batch`. See [Memory on a long video](#memory-on-a-long-video). With `--devices` the counters of every worker are summed, `peak_reserved_bytes` is the worst card rather than the total, and `devices` plus `per_device` name the cards that did the work |
 | `clamped_segments` | Lines that hit a stretch limit (either direction) |
 | `clamped_long_segments` | …of which were too long to compress into their slot |
 | `clamped_short_segments` | …of which were too short to slow down enough to fill it |
@@ -1188,6 +1227,11 @@ That is deliberate — it keeps a result reproducible from one command — but i
 means experimenting costs a full run each time. Slice the input short
 (see [Fast iteration](#fast-iteration)) when you plan to try several settings.
 
+The one exception is `--devices`: a job that never passes it hashes exactly what
+it hashed before the option existed, so adding the feature invalidated no cache.
+Asking for a fan-out *does* change the hash, because per-worker batching differs
+from a single worker's — the same reason `--tts-batch` is part of it.
+
 Because the fingerprint distinguishes settings, you can safely point several
 different runs at the same `--output-dir`: each input gets its own `<stem>`
 folder, and a run whose settings differ from the last one starts fresh rather
@@ -1216,7 +1260,7 @@ video/audio ─► 1. audio extract ─► 2. separate ─► 3. ASR + VAD ─�
 | 4 | Diarize | `pipeline/diarize.py` | embeds each segment and clusters the embeddings into speakers |
 | 4b | Overlap | `pipeline/overlap_separation.py` | with `--overlap separate`, splits a flagged segment into per-speaker streams for re-transcription |
 | 5 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
-| 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker |
+| 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker — spread over several cards with `--devices` |
 | 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked bed — optionally matched to the source's room |
 | 8 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
 
@@ -1257,7 +1301,7 @@ python -m pytest
 ```
 
 ```
-899 passed
+1051 passed
 ```
 
 Run a single area while iterating:
@@ -1429,10 +1473,12 @@ pipeline/
 ├── mixing.py              ducking, bed mix and room matching (pure numpy)
 ├── translate.py           OpenAI-compatible translation
 ├── tts.py                 per-speaker donor selection + voice cloning
+├── voice.py               one voice: the facts that build its clone prompt
+├── parallel.py            fan-out: tasks, the worker pool, per-device counters
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (899 tests, no GPU or models needed)
+tests/                     pytest suite (1051 tests, no GPU or models needed)
 models/                    downloaded weights (gitignored)
 output/                    job artifacts (gitignored)
 clone.py, main.py          standalone TTS demos kept for reference
