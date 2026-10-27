@@ -13,3 +13,4 @@ We want to use as most as possible open models that can be run on consumer. For 
 # Important
 - technical guidelines for the project are here: .agents/technical-guidelines.md
 - plan and roadmap (MVP + future improvements) are here: PLAN.md
+- user documentation (setup, usage, voices, troubleshooting) is here: docs/README.md

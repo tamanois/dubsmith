@@ -1,155 +1,58 @@
 # AI Video Dubbing
 
-Dub a video into another language while keeping each speaker's **own voice
-**timbre**. Runs entirely on local, open models; no cloud required.
+Dub a video into another language while keeping each speaker's **own voice timbre**.
+Runs entirely on local, open models; no cloud required.
 
-See [`PLAN.md`](PLAN.md) for the full vision, roadmap (P1–P6) and design
-decisions, and [`AGENTS.md`](AGENTS.md) for the project context.
+Take a video, detect the language of the speakers, identify each voice, and
+produce a new video where the speakers speak a target language in their own
+voice — with a native accent when possible.
+
+- [Vision and roadmap](PLAN.md) · [Documentation](docs/README.md) · [Engineering guidelines](.agents/technical-guidelines.md)
 
 ---
 
 ## What it does
 
-| | |
+| Capability | Detail |
 |---|---|
 | **Input** | One video, or one audio file |
-| **Speakers** | One or several: speakers are found automatically and each is cloned from their own voice. `--diarizer none` forces a single voice |
-| **Source language** | One language, auto-detected (multi-language is P5) |
-| **Target language** | English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
-| **Voice** | Cloned from the source speaker, with a generated native accent by default (see [Accent modes](#accent-modes)) |
-| **Output** | Dubbed video/audio + source & translated SRT subtitles, original music/ambience preserved |
-| **Not included** | Lip sync (P4); choosing a native accent by hand instead of the generated one (P2); multi-language source videos (P5) |
+| **Speakers** | One or several: detected automatically, each cloned from their own voice (`--diarizer none` forces one) |
+| **Languages** | Source auto-detected; target: English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
+| **Voice** | Cloned from the source speaker, with a generated native accent by default. Saved voice prints can be designed or cloned once and reused by name |
+| **Output** | Dubbed video/audio + source and translated SRT subtitles, original music/ambience preserved |
+| **Not included** | Lip sync (P4), multi-language source videos (P5) |
 
 ---
 
-## Hardware requirements
+## Quick start
 
-| | |
-|---|---|
-| **Disk** | ~10 GB of model weights (`models/` is gitignored), plus your media and the generated accent anchors |
-| **GPU** | Optional, but strongly recommended. ~12 GB VRAM runs the default path comfortably: each TTS checkpoint is ~3.5 GB in bfloat16 and Whisper large-v3 ~3 GB. The two TTS checkpoints are never resident together |
-| **CPU only** | Works end to end and produces the same *result*. Measured on a 12-core box: a 22 s clip dubs in **2:10** (`preserve`) or **5:18** (`reference-accent`), with every quality gate passing. Synthesis is ~4.3× realtime in float32, so the real constraint is **RAM** (12.7–17.2 GB peak), not patience |
-| **Python** | 3.10 or newer |
+From a fresh clone to a first dub.
 
-The precision follows the hardware rather than the device name — bfloat16 on
-Ampere and newer, float16 on older accelerators (Turing, Volta), float32 on CPU.
-Run `python dub.py info` on unfamiliar hardware before a long job: it reports the
-accelerator, the device and precision the pipeline would pick, which optional
-packages are installed, and which models are present.
+**Requirements**
 
----
+- Python **3.10+**
+- `ffmpeg` and `ffprobe` for video input (audio-only needs neither)
+- ~10 GB of disk for the model weights
+- A GPU is optional but strongly recommended (~12 GB VRAM for the default path)
+- An **OpenAI-compatible** LLM endpoint for translation
 
-## Prerequisites
-
-### 1. System binaries
-
-These are **not** installable from `pip` and need root. On Debian/Ubuntu:
+**1. Clone and install**
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y ffmpeg rubberband-cli sox
-```
-
-| Binary | Required? | Used for | If missing |
-|---|---|---|---|
-| `ffmpeg` / `ffprobe` | **Required for video** | audio extraction, muxing, probing | video input fails with a clear error; **audio-only input still works** |
-| `rubberband` | Recommended | best-quality time stretching | falls back to `sox`, then to a pure-Python stretcher |
-| `sox` | Recommended | alternative stretcher | falls back to the Python stretcher |
-
-The pipeline **degrades gracefully**: it never hard-fails because a *stretcher* is
-missing, and audio-only jobs work with no system binaries at all. Only video
-input genuinely requires `ffmpeg`.
-
-> Check what you have:
-> ```bash
-> for b in ffmpeg ffprobe rubberband sox; do printf '%-11s %s\n' "$b" "$(command -v $b || echo MISSING)"; done
-> ```
-
-### 2. Python
-
-Python **3.10+** is required (developed and tested on 3.10.12).
-
-```bash
+git clone <repository-url> qwen-tts
+cd qwen-tts
 python3 -m venv .venv
 source .venv/bin/activate
-pip install .              # or: pip install -r requirements.txt
-```
-
-The package installs a `dub` command, so `python dub.py --target fr` and
-`dub --target fr` are the same thing. Optional features are extras:
-
-```bash
-pip install ".[background]"    # Demucs: keep the original music and ambience
-pip install ".[diarization]"   # funasr: clone each speaker from their own voice
-pip install ".[separation]"    # SpeechBrain: split overlapping speakers
-pip install ".[full]"          # all of the above
-```
-
-Every one of those degrades gracefully when absent, so a first dub needs none of
-them. On a **CPU-only machine**, install the CPU torch wheel first — the default
-wheel is several gigabytes of CUDA you cannot use:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install .
 ```
 
-> If dependency resolution is awkward, install the two pins first — this is what
-> `packages.md` refers to:
-> ```bash
-> pip install numpy==1.26.4 typing_extensions
-> pip install -r requirements.txt
-> ```
-
-**GPU is optional.** With CUDA or ROCm the pipeline runs there; without one
-everything still runs on CPU, just much slower. Speech recognition always uses
-CTranslate2, which offers CUDA and CPU only — so on Apple Silicon ASR runs on the
-CPU while the other stages can use Metal if you ask for it. See
-[Devices and precision](#devices-and-precision).
-
-Python packages installed by `requirements.txt`:
-
-| Package | Role |
-|---|---|
-| `torch` | model runtime |
-| `qwen_tts` | voice-cloning TTS |
-| `faster-whisper` | ASR (bundles its own Silero VAD) |
-| `pyloudnorm` | EBU R128 loudness normalisation |
-| `openai` | client for the OpenAI-compatible translation endpoint |
-| `librosa`, `soundfile` | audio I/O, resampling, fallback stretching |
-| `pydantic` | config validation |
-
-For development and tests:
+Optional extras (each degrades gracefully when absent):
 
 ```bash
-pip install -r requirements-dev.txt
+pip install ".[full]"     # Demucs background separation, funasr diarization, SpeechBrain overlap
 ```
 
-### 3. Optional: CUDA 12 libraries for GPU speech recognition
-
-CTranslate2 (which faster-whisper uses) links against **CUDA 12** specifically,
-while recent `torch` wheels ship **CUDA 13**. On such a machine ASR logs:
-
-```
-Library libcublas.so.12 is not found or cannot be loaded
-```
-
-The pipeline handles this by itself: it preloads vendored CUDA libraries, and if
-that is not possible it **falls back to CPU** with a clear warning (identical
-output, just slower). To get GPU ASR instead, install the matching runtime:
-
-```bash
-pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
-```
-
-No `LD_LIBRARY_PATH` export is required — the pipeline loads these libraries into
-the process itself (see `pipeline/asr.py`). Check the log lines to see which
-device was actually used.
-
-### 4. A translation endpoint
-
-The translation stage calls any **OpenAI-compatible** `/v1/chat/completions`
-server. Point it at a local server or a cloud provider via `.env`:
+**2. Point the translator at a model**
 
 ```bash
 cp .env.example .env
@@ -161,1375 +64,170 @@ LLM_API_KEY=not-needed
 LLM_MODEL=local-model
 ```
 
-A local `llama.cpp` server works well:
+Any OpenAI-compatible server works, including a local `llama.cpp`:
+`llama-server -m /path/to/model.gguf --port 8080`.
 
-```bash
-llama-server -m /path/to/model.gguf --port 8080
-```
-
-Real environment variables always take precedence over `.env`.
-
----
-
-## Devices and precision
-
-```bash
-python dub.py info                     # what would this machine use, and why?
-python dub.py --video talk.mp4 --target fr --device cpu    # force CPU
-python dub.py --video talk.mp4 --target fr --dtype fp16    # force a precision
-```
-
-`--device` accepts `auto` (the default), `cpu`, `cuda`, `cuda:N` for a specific
-GPU, and `mps` or `xpu` on Apple and Intel hardware. `--dtype` accepts `auto`
-(the default), `bf16`, `fp16` or `fp32`.
-
-The rules, and the reasoning behind them:
-
-| Situation | What happens |
-|---|---|
-| CUDA or ROCm GPU present | `auto` uses it. `cuda:1` is honoured exactly, so a second GPU can be pinned |
-| No GPU | `auto` uses the CPU. Everything works; it is just much slower |
-| Apple Silicon | `auto` uses the CPU, because faster-whisper runs on CTranslate2, which has no Metal backend. `--device mps` still puts the *other* stages on the GPU, and ASR quietly stays on the CPU |
-| Ampere or newer NVIDIA (sm_80+) | bfloat16 |
-| Turing or Volta (sm_70–sm_75) | float16 — bfloat16 is unsupported on these cards, and choosing it was a real failure on the second-hand GPUs people actually own |
-| Pascal or older (sm_61 and below) | float32 — emulated float16 is lossy |
-| CPU | float32 |
-| ROCm | float16, or bfloat16 on CDNA2 and newer |
-| Intel XPU | bfloat16 |
-
-### Using more than one card
-
-```bash
-python dub.py --video talk.mp4 --target fr --devices cuda:0,cuda:1
-python dub.py --video talk.mp4 --target fr --devices cuda:1,cuda:0  # cuda:1 leads
-```
-
-`--devices` spreads the two stages that dominate the wall clock - the blend and the
-synthesis - over several cards. Each device gets its own worker process with its own
-copy of the checkpoint, and each takes work as soon as it is free, so the split is by
-*work*, not by model: nothing is sharded inside a model, because a clone prompt
-belongs to the device that built it.
-
-| | |
-|---|---|
-| Spread over the cards | The blend (one task per voice) and the synthesis (one task per voice, or per piece of a voice's lines when there are fewer voices than cards) |
-| Stays on the first device | ASR, diarization, separation and the accent anchors - each runs once, so there is nothing to split |
-| Voice | Unchanged. Every worker builds the same prompt from the same facts, and the reference is encoded once per worker rather than once per run |
-| Memory per card | Unchanged. Each worker keeps its own measured ceiling, so a card sees the peak it would have seen on its own |
-| Wall clock | Measured on two RTX 3060s. A controlled A/B - the same five synthesis tasks, same texts, reference and model, only the worker count changed - went from **19.4 s on one card to 14.9 s on two**. The gain is bounded by the checkpoint load (~7-8 s per worker, paid once per job), which dominates a job this short; on the 11-minute job, where synthesis measured 616 s, the per-task work is the whole cost and the split has the room it needs |
-| Cost | One checkpoint load per worker per job (workers are kept alive across the blend and the synthesis), and one full re-synthesis when you switch to a list, because per-worker batching differs from a single worker's |
-
-The first device in the list carries the stages that cannot be split, so
-`--devices cuda:1,cuda:0` also decides which card ASR and diarization use.
-`--device` is unchanged and is the whole answer when `--devices` is absent: a run
-that does not ask for a fan-out does exactly what it did before. Repeating a name is
-allowed (`--devices cpu,cpu`), which is how the fan-out is tested on a machine with
-one processor.
-
-A full dub was run this way (`input/change-the-world.mp4`, 22 s, `--accent-mode
-preserve`): both cards took work, the peaks were 5.31 GiB and 4.93 GiB — each inside
-its own ceiling and independent of the other — and `audit_qc.py` exited 0.
-
-If you ask for a precision the device cannot run, the pipeline uses the best it
-can and says so in the log rather than failing the job. `report.json` → `device`
-records what was actually used, so a run on unfamiliar hardware is diagnosable
-from the report alone.
-
-**Changing the precision does not measurably change the voice.** Measured on three
-sentences with one reference clip: float16 versus bfloat16 scored 0.9902 (median) on
-the checkpoint's own speaker encoder, against 0.9898 and 0.9935 for two draws at the
-*same* precision. The cross-precision difference is smaller than the run-to-run
-sampling spread, so forcing `--dtype fp16` on a pre-Ampere card is a throughput
-choice rather than a quality one.
-
----
-
-## Memory on a long video
-
-A long job is a memory problem before it is a speed problem, and the reason is
-specific and measurable: **the checkpoint decodes the clone prompt's reference audio
-once per line, then throws it away.** `generate_voice_clone` concatenates the
-prompt's speech codes onto every line's codes and only trims the reference back off
-the waveform afterwards, so a batch of eight lines cloned from a 21 s clip decodes
-~170 s of audio no matter how short the lines are.
-
-Measured on a 12 GB RTX 3060, bfloat16, cloning from this repo's own 21 s blend
-clip:
-
-| Lines in one call | Audio actually produced | Peak memory held |
-|---|---|---|
-| 1 | 0.2 s | 4.67 GiB |
-| 2 | 0.5 s | 5.33 GiB |
-| 4 | 1.3 s | 6.74 GiB |
-| 8 | 3.0 s | **9.55 GiB** |
-
-So the peak is ~0.65 GiB *per line* at that reference length, and an 11-minute video
-(a job with 476 lines) sits one large batch away from the card's 11.87 GiB. That is
-exactly what happened: `CUDACachingAllocator` reported allocations of **0.8–2.4 GiB**
-failing with as little as **54 MB** free. The job still finished — the allocator
-recovers internally, so nothing reaches the pipeline as an error — but retrying at
-that edge is one unlucky batch away from a failed run.
-
-Five things now keep a long job off that ceiling, and all are on by default:
-
-| What | Why |
-|---|---|
-| A batch is budgeted in **decoded** audio: the reference is charged to every line, on top of the lines' own predicted duration | The reference dominates. Capping only the lines' duration changed nothing, because 8 × 21 s of reference is a bigger term than the lines themselves |
-| A measured **ceiling** on the card (`0.7` of it): a call that fills more than that halves the size of everything after it | The peak depends on the reference length, the dtype and the card, so it is measured per call rather than assumed. It never grows back, so the run cannot oscillate around the edge |
-| Cached blocks go back to the driver whenever free memory falls below 3 GB | Waiting for the error before releasing is releasing too late; this costs milliseconds |
-| The allocator runs with `expandable_segments:True` (CUDA only, and only when you have not set `PYTORCH_ALLOC_CONF` yourself) | The allocator holds freed blocks at the size they were requested, so a pool can have free memory in it and still be unable to serve the next shape |
-| `--tts-batch` caps the lines per call outright | The manual ceiling on top of the automatic one |
-
-`report.json` → `tts` records what happened: `batch_size`, `max_decode_seconds`,
-`reference_seconds`, `seconds_per_char`, `batches`, `peak_batch_seconds`,
-`oom_retries`, `cache_releases`, `ceiling_shrinks` and `peak_reserved_bytes`. If
-`oom_retries` is not zero, lower `--tts-batch`:
-
-```bash
-python dub.py --video long.mp4 --target fr --tts-batch 2
-```
-
-With `--devices` there is one set of counters per worker: the counts are summed,
-`peak_reserved_bytes` is the worst card, and `per_device` keeps each card's own
-numbers. A card that is smaller than the others shows up there rather than in the
-peak alone.
-
-A shorter reference is the other lever, and it is the cheap one: the reference is
-charged per line, so halving it halves that term for the whole job. `--ref-text`
-and `--accent-text` clips of 10–20 s are plenty; a 40 s reference doubles the cost of
-every line for no benefit.
-
-**The trade is time, and on a small card it is real.** Smaller batches mean more
-model calls: on the measured 12 GB card the 11-minute job's synthesis went from 393 s
-(with 66 failed allocations) to 616 s (with none), roughly +55 %. On a card with room
-the ceiling never fires and batches stay as large as `--tts-batch` allows.
-
----
-
-## Download the models
-
-Model weights are **not** stored in this repository (`models/` is gitignored).
-One command fetches everything the MVP needs:
+**3. Download the models (~10 GB, once)**
 
 ```bash
 python dub.py models --download all
 ```
 
-This downloads:
-
-| Name | Hugging Face repo | Approx. size |
-|---|---|---|
-| `whisper_large_v3` | `Systran/faster-whisper-large-v3` | ~3 GB |
-| `tts_base` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ~3.5 GB |
-| `tts_voice_design` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~3.5 GB |
-
-The third checkpoint generates the **accent anchors** the default `native`
-accent mode borrows pronunciation from, so it is required rather than optional.
-Anchors are generated once per language and cached under `models/anchors/`.
-
-Other commands:
+**4. Check the machine**
 
 ```bash
-python dub.py models --list                # show every model and whether it's present
-python dub.py models --download tts_base   # one model only
-python dub.py models --download everything # incl. optional models
-python dub.py models --download --force all
+python dub.py info          # device, precision, optional packages, models
 ```
 
-Optional models (registered but not needed for the MVP):
-
-| Name | Repo | Why you might want it |
-|---|---|---|
-| `tts_custom_voice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 premium named voices + emotion instructions |
-| `tts_tokenizer` | `Qwen/Qwen3-TTS-Tokenizer-12Hz` | standalone tokenizer (already bundled in `tts_base`) |
-
-You can also copy a model directory in by hand — anything present under
-`MODELS_DIR` is detected automatically. Override the location with `MODELS_DIR`
-in `.env`, which every command then honours. The download command also takes
-`--models-dir` directly:
+**5. Dub**
 
 ```bash
-python dub.py models --download all --models-dir /data/models
+python dub.py --video talk.mp4 --target fr
 ```
 
-Check which models are visible (and what to do about the ones that aren't):
+The result is `output/talk/video_dubbed.mp4`, with `dub.wav`, subtitles and
+`report.json` beside it. A first run also generates the French accent anchor,
+cached under `models/anchors/`.
 
-```bash
-python dub.py models --list
-```
-
-A dubbing run fails with an actionable message naming the exact download command
-if a required model is missing, so you can also just try a dub and see.
+For the full setup matrix — CPU-only installs, CUDA 12 libraries for GPU ASR,
+optional models, `MODELS_DIR` — see [docs/setup.md](docs/setup.md).
 
 ---
 
-## Usage
+## Main commands
 
-### Which command do I want?
-
-| If you want… | Use | What it changes |
-|---|---|---|
-| a first working dub, zero setup | `--video talk.mp4 --target fr` | detects the source language, picks the donor voice from the video, borrows a generated native accent, preserves the original music/ambience |
-| a voice that isn't the video's speaker | `--ref-audio ref.wav --ref-text "…"` | clones `ref.wav` for both timbre and accent |
-| an anchor fitted to the source voice | `--accent-match rate` (or `gender`) | generates a per-speaker anchor matching the speaker's rate (and gender) |
-| to keep the source accent | `--accent-mode preserve` | clones the speaker's accent along with their voice |
-| to drop the source accent using the model's own phonetics | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
-| a native accent you choose yourself | `--accent-mode reference-accent --accent-audio nat.wav --accent-text "…"` | timbre from the video's speaker, pronunciation from `nat.wav` |
-| every speaker in their own voice | *nothing* | finds the speakers and clones each one from their own voice — see [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers) |
-| one voice for the whole video | `--diarizer none` | the pre-P1 behaviour: whichever speaker talks most supplies the voice |
-| no music behind the voice | `--no-background` | discards the separated bed instead of ducking it |
-| an absolute loudness target | `--loudness lufs --lufs -16` | forces a level instead of matching the source |
-| to redo a run from scratch | `--force` | ignores the stage cache |
-| to judge a run without listening | *nothing* | read `report.json` in the job folder |
-
-Every option is described in [Options in full](#options-in-full);
-`python dub.py --help` prints the same list.
-
-### Commands, grouped by purpose
-
-**Set up**
+**Dub a video or audio file**
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate   # one-time
-pip install .                                        # runtime dependencies
-pip install -r requirements-dev.txt                  # + pytest and the optional backends
-
-python dub.py info                                   # what will this machine use?
-python dub.py models --download all                  # ~10 GB of weights
-python dub.py models --list                          # what is present already?
-```
-
-**Dub something**
-
-```bash
-# video -> dubbed video, source language auto-detected
-python dub.py --video talk.mp4 --target fr
-
-# audio only: no ffmpeg needed, writes dub.wav + subtitles
-python dub.py --audio interview.wav --target es
-
-# trust your own language detection instead of Whisper's
+python dub.py --video talk.mp4 --target fr          # dubbed video + subtitles
+python dub.py --audio interview.wav --target es     # audio only, no ffmpeg
 python dub.py --video talk.mp4 --source en --target de
-
-# skip the subtitle files
-python dub.py --video talk.mp4 --target ja --no-subtitles
 ```
-
-With no `--ref-audio`, the reference voice is taken automatically from the
-longest clean speech segment and its transcript comes from the ASR pass, so
-there is nothing to prepare by hand.
 
 **Choose the voice**
 
 ```bash
-# clone a specific recording instead of the speaker in the video
-python dub.py --video talk.mp4 --target fr \
-  --ref-audio "voice.wav" \
-  --ref-text "the exact words spoken in voice.wav"
-
-# keep the speaker's timbre, drop their accent
-python dub.py --video talk.mp4 --target fr --accent-mode speaker-only
+# clone a specific recording (the transcript must match the audio exactly)
+python dub.py --video talk.mp4 --target fr --ref-audio me.wav --ref-text "…"
 
 # keep the speaker's timbre, borrow a native accent
 python dub.py --video talk.mp4 --target fr \
-  --accent-mode reference-accent \
-  --accent-audio "native.wav" \
-  --accent-text "the exact words spoken in native.wav"
+  --accent-mode reference-accent --accent-audio native.mp3 --accent-text "…"
+
+# keep the source accent
+python dub.py --video talk.mp4 --target fr --accent-mode preserve
 ```
 
-Any format `libsndfile` reads works for reference and accent clips:
-`.wav` `.flac` `.mp3` `.ogg` `.aiff`, a URL, or a `(samples, rate)` tuple.
-`--ref-text` must be the **exact transcript** of `--ref-audio` because the model
-conditions on both (ICL mode); the same is true of `--accent-text` for
-`--accent-audio`. See [Accent modes](#accent-modes) for which mode needs which.
-
-**Control the audio bed and level**
+**Create and reuse a saved voice**
 
 ```bash
-python dub.py --video talk.mp4 --target fr --no-background    # voice only
-python dub.py --video talk.mp4 --target fr --duck-db 10       # bury the music further
-python dub.py --video talk.mp4 --target fr --separator none   # treat the source as one track
-python dub.py --video talk.mp4 --target fr --loudness lufs --lufs -16
+python dub.py voices --design --prompt "a warm female French voice" --lang fr --label warm-fr
+python dub.py voices --clone --audio me.wav --clone-text "…" --lang fr --label me
+python dub.py voices --list
+
+python dub.py say --voice warm-fr --text "Bonjour, ceci est un test."
+python dub.py --video talk.mp4 --target en --voice warm-fr
 ```
 
-**Control timing**
+**Multi-speaker videos**
 
 ```bash
-python dub.py --video talk.mp4 --target fr --min-stretch 0.70   # permit faster speech than the default
-python dub.py --video talk.mp4 --target fr --budget-speedup 0.90 # fit more words per line
-python dub.py --video talk.mp4 --target fr --max-stretch 1.10  # cap how far lines are slowed
-python dub.py --video talk.mp4 --target fr --stretcher sox     # pick a specific backend
+python dub.py --video debate.mp4 --target fr            # one voice per speaker
+python dub.py --video debate.mp4 --target fr --overlap separate
 ```
 
-**Repeatable and diagnostic runs**
+**Inspect and audit a run**
 
 ```bash
-python dub.py --video talk.mp4 --target fr --force     # ignore the cache
-python dub.py --video talk.mp4 --target fr -v          # debug logging
-python dub.py --video talk.mp4 --target fr --device cpu # rule the GPU out
+cat "output/talk/report.json"                  # the quickest way to judge a run
+python audit_qc.py "output/talk"               # pass/fail gates, no model
+python audit_qc.py "output/talk" --timbre      # adds the per-line timbre gate
 ```
 
-### Fast iteration
-
-A 5-minute video takes a few minutes to dub, which is slow to iterate on. Slice
-out a short section and dub that instead — the pipeline behaves identically,
-just faster:
+**Models and the environment**
 
 ```bash
-ffmpeg -ss 30 -t 60 -i talk.mp4 -c copy clip60.mp4
-python dub.py --video clip60.mp4 --target fr
+python dub.py models --list
+python dub.py info
 ```
 
-Note that `-c copy` cuts on the nearest keyframe, so `clip60.mp4` may start a
-second or two earlier than requested. That is fine for trying out options.
-
-### Accent modes
-
-Accent and timbre are stored separately by the checkpoint: pronunciation and
-prosody ride in the reference *speech codes*, while vocal identity rides in the
-*speaker embedding*. That split is what makes these modes possible.
-
-| `--accent-mode` | Speech codes (accent, pacing) | Speaker embedding (timbre) | Use when |
-|---|---|---|---|
-| `native` *(default)* | a **generated** native accent anchor | the reference voice, or the auto donor | The default: the speaker's timbre with a native target accent, no clip supplied |
-| `preserve` | the reference voice, or the auto-selected donor | same clip | You want the original speaker, including their accent |
-| `speaker-only` | none — the model chooses | the reference voice | The source accent is too strong and you want the model's own phonetics |
-| `reference-accent` | **`--accent-audio`** | the reference voice, or the auto donor | You want to choose the borrowed accent yourself |
-
-`native` asks for nothing: the anchor is synthesised by the VoiceDesign checkpoint
-from a short native-language passage (see
-[Automatic native accent](#automatic-native-accent)). The other three modes remain
-available and unchanged. `speaker-only` is the cheap option — no extra clip, but
-the model chooses the delivery — and `reference-accent` costs you one clip and its
-transcript, buying an accent you pick by hand.
-
-### Automatic native accent
-
-The default mode generates its own accent reference, so the speaker's timbre comes
-from the video and the pronunciation comes from a native narration the model
-writes for the target language:
-
-```bash
-python dub.py --video talk.mp4 --target fr          # native accent, out of the box
-python dub.py --video talk.mp4 --target fr --accent-match rate    # fit its pace
-python dub.py --video talk.mp4 --target fr --accent-match gender  # pace and gender
-```
-
-The anchor is a short passage synthesised once per language by
-`Qwen3-TTS-12Hz-1.7B-VoiceDesign` and cached under `models/anchors/`, so it costs
-one generation per language and nothing afterwards. Pre-generate the languages you
-care about during setup:
-
-```bash
-python dub.py anchors --generate                 # every supported language
-python dub.py anchors --generate --lang fr --lang de
-python dub.py anchors --list                     # what is cached
-```
-
-With `--accent-match`, the anchor is instead generated per speaker to fit the
-source voice: `rate` matches its measured speaking rate, and `gender` matches its
-(coarse) gender as well. This costs one anchor per distinct (language, rate band,
-gender) combination, cached like the plain ones.
-
-
-`reference-accent` asks the model to satisfy two signals at once: the accent
-clip's speech codes and the speaker's own embedding. Those describe different
-people, and any single line is free to follow either one — heard as the speaker
-changing mid-video. So by default the mode **builds the blend once**
-(`--accent-blend two-stage`): the accent transcript is rendered in the speaker's
-voice, the take that kept their timbre is kept, and every line is then cloned from
-that one clip. Its codes and its embedding come from the same audio, so there is
-nothing left to disagree. `--accent-blend single-stage` restores conditioning each
-line on both sources directly, which is useful for an A/B listen.
-
-### Borrow a native accent without losing the voice
-
-This is the manual alternative to the default: use it when you already have a
-native-target recording whose pronunciation you want, instead of the generated
-anchor. Hand over the clip; the voice stays the speaker's, the pronunciation
-becomes the clip's. A news or podcast segment works better than a slow, careful
-personal reading — see [Reference pacing](#reference-pacing):
-
-```bash
-python dub.py --video talk.mp4 --target fr \
-  --accent-mode reference-accent \
-  --accent-audio "native-narration.mp3" \
-  --accent-text "the exact words spoken in native-narration.mp3"
-```
-
-Both flags are required together, and `--accent-text` must be the exact
-transcript of `--accent-audio` — it is what aligns the codes being borrowed.
-`--ref-audio` is optional: leave it out and the timbre is auto-selected from the
-video, exactly as in the other modes. Keep the accent clip short; 10–20 seconds
-is plenty, and a longer clip mostly costs synthesis time.
-
-Before dubbing anything, the mode renders your accent transcript in the speaker's
-own voice and writes the result to `reference_blend.wav` inside the job folder.
-That clip is what every line is then cloned from.
-
-Building that clip is not neutral between the two voices. The accent clip arrives
-as a complete example — its speech codes *and* its transcript — while the speaker
-contributes a single embedding, so a single pass tends to come out closer to the
-accent clip than to the speaker. The mode therefore repeats it: each pass re-reads
-the previous clip and re-injects the speaker's embedding, walking the voice back
-toward the speaker while the accent transcript keeps pronunciation anchored. It
-stops as soon as `--blend-ratio` is reached (default `0.85`, meaning well past
-half-way from the accent voice to the speaker's own) or after `--blend-iters`
-passes (default 5), whichever comes first, and keeps the best pass rather than the
-last one. `--blend-takes` (default 3) additionally renders several candidates in
-the first pass and keeps the one closest to the speaker. The clip is cached with
-the rest of the job, so a rerun reuses it instead of quietly reselecting a
-different voice.
-
-How far the blend got is measured rather than guessed. `report.json` →
-`donor.blend` reports `donor_ratio`: `0` is the accent clip's voice, `1` is a
-French utterance in the speaker's own voice. Both ends of that scale are in the
-target language, which is what makes it meaningful — a raw similarity against the
-*source-language* donor would measure the language gap as much as the voice. If a
-run stops short of the target, the log says so: raise `--blend-iters`, or lower
-`--blend-ratio` if you would rather keep more of the accent. The `margin` field is
-a different thing — a ranking score for choosing between takes, not a verdict,
-since its absolute value is not comparable across clip pairs.
-
-The quickest check on a run is still to listen to `reference_blend.wav` on its own:
-twelve seconds of the speaker explaining something in the target language answers
-"whose voice is this?" directly.
-
-#### Choosing the blend strength
-
-`--blend-ratio` is the knob you will actually turn; `--blend-iters` is the safety
-limit. Start from the defaults (`0.85`, `5`) and move in one direction at a time,
-judging by the log's `donor ratio` line and the `reference_blend.wav` clip:
-
-| You want | Do |
-|---|---|
-| The default: a balance that keeps the speaker clearly | leave both as-is (`--blend-ratio 0.85 --blend-iters 5`) |
-| The speaker's voice stronger — the accent clip is leaking through | raise `--blend-ratio` (e.g. `0.92`), and `--blend-iters` with it |
-| The speaker to dominate, accent as a hint only | `--blend-ratio 0.95 --blend-iters 8` |
-| More of the borrowed accent, a bit of the speaker | lower `--blend-ratio` (e.g. `0.3`) |
-| The exact previous single-pass behaviour | `--blend-iters 1` |
-| Tune by hand rather than by the measured ratio | `--blend-ratio 0 --blend-iters N` — every pass runs and the least accent-like one is kept |
-
-**Why the defaults moved.** They were `0.7` / `4` while the documented accent
-source was a human clip, which clears a 0.8 target in a single pass. A *generated*
-anchor (`native`, the default mode) is a complete model performance and drags much
-harder: measured on one 8 s clip, 2 lines, same donor, the blend reached
-`donor_ratio` 0.899 in one pass with a human accent clip, but only 0.861 after five
-passes against the anchor — and at the old 0.7 target it stopped at 0.79, which is
-the setting the speaker's voice sounded faintest under. Five passes is where that
-curve flattened: passes six to eight improved neither the ratio nor the margin.
-The cost is per *voice*, not per line: `takes + (iters - 1)` extractions of the
-accent transcript per speaker.
-
-If the log says the run *stopped short of the target* (the ratio line came in
-under `--blend-ratio`), raise `--blend-iters` or lower `--blend-ratio`. A ratio
-above the target means the search succeeded and stopped early; raising
-`--blend-ratio` would push further toward the speaker, at the cost of one extra
-synthesis of the accent transcript per pass.
-
-### Dubbing a video with several speakers
-
-An interview, a debate, a two-hander: with more than one voice in the source, a
-single donor cannot represent them. The pipeline finds the speakers and gives
-each one their own voice. This is on by default, so a one-voice video behaves
-exactly as it did before.
-
-```bash
-python dub.py --video debate.mp4 --target fr              # one voice per speaker
-python dub.py --video debate.mp4 --target fr --diarizer none   # force one voice
-```
-
-The log names what it found, and `report.json` → `speakers` breaks it down:
-
-```
-Diarization (embedding): 2 speaker(s) over 12 segment(s) - SPK_0 7, SPK_1 5
-Auto-selected donor for SPK_0: segment 3 (7.3s)
-Auto-selected donor for SPK_1: segment 8 (5.0s)
-```
-
-**How it decides.** Each ASR segment is embedded with a speaker-verification
-model and the embeddings are clustered, so every segment is assigned rather than
-re-segmented — a line is never cut in half, and the labels stay aligned with the
-text by construction. A cluster shorter than `--min-speaker-seconds` is folded
-into its nearest neighbour rather than becoming a speaker with no usable voice to
-clone from. That floor is generous by default (20 s, against the 3 s a donor needs
-at all) because a one- or two-second donor does not describe a voice — the blend
-built from it stalls near the accent, which is what "the voice is lost" looks like
-in `report.json`. Segments whose embedding fails inherit the previous speaker's, so
-one bad two-second window cannot invent a third voice.
-
-The default backend is ERes2NetV2, which ships inside `funasr`. It is an optional
-dependency: without it every line is dubbed in one voice and the log says so
-rather than failing the job. Install it with `pip install -r requirements-dev.txt`
-or uncomment it in `requirements.txt`.
-
-The threshold is the one number worth knowing about. It is a cosine *distance* on
-embeddings, and it is not portable across material — on the two-person clip in
-this repo the merge profile is flat to `0.379` and then jumps to `0.468`, so
-everything in that gap returns the same two speakers and a constant anywhere inside
-it is defensible. The default is `0.7`, chosen on the 11-minute job rather than on
-that clip: `0.40` split the video into **42** voices where `0.70` returned the **5**
-people actually in it, and a listener confirmed that as the point where the extra
-voices stopped appearing. If a video comes out over-split (one person becoming two)
-raise `--speaker-threshold`; if two people are merged into one, lower it.
-`02b_speakers.json` in the job folder records the labels the run used, so you can
-see the damage without re-running.
-
-**What each speaker costs.** Diarization adds one embedding pass over the speech
-stem, which is cheap next to ASR. Synthesis is then grouped by speaker — one
-prompt per voice rather than one per line — so a two-person video costs two
-prompts and two batches instead of one of each. In
-[`reference-accent`](#accent-modes) mode each voice needs its own blended
-reference, because a clip whose codes and embedding both describe one speaker
-cannot serve another:
-
-```
-04_dubbed/reference_blend_SPK_0.wav
-04_dubbed/reference_blend_SPK_1.wav
-```
-
-Each is built by the same measured search as the single-voice case, with its own
-`donor_ratio`, and `--blend-*` applies to all of them. A one-voice job keeps the
-original `reference_blend.wav` name, so existing scripts and
-`audit_timbre.py` are unaffected.
-
-**Overlapping speech is detected, not guessed away.** Speakers are attributed per
-segment, not per word, so a segment where two people talk over each other cannot
-be given to both of them. Each segment is therefore re-embedded in 2.5 s windows
-and every window is checked against the speakers the labels already establish: a
-line is flagged when a *run* of its windows fits another of those speakers better
-than its own, while its own speaker still owns the majority of it. Flagged lines
-are listed in `02c_overlap.json`, counted in `report.json` → `overlap`, and named
-in the log:
-
-```
-Overlapping speech detected in 1 of 16 segment(s): #1. Each is dubbed in the
-voice of its dominant speaker, so the second voice is not separately dubbed.
-```
-
-The 2.5 s window is measured, not chosen by taste. On the two-person clip in this
-repo a 1 s window splits one speaker's *own* voice by up to 1.08 cosine distance —
-more than three times the 0.34 that separates the two speakers — so short windows
-report noise rather than a second voice (re-clustering them flagged 14 of 16
-segments). Comparing against a speaker *centroid* rather than against other
-windows is the other half of the fix, because an average over many windows is
-what cancels that noise; and a one-voice job is never flagged at all, since with
-no second centroid there is nothing for a window to match.
-
-The trade-off is sensitivity, and it is deliberate: an interruption shorter than
-about a window is not caught, and a segment whose windows *all* match another voice
-is treated as a labelling problem rather than an overlap. On this repo's clip the
-detector flags 1 of 16 segments. By default a flagged line is still dubbed in one
-voice, but the limitation is measured rather than silent; `--overlap separate`
-splits it instead. A one-voice job skips the check entirely, so its report is
-unchanged.
-
-**Both voices are dubbed with `--overlap separate`.** A flagged segment is split
-into one stream per voice by SpeechBrain's 16 kHz SepFormer, each stream is
-re-transcribed (the second voice's words are not in Whisper's one-utterance
-output), and each stream is matched to a speaker by comparing its embedding to the
-same centroids the labelling used. Both lines are then translated and synthesised
-in their own voice, and placed *simultaneously* on the timeline rather than one
-being pushed behind the other — the overlap is genuine, so the dub keeps it. The
-two voices are recorded in `02d_overlap_segments.json`, and the run's `report.json`
-→ `overlap` gains `mode: "separate"`, `separated` and `lines`.
-
-Separation is best-effort by construction: a segment whose streams cannot be told
-apart (a likely false-positive flag), or whose second stream recovers no speech, is
-left exactly as it was. `speechbrain` is an optional dependency — without it
-`--overlap separate` warns and behaves as `--overlap dominant`.
-
-**What is *not* attempted.** The number of speakers comes out of the clustering
-rather than being declared, so `--speaker-threshold` is the knob to reach for when
-the count looks wrong. Separation handles two overlapping voices per segment
-(SepFormer is a fixed two-speaker model); a third voice on the same instant is not
-recovered.
-
-Measured on this repo's TED talk, same French lines and same donor, so the three
-rows are directly comparable:
-
-| Mode | Timbre similarity to donor | French acoustic fit (logprob, higher is better) |
-|---|---|---|
-| `preserve` | 0.9841 | −0.138 |
-| `speaker-only` | 0.9876 | −0.081 |
-| `reference-accent` | 0.9854 | **−0.057** |
-| *(same speaker, different utterance)* | 0.9808 | — |
-
-All three keep the timbre above the natural same-speaker baseline; the hybrid mode
-moves the pronunciation furthest toward native French.
-
-### Reference pacing
-
-The model imitates the reference clip's speaking rate, so a slow, deliberate
-recording lengthens every dubbed line. Longer lines need more compression, and
-once the stretch limit is reached the surplus has to be trimmed. This applies to
-the donor (`--ref-audio`) and the accent clip (`--accent-audio`) alike.
-
-Measured on this repo's TED talk — same source, same voice, only the reference
-pacing differs:
-
-| Reference used as | Pace | Speech trimmed |
-|---|---|---|
-| auto donor (the source speaker) | ~3.5 words/s | 11.4 s |
-| slow personal recording, as donor | ~2.0 words/s | **23.0 s** |
-| slow personal recording, as accent clip | ~2.0 words/s | 13.4 s |
-| fast narrated clip, as accent clip | ~3.6 words/s | **2.3 s** |
-
-Two conclusions worth carrying into your own reference choices. Borrowing only an
-accent is cheaper than borrowing the whole voice: the same slow clip cost 13.4 s
-as an accent source but 23.0 s as the donor. And reference pace is a **trade, not
-a win**: a faster reference shortens the translation so less speech needs cutting,
-but it also leaves the voice finishing early — on this video the fast clip left
-15.2 s of silence spread over 23 lines, in slots where the original speaker is
-still talking on screen.
-
-Those two failures are not equally bad. Silence is a pause; deleted words are
-information loss. Measured across five clip speeds, roughly half the lines missed
-their slot at *every* pace, so pacing alone can never fix this — which is why the
-pipeline no longer sizes its translations from the reference clip at all. It
-measures the **cloned voice** with a probe render per speaker (`03a_rate.json`),
-builds each line's word ceiling from that measurement, and checks the translation
-against the ceiling before synthesising it. Reference pace is now a pronunciation
-and delivery choice rather than a length lever; see
-[When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot).
-
-Need a transcript and never wrote one down? Transcribing the clip with the same
-model the pipeline uses is accurate enough in practice — the run behind the table
-above used a machine transcript of the accent clip. Just avoid paraphrasing: the
-text has to match the audio it describes, so correct any obviously normalised
-numbers or names by hand.
-
-### Placing the dub in the room
-
-Synthesised speech is close-mic'd and dry. Laid over a soundtrack it can read as a
-voice *on top of* the picture rather than someone *in* it — the speaker's identity
-is right, the sense of place is missing. `--room match` fixes that as a
-post-synthesis step, so it cannot disturb the voice cloning. It does two things:
-
-- the **room-tone floor**: the separated speech stem's quiet passages (genuine
-  ambience, not the speaker) become a continuous bed under the dub;
-- a **gentler duck** (`--room-duck-db`, 3 dB instead of 6), because the room is
-  part of the voice and a deep duck pulls it away again.
-
-```bash
-python dub.py --video talk.mp4 --target fr --room match
-```
-
-**The reverb tail is opt-in and off by default.** An earlier version enabled it at
-−12 dB, and a real listen rejected it: 2.4 s of undamped, full-bandwidth reverb
-rings under every line and reads as an echo rather than a room. `--room-wet-db -20`
-adds a tail if you want one — the impulse response is now low-passed at 4 kHz,
-because a real room absorbs treble and flat noise does not.
-
-It is **off by default** for the same reason the dry voice-over is the default: a
-close voice-over is correct for narrated content, so it should stay reachable
-rather than being silently replaced. Two things to know before enabling it. The
-RT60 is estimated from the source's own decay, so it is a starting point — trust
-your ears and tune with `--room-rt60` and `--room-wet-db`. And it needs the speech
-stem, which only exists when the background is kept: with `--no-background` the dub
-is delivered dry and `report.json` says `room.applied: false` rather than inventing
-a space.
-
-### Options in full
-**Input and language** — exactly one of `--video` / `--audio` is required.
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--video PATH` | – | Video input. Enables muxing, so you get `video_dubbed.mp4`. Needs `ffmpeg`. |
-| `--audio PATH` | – | Audio-only input. Produces `dub.wav` + subtitles, needs no `ffmpeg`. |
-| `--target LANG` | `fr` | Language to dub into. Accepts a code (`fr`) or a name (`French`). |
-| `--source LANG` | auto | Overrides the detected source language. Useful when a clip is too short or too noisy for reliable detection. |
-
-**Voice** — see [Accent modes](#accent-modes) for how these interact.
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--ref-audio PATH` | auto | Clones this recording instead of the speaker found in the video. |
-| `--ref-text TEXT` | – | Exact transcript of `--ref-audio`. Required with it in `preserve` mode; ignored in the other two modes. |
-| `--accent-mode MODE` | `native` | Where pronunciation comes from: `native` (a generated accent anchor — the default), `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip). |
-| `--accent-match MODE` | `off` | With `--accent-mode native`, shape the generated anchor to the source voice: `rate` matches its speaking rate, `gender` also matches its gender. |
-| `--accent-audio PATH` | – | Native target-language clip to borrow pronunciation from. Requires `--accent-mode reference-accent`. |
-| `--accent-text TEXT` | – | Exact transcript of `--accent-audio`. Required with it. |
-| `--accent-blend MODE` | `two-stage` | `two-stage` renders the accent transcript once in the speaker's voice and clones every line from that clip, so its codes and its embedding cannot disagree. `single-stage` conditions each line on both sources directly. |
-| `--blend-takes N` | `3` | How many times the one-off blend is rendered before keeping the take closest to the speaker. Only that clip is sampled this way, not the lines. |
-| `--blend-iters N` | `5` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](#choosing-the-blend-strength). |
-| `--blend-ratio T` | `0.85` | How far toward the speaker's own voice the blend should reach, from `0` (the accent voice) to `1` (a target-language utterance in the speaker's voice). Iteration stops there. `0` disables the search. See [Choosing the blend strength](#choosing-the-blend-strength). |
-
-**Speakers** — see [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers).
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--diarizer BACKEND` | `auto` | `auto` finds the speakers with the embedding model; `none` dubs every line in one voice, which is the pre-P1 behaviour. Without `funasr` installed, `auto` warns and behaves as `none`. |
-| `--speaker-threshold D` | `0.7` | Cosine distance above which two embeddings count as different people. Raise it if one speaker is being split in two; lower it if two speakers are being merged. |
-| `--min-speaker-seconds S` | `20.0` | A voice must own at least this much speech to be dubbed separately; a shorter cluster joins its nearest neighbour. The floor is well above the 3 s needed to clone at all, because a donor of a second or two does not describe a voice — its blend stalls near the accent (measured at `donor_ratio` 0.23 on the 11-minute job, where the dub audibly kept the anchor's voice). `0` keeps every cluster. |
-| `--overlap MODE` | `dominant` | What to do with a segment that carries two voices at once. `dominant` dubs the whole line in its dominant speaker's voice; `separate` splits it and dubs both voices (needs the optional `speechbrain`). See [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers). |
-| `--overlap-separator BACKEND` | `auto` | `auto` uses SpeechBrain's SepFormer when installed, `sepformer` requires it, `none` disables it. Only used with `--overlap separate`. |
-
-**Audio bed and loudness**
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--no-background` | off | Discards the original music/ambience. By default it is separated out and ducked under the dub instead. |
-| `--separator BACKEND` | `auto` | `auto`, `demucs` (split speech from the bed), or `none` (treat the source as a single track). |
-| `--duck-db DB` | `6.0` | How far the background drops while dialogue plays. Higher = the voice sits more forward. |
-| `--room MODE` | `off` | `match` places the dub in the source's own acoustic space — a reverb tail, a continuous room-tone floor, and a shallower duck. `off` keeps the dry voice-over, which is the right choice for narrated content. Needs the background to be kept (the default). |
-| `--room-rt60 SECONDS` | measured | Reverberation time to use instead of measuring one from the speech stem. An escape hatch for a source whose decay cannot be estimated. |
-| `--room-wet-db DB` | `0` | Reverb level relative to the dry voice. **`0` means no reverb** — the tail is opt-in, because it can only be judged by ear and the first default was rejected on a real listen as an audible echo. Try `-20` to enable a subtle tail. |
-| `--room-duck-db DB` | `3.0` | How far the bed drops under dialogue when `--room match`. Shallower than `--duck-db`, because the room is part of the voice. |
-| `--room-tone-db DB` | `-30.0` | Level of the room-tone floor lifted from the speech stem's pauses. |
-| `--loudness POLICY` | `match-source` | `match-source` puts the dub at the original track's measured level; `lufs` forces `--lufs` instead. |
-| `--lufs VALUE` | `-16` | Absolute loudness target in LUFS. Only used with `--loudness lufs`. |
-
-**Timing** — these trade speech clarity against staying in sync.
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--min-stretch RATIO` | `0.75` | Compression floor: how much faster than natural a line may be played to fit its slot. It is a clarity limit rather than the point where words are cut — past it the wording has to give instead, because the alternative is deleting speech. Lower = faster speech, and it can start to sound hurried. |
-| `--max-stretch RATIO` | `1.18` | Most a line may be slowed to fill its slot. Raising this makes speech sound unnatural, so prefer fixing the translation. |
-| `--max-overrun SECONDS` | `0.25` | How far a line may run past its window — into the next line's time — before the excess is cut. The pause after the line is spent first (free); this covers the rest, because a fraction of a second of lateness is a smaller defect than a deleted word. `0` restores exact sync and cuts the tails instead. |
-| `--stretcher BACKEND` | `auto` | `auto`, `rubberband`, `sox`, `librosa`, `none`. `none` disables stretching (lines then only overrun or trim). Falls back automatically if a binary is missing. |
-
-**Length repair** — fixes a long translation by wording rather than by cutting audio.
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--refine` / `--no-refine` | on | Rewrites the lines that would otherwise have words cut, then re-synthesises just those. Lines that already fit are untouched; a rewrite is kept only if it measurably reduces the overflow. `--no-refine` restores the previous trim-only behaviour. |
-| `--refine-max-passes N` | `1` | How many times a line may be rewritten before falling back to trimming. `0` disables the repair. |
-| `--refine-threshold SECONDS` | `0.05` | How far a line must overrun its slot *and* the pause after it before it is worth rewriting. Raise it to repair fewer, worse lines. |
-| `--length-budget MODE` | `words` | `words` (the default) also tells the translator how many words fit each line, measured from the voice that will speak it — one probe render per speaker, before translating. `off` sends only the duration, which measurably loses the ends of sentences. Falls back to the accent clip's own rate when there is no target-language text to probe with. |
-| `--budget-speedup RATIO` | `0.85` | Tempo the word budget is willing to spend on *every* line: the ceiling is how many words fit at that speed-up. Keep it above `--min-stretch` so most lines stay at or above 0.85 and only the stubborn ones reach the floor. |
-
-**Models and hardware**
-
-| Option | Default | What it achieves ||---|---|---|
-| `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps`, or `xpu`. `cuda:1` pins a specific GPU. `cpu` is much slower but proves the GPU is not the problem. See [Devices and precision](#devices-and-precision) |
-| `--devices DEV[,DEV...]` | unset | Spreads the blend and the synthesis over several devices, one worker process each: `--devices cuda:0,cuda:1`. A worker takes the next piece of work as it frees up, so the split is by work rather than by model. The first device carries the stages that cannot be split (ASR, diarization, separation, anchors). Repeating a name is allowed and is how the fan-out is tested on one machine. Unset leaves `--device` as the whole answer. See [Using more than one card](#using-more-than-one-card) |
-| `--dtype DTYPE` | `auto` | Precision for the voice-cloning checkpoint: `auto`, `bf16`, `fp16`, or `fp32`. `auto` reads the device's capability. An explicit value is honoured unless the device cannot run it |
-| `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate — the main lever on a CPU-only machine. |
-| `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
-| `--tts-batch N` | `8` | Most lines synthesised in one model call. The engine additionally budgets a batch by the audio that will be **decoded**, which includes the clone reference once per line — that term dominates, so this is the ceiling and the escape hatch. Lower it if a long video still runs out of GPU memory; see [Memory on a long video](#memory-on-a-long-video). |
-| `MODELS_DIR` (env) | `models` | Where weights live. Set in `.env`; the download command also takes `--models-dir`. |
-
-**Output and caching**
-
-| Option | Default | What it achieves |
-|---|---|---|
-| `--output-dir DIR` | `output` | Where job folders are written. Each input gets its own `<stem>` folder. |
-| `--no-subtitles` | off | Skips both SRT files. |
-| `--force` | off | Ignores the stage cache and rebuilds everything. |
-| `--log-file PATH` | `<job folder>/run.log` | Where the run log is also written, alongside stderr. Created with its parent directory, appended to across runs (each one opens with a `Run started` line, so they stay separable), and stamped with the time so a line can be matched against `report.json` → `stage_seconds`. `LOG_FILE` sets the same default, which is why the log never invalidates a cached stage. |
-| `--log-max-bytes N` | `2097152` | Size at which the log is rotated. Once the file reaches it, it is renamed to `run-<YYYYmmdd-HHMMSS>.log` and a fresh one begins — at a run boundary, so a run is never split across two files. `0` keeps a single file forever. |
-| `--no-log-file` | off | Writes no log file at all — the escape hatch when a caller wants stderr alone. |
-| `-v` / `--verbose` | off | Debug logging, including which device each stage actually used. |
-
-### When a translation is too long for its slot
-
-Translated speech is routinely longer than the source: French needs roughly 15–40%
-more time than English for the same content. Four things stand between that extra
-length and a cut, in the order they apply.
-
-1. **The word ceiling.** Each line's *window* — its slot plus the pause before the
-   next line — is converted into a word count using the rate the **cloned voice**
-   was measured at: one probe render per speaker, before translating
-   (`03a_rate.json`). The translator is told that number, and the ceiling
-   *replaces* the "stay within 20% of the original" hint rather than joining it.
-   Sending both was the original bug: the model followed the source-length hint and
-   overran the ceiling by 1.5–1.8×, which the mixer could only answer by deleting
-   words.
-2. **The pre-synthesis check** (`03d_prefit.json`). Whatever still exceeds its
-   ceiling is reworded before it is ever spoken, in one batched translator call. A
-   rewrite is adopted only if it is measurably shorter, the original translation
-   stays in `03_script.json`, and the reworded version is what the subtitles show.
-   Checking here rather than afterwards is the difference between one synthesis
-   pass and two.
-3. **The compression floor** (`--min-stretch`, default `0.75`). The mixer speeds a
-   line up, never past the floor, and spends the pause before the next line before
-   spending more tempo — a pause nobody talks over is free, while tempo always
-   costs clarity.
-4. **The measured repair** (`--refine`, default on). Lines that still overrun are
-   reworded against *real* audio: their spoken length, the time actually available,
-   and a ceiling derived from that measurement. Only those lines are re-synthesised.
-5. **A bounded overrun** (`--max-overrun`, default `0.25 s`). A line that still does
-   not fit may run up to a quarter of a second past its window, which the next line
-   absorbs by starting that much later. This is the last guard before the cut: on
-   the 11-minute job it is what stands between 52 damaged lines and four. It is
-   lateness, not clarity — the alternatives were a 0.64 tempo on half those lines
-   (audible) or deleting their last word.
-
-Dead air goes first, for every line: a synthesised clip often opens with a tenth to
-a third of a second of digital silence (`silence_trimmed_seconds_total` reports
-what was removed). Left in place it is audible dead air *and* it is charged to the
-compression budget — measured on one line, 0.5 s of silence forced a 0.82
-compression where the speech alone needed 0.97.
-
-The writes are all kept separate so a run explains itself: `03_script.json` is what
-the model said, `03d_prefit.json` what the pre-synthesis check changed, and
-`03b_spoken.json` what the measured repair changed. The subtitles follow the last
-of those, so they never display words the viewer cannot hear.
-
-#### When the *source* timing is the problem
-
-Whisper's boundaries occasionally squeeze consecutive lines into less time than
-their words need — measured on the 11-minute job, nine words in 0.9 s, four of them
-in 0.16 s with the next line starting 0.02 s later. No tempo, wording or allowance
-fits that, because the text is right and the timing is not.
-
-Those stretches are repaired **before** anything is translated: a run of
-consecutive lines whose words could not have been spoken at 6.5 words/s or more
-(the speaker on that job averages 4.7) is re-timed, each line taking a share of the
-run's span and of the pause that follows it, in proportion to its own word count.
-The run keeps its start, never passes the next line's start, and every line outside
-it keeps its own time — so the repair **trades no sync at all**, it only fixes
-boundaries that were impossible. `report.json` → `packed` records what it did, and
-the block is absent when the boundaries were already plausible.
-
-The repair also widens the word budget for those lines: a slot that held four words
-in 0.16 s now holds a sentence, which is what stops the translator being asked for
-the impossible.
-
-Three properties make it safe to leave on:
-
-- **Lines that already fit are never touched** — their audio is bit-for-bit
-  identical to a run with `--no-refine`, which is asserted in the test suite.
-- **A failed repair is a no-op.** If the translator is unreachable, or a custom
-  translator cannot rewrite, the run logs a warning and keeps the audio it has.
-- **Nothing is re-shortened on a re-run.** Both rewriting passes always start from
-  the original translation, so repeated runs cannot shorten an already-short line.
-
-Measured on the 4:47 TED talk, English → French, identical settings apart from
-the flag:
-
-| Metric | `--no-refine` | with repair |
-|---|---|---|
-| Speech deleted | 3.76 s | **0.0 s** |
-| Worst single line deleted | **59%** | **0%** |
-| Lines losing >10% of their speech | 5 | **0** |
-| Lines that had to be cut | 8 | 0 |
-| Output exceeding slot + pause | 4.79 s | 0.51 s |
-| Silence left in slots | 18.35 s | 17.11 s |
-| Round-trip intelligibility (WER) | 1.5% | 1.2% |
-| Drift / loudness / background | — | unchanged |
-
-The repair rewrote 3 of 57 lines in one extra translator call. Its cost is a
-second synthesis pass over just those lines, which took the stage from 56 s to
-73 s.
-
-**The same problem on an 11-minute two-speaker video**, which is where the word
-ceiling mattered. Both runs are the same input and settings, English → French,
-`native` accent; ASR re-ran, so the two segmented slightly differently (489 vs 471
-lines) and the deltas are indicative rather than perfectly controlled:
-
-| Metric | Before | After |
-|---|---|---|
-| Speech deleted | 40.63 s | **4.69 s** |
-| Lines that lost speech | 179 | **31** |
-| Lines losing >10% of their speech | 135 | **23** |
-| Worst single line deleted | 97.5% | 51.4% |
-| Speech fitted into the following pauses | 43.97 s | 26.82 s |
-| Dead air removed from clip ends | — | 74.12 s (277 lines) |
-| Lines starting within `--max-overrun` of their source | 0 | 228 (worst 0.25 s) |
-| Synthesis stage | 699 s | **461 s** |
-| Sync gate | pass | **pass** |
-
-Four things did most of the work: the probe measured the cloned voices at 3.57 and
-4.00 words/s where the accent clip reads 2.97, so the ceilings sent to the
-translator rose and the translations landed **on** them (words ÷ ceiling: median
-1.00, mean 0.95, against 1.5–1.8× before); the pre-synthesis check reworded 39 of
-the 144 lines that still missed, keeping 945 of their 1047 words; dropping dead air
-from clip ends removed 74 s that had been charged to the compression budget; and
-`--max-overrun` turned the lines that could still not fit into a quarter-second of
-lateness instead of a deleted tail. Synthesis got *faster* despite the extra
-translator call, because 192 lines used to be spoken twice.
-
-#### Trading deletions for lateness
-
-The remaining lines are ones whose **source** region is genuinely over-packed: the
-dub needs about 1.5× the time the original had, so either its tail is cut or it
-starts late. `--max-overrun` moves along that curve, and the lateness is bounded
-*per line* — a line that is already late loses its allowance and is cut instead, so
-a long stretch of tight lines cannot walk the dub out of sync. Simulated over the
-job's own fitted durations (and confirmed by the run at 0.25 s):
-
-| `--max-overrun` | Lines that lose speech | Speech lost | Worst lateness |
-|---|---|---|---|
-| `0` (exact sync) | 66 | 8.90 s | 0 |
-| `0.25` (default) | 31 | 4.69 s | 0.25 s |
-| `0.5` | 15 | 2.63 s | 0.50 s |
-| `0.75` | 4 | 0.40 s | 0.75 s |
-
-Raising it is a one-flag decision per job, and the sync gate judges the result:
-`audit_qc.py --max-shift 0.75` accepts 0.75 s of lateness, and `shifted_seconds_max`
-says what a run actually used.
-
-### Verified commands
-These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
-figures come from each run's `report.json`.
-
-| Command | Result |
-|---|---|
-| `--video talk.mp4 --target fr` | 11.4 s of speech trimmed; sync exact; background preserved |
-| `--video talk.mp4 --target fr --ref-audio slow.wav --ref-text "…"` | 23.0 s trimmed — the slow reference lengthened every line |
-| `--video talk.mp4 --target fr --accent-mode speaker-only` | timbre 0.9876, French fit −0.081 |
-| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio slow.wav --accent-text "…"` | timbre 0.9854, French fit −0.057, 13.4 s trimmed |
-| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…"` | **best overall**: 2.3 s trimmed, 0 drift, loudness matched, background preserved |
-| `--video talk.mp4 --target fr --accent-mode reference-accent --accent-audio fast.mp3 --accent-text "…" --refine` (default) | **best overall**: 0.0 s trimmed, 3 lines rewritten, worst-line deletion 59% → 0%, WER 1.5% → 1.2% |
-| `--video debate.mp4 --target fr --accent-mode reference-accent …` (two speakers, 60 s) | 2 voices found (7 and 8 lines), each with its own donor and its own blend clip; 0 of 15 lines closer to the accent voice on the per-speaker audit |
-
-The last row is the configuration to aim for: a fast-paced native clip as the
-accent source gives near-native pronunciation with almost no speech lost. Full
-run takes about 2 minutes 45 seconds.
-
-The timing knobs were measured on a longer, harder job: an 11-minute English →
-French video with two speakers (`input/louisavy-11m.mp4`), where the source talks
-at 4.7 words/s and the French clone delivers 3.6. `--max-overrun` is the knob that
-decides whether a line that still does not fit loses its tail or starts late:
-
-| Command | Result |
-|---|---|
-| `--video louisavy-11m.mp4 --target fr` (defaults) | **run**: 4.69 s of speech deleted across **31** lines; lateness bounded at `shifted_seconds_max` 0.25 s; synthesis 461 s; `audit_qc.py` passes sync |
-| `… --max-overrun 0` | **simulated** on the same job's fitted durations: 8.90 s deleted across 66 lines, every line exactly on its source time |
-| `… --max-overrun 0.75` | **simulated** on the same durations: 0.40 s deleted across 4 lines, worst line 0.75 s late (`audit_qc.py --max-shift 0.75` accepts it) |
-
-The simulations are the same model that reproduced the run's own 0.25 s result to
-the line (31 lines, 4.67 s predicted against 31 and 4.69 s measured), which is why
-they are quoted — but they are predictions, not runs. The full curve is in
-[When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot).
-
----
-
-## Outputs
-
-Everything for one job lands in `output/<input-stem>/`:
-
-```
-output/talk/
-├── 01_audio.wav         # normalised 48 kHz mono source audio
-├── 01b_speech.wav       # separated speech stem (when background is preserved)
-├── 01c_background.wav   # separated music/ambience stem
-├── 02_transcript.json   # ASR result: segments, words, timings, language
-├── 02b_speakers.json    # segment id -> speaker, from diarization
-├── 02c_overlap.json     # which segments carry a second voice (multi-speaker runs)
-├── 02d_overlap_segments.json   # only with --overlap separate: the per-voice lines
-├── 03_script.json       # source -> target text per segment
-├── 03a_rate.json        # words/s measured for each cloned voice (what budgets come from)
-├── 03b_spoken.json      # lines the length repair re-wrote (only those)
-├── 03c_refine.json      # what the length repair achieved
-├── 03d_prefit.json      # lines re-worded before synthesis, and how much of the wording survived
-├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
-│   ├── donor.json       # which voice was cloned for each speaker, and from what
-│   ├── reference_blend.wav   # only in reference-accent: the clip every line is cloned from
-│   ├── reference_blend_SPK_1.wav   # ...one per speaker once there are several
-│   └── blend.json       # only in reference-accent: how each clip was chosen
-├── 05_mix.wav           # assembled dub track, before normalisation
-├── 05_room.json         # only with --room match: the decay measured and levels used
-├── timing.json          # per-segment stretch ratio, placement and deficit
-├── dub.wav              # final loudness-normalised dub audio
-├── video_dubbed.mp4     # dubbed video (video input only)
-├── subs_source.srt
-├── subs_target.srt
-├── report.json          # counts, loudness, stretch stats, stage timings
-├── manifest.json        # stage cache
-├── run.log              # the log from stderr, appended across runs
-└── run-20260929-070308.log    # only once it passes --log-max-bytes
-```
-
-`report.json` is the quickest way to judge a run without listening to it:
-
-| Field | Meaning |
-|---|---|
-| `segment_count` | Utterances found after VAD gating |
-| `source_language` | Language Whisper detected |
-| `dub_seconds` | Length of the dub track (should match the source) |
-| `loudness_source_lufs` | Loudness of the original audio |
-| `loudness_dub_lufs` | Loudness actually delivered |
-| `loudness_target_lufs` | What the dub aimed for |
-| `loudness_policy` | `match-source` or `lufs` |
-| `loudness_delta_vs_source` | Positive when the dub is louder than the original |
-| `loudness_gain_db` | Total gain applied to reach the target |
-| `loudness_peak_limited` | `true` when the limiter engaged to avoid clipping |
-| `background_preserved` | `true` when the original music/ambience was kept |
-| `duck_db` | Attenuation applied under dialogue (`null` when no background). With `--room match` this is the shallower `--room-duck-db`, i.e. the depth actually used |
-| `room` | Present only with `--room match`: the mode, whether it was applied, the measured `rt60_s`, whether the reverb tail is on (`reverb`), and the `wet_db` / `tone_gain_db` / `duck_db` used. Absent — not `null` — on a dry run, so previous reports read unchanged. `applied: false` means the speech stem was missing (usually `--no-background`) and the dub was delivered dry |
-| `accent_mode` | `native`, `preserve`, `speaker-only`, or `reference-accent` |
-| `speakers` | One entry per voice with its segment count and speech time, or `null` for a one-voice job — so single-voice reports read exactly as they did before diarization existed. The names (`SPK_0`, …) are the ones in `02b_speakers.json` |
-| `overlap` | Present only on multi-speaker runs: how many segments were found to carry a second voice (`segments`, `seconds`, `speech_ratio`) and how they were handled. `mode: "dominant"` means each flagged line was dubbed in its dominant speaker's voice; `mode: "separate"` (with `--overlap separate`) means both voices were recovered and dubbed, adding `separated` and `lines` counts. Absent — not `null` — on a one-voice job |
-| `donor` | Which reference voice was used: an explicit file, or the auto-selected segment (with its timestamps and transcript) |
-| `donor.speaker_count` | How many voices the run found |
-| `donor.primary_speaker` | The speaker with the most speech. Its own fields are also copied to the top level of `donor`, so `donor.source` / `donor.accent` / `donor.blend` keep naming the voice a single-speaker job would have used |
-| `donor.speakers` | Per-voice detail: the donor segment chosen for each, how many segments they own, how long they speak, and the accent and blend records for that voice. This is the job's voice bible |
-| `donor.accent` | Present in `native` and `reference-accent` modes: for a supplied clip, its path and whether a transcript was provided; for a generated anchor, `source` (`anchor` or `anchor-matched`), the `language`, and the matched `rate_band` / `gender` |
-| `donor.blend` | Present in every blending mode (`native` and `reference-accent`): the strategy used, the passes and takes considered, and how the kept clip scored. `donor_ratio` places it between the accent voice (`0`) and the speaker's own voice (`1`) — the field to watch, and the one to raise `--blend-iters` for. `margin` only ranks takes against each other; a negative value is not by itself evidence of a problem |
-| `tts` | How synthesis batched and what memory it reached: `batch_size`, `max_decode_seconds`, `reference_seconds` (the clone clip, charged per line), `seconds_per_char` (measured, not assumed), `batches`, `peak_batch_seconds`, `oom_retries`, `cache_releases`, `ceiling_shrinks`, and `peak_reserved_bytes`. `oom_retries` or `ceiling_shrinks` above zero means the run touched the memory ceiling — lower `--tts-batch`. See [Memory on a long video](#memory-on-a-long-video). With `--devices` the counters of every worker are summed, `peak_reserved_bytes` is the worst card rather than the total, and `devices` plus `per_device` name the cards that did the work |
-| `clamped_segments` | Lines that hit a stretch limit (either direction) |
-| `clamped_long_segments` | …of which were too long to compress into their slot |
-| `clamped_short_segments` | …of which were too short to slow down enough to fill it |
-| `compress_floor` | The compression floor this run used (`--min-stretch`), which is what `needed_ratio` should be read against |
-| `delivery_wps` | Words per second measured for each cloned voice by the probe — the number every word budget is derived from |
-| `budget_wps` | …divided by `budget_speedup`: the ceiling the translator was actually given, per voice |
-| `budget_speedup` | The tempo the budget was allowed to spend on every line |
-| `accelerated_segments` | Lines the mixer sped up at all |
-| `needed_below_floor_segments` | Lines whose *translation* was longer than the floor allows — the only ones that can lose words, and the number to drive to zero |
-| `needed_ratio_min` | The hardest compression any line needed, before the floor was applied |
-| `prefit` | What the check *before* synthesis did: `attempted`, `offenders`, `improved`, `llm_calls`, and `words_kept` (the share of the wording that survived) |
-| `silence_trimmed_segments` | Lines that had dead air trimmed from their ends before fitting |
-| `silence_trimmed_seconds_total` | Seconds of dead air removed. Silent, so nothing is lost — but leaving it in would spend the compression budget (and, at the floor, the wording) on a pause |
-| `worst_trimmed_lines` | The worst offenders by name: `id`, `trimmed` seconds and the `needed_ratio` that caused it |
-| `deficit_segments` | Lines that left silence in their slot |
-| `deficit_seconds_total` | Total silence left inside slots |
-| `overrun_segments` | Lines that spilled into the pause after them (free, no speech lost) |
-| `overrun_seconds_total` | Total speech fitted into those pauses |
-| `surplus_seconds_total` | Total speech exceeding slot + pause, i.e. at risk of being cut |
-| `trimmed_segments` | Lines where the residue had to be cut to keep the video in sync |
-| `trimmed_seconds_total` | Seconds of speech lost to those cuts |
-| `worst_line_deleted_ratio` | The largest share of a single line that was deleted |
-| `lines_over_10pct_deleted` | Lines that lost more than a tenth of their speech |
-| `speech_rate_wps` | Words per second the cloned voice actually delivered, measured on the placed audio (dead air excluded, stretch included) — compare it with `delivery_wps` to see whether the probe was right |
-| `refine` | What the length repair did: offenders, improved, seconds reclaimed |
-| `shifted_segments` | Lines that start later than their source, because they used the overrun allowance |
-| `shifted_seconds_total` / `shifted_seconds_max` | How late they run, in total and at worst. `max` is the number the sync gate judges |
-| `max_overrun` | The lateness policy this run was given (`--max-overrun`) |
-| `packed` | Present only when ASR timing had to be repaired: how many runs of lines Whisper squeezed into less time than their words need, how many lines that was, the worst words/second and the seconds added back. Absent — not `null` — when the boundaries were already plausible |
-
-Two of these deserve attention:
-
-- **`clamped_segments` above zero** means the translation was too long for its
-  slot, so timing hit the stretch limit. Tighten the translation (or shorten the
-  lines) rather than raising `--max-stretch`, which would sound unnatural.
-- **`loudness_peak_limited: true`** means the limiter reduced a few peaks so the
-target could be reached without clipping. Speech is peakier than mastered audio,
-and without limiting a handful of transients would hold the whole program several
-dB too quiet. The delivered loudness should still match `loudness_target_lufs`;
-if it does not, the material was too dynamic to reach the target cleanly.
-- **`trimmed_seconds_total`** is the one to watch. Translated speech is often
-  longer than the source (French runs roughly 15–40% longer than English), and no
-  amount of tempo can absorb an arbitrarily long line. A line is first compressed
-  to the floor, then allowed to spill into the pause that follows it — free,
-  since nobody is talking — and only the remainder is cut. Three things keep that
-  remainder at zero, in order: the word ceiling the translator is given, the
-  pre-synthesis check that rewords whatever still misses it, and the floor itself.
-  `needed_below_floor_segments` counts the lines that got past all three, and
-  `worst_trimmed_lines` names them. What is left is what the overrun allowance could
-  not cover: a line may run up to `--max-overrun` seconds past its window instead of
-  losing its tail, and the lines that do are counted in `shifted_segments` with their
-  lateness in `shifted_seconds_max`.
-
-### Caching
-
-Stages are cached in `<job folder>/manifest.json`, keyed by a fingerprint of
-every job setting. Re-running an identical command does nothing at all — that is
-what makes iterating on a long video cheap.
-
-The fingerprint is a hash of the whole configuration, so **changing any option
-re-runs the whole job**: the target language, the accent mode, the reference or
-accent clip, the stretch bounds, the device. There is no partial invalidation, so
-a run that only changes `--accent-mode` re-does the ASR and translation as well.
-That is deliberate — it keeps a result reproducible from one command — but it
-means experimenting costs a full run each time. Slice the input short
-(see [Fast iteration](#fast-iteration)) when you plan to try several settings.
-
-The one exception is `--devices`: a job that never passes it hashes exactly what
-it hashed before the option existed, so adding the feature invalidated no cache.
-Asking for a fan-out *does* change the hash, because per-worker batching differs
-from a single worker's — the same reason `--tts-batch` is part of it.
-
-Because the fingerprint distinguishes settings, you can safely point several
-different runs at the same `--output-dir`: each input gets its own `<stem>`
-folder, and a run whose settings differ from the last one starts fresh rather
-than reusing stale audio.
-
-```bash
-python dub.py --video talk.mp4 --target fr --force        # ignore the cache entirely
-rm -rf output/talk                                        # or just start clean
-```
-
----
-
-## How it works
-
-```
-video/audio ─► 1. audio extract ─► 2. separate ─► 3. ASR + VAD ─► 4. diarize ─┐
-                               (speech | bed)                               │
-  8. mux + SRT ◄─ 7. mix + duck ◄─ 6. clone + synthesise ◄─ 5. translate (LLM) ◄┘
-```
-
-| # | Stage | Module | What it does |
-|---|---|---|---|
-| 1 | Audio | `pipeline/media.py` | ffmpeg extract (video) or direct read (audio), mono 48 kHz |
-| 2 | Separate | `pipeline/separation.py` | Demucs splits speech from music/ambience; ASR then reads the clean speech stem |
-| 3 | ASR | `pipeline/asr.py` | faster-whisper + Silero VAD, word timestamps, drops non-speech |
-| 4 | Diarize | `pipeline/diarize.py` | embeds each segment and clusters the embeddings into speakers |
-| 4b | Overlap | `pipeline/overlap_separation.py` | with `--overlap separate`, splits a flagged segment into per-speaker streams for re-transcription |
-| 5 | Translate | `pipeline/translate.py` | batched, context-aware, length-budgeted translation |
-| 6 | Synthesise | `pipeline/tts.py` | per-speaker donor selection + voice cloning, grouped by speaker — spread over several cards with `--devices` |
-| 7 | Mix | `pipeline/timing.py`, `pipeline/mixing.py` | fit each line to its slot, then lay it over the ducked bed — optionally matched to the source's room |
-| 8 | Deliver | `pipeline/orchestrate.py` | loudness match, subtitles, mux, report |
-
-Three design points worth knowing:
-
-- **Accent comes from an anchor, timbre from cloning.** By default (`native`) the
-  accent is a generated per-language anchor and the timbre is the source speaker's.
-  `--accent-mode preserve` keeps the source accent, `speaker-only` drops the
-  borrowed phonetics, and `reference-accent` uses a native clip you supply.
-- **One anchor per language, generated once.** The VoiceDesign checkpoint turns a
-  short passage into native speech, so ten languages share one model instead of
-  shipping ten voices; the result is cached under `models/anchors/`.
-- **One prompt per voice, not per line.** Diarization gives each speaker their own
-  donor and, in `reference-accent` mode, their own blended reference; synthesis is
-  then grouped by speaker so the prompt is rebuilt only when the voice changes.
-- **Timing errors never accumulate.** Each line is anchored to its own original
-  start time; a line that does not fit spills into the pause after it and any
-  residue beyond that is trimmed. Lines are never pushed late, so a long
-  translation cannot make the rest of the video drift out of sync.
-- **The room can be borrowed without touching the voice.** Synthetic speech is
-  recorded close and dry, which reads as a voice laid over the picture. With
-  `--room match`, the decay (RT60) is measured from the separated speech stem —
-  the only material that carries the room — and applied as a convolution over the
-  finished dub, while the stem's own pauses become a continuous room-tone floor.
-  It runs after synthesis, so it cannot disturb the voice cloning.
+Every flag and default is in [docs/options.md](docs/options.md);
+`python dub.py --help` prints the same list.
 
 ---
 
 ## Tests
 
-All tests run **without** a GPU, downloaded models, or ffmpeg — heavy components
-are injected as fakes and binaries are mocked. The whole suite runs in about
-a minute.
+The suite needs no GPU, downloaded models or ffmpeg — heavy components are faked.
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-```
-1051 passed
+```text
+1105 passed
 ```
 
-Run a single area while iterating:
+Run one area while iterating:
 
 ```bash
-python -m pytest tests/test_tts.py -q          # voice cloning, accent modes
-python -m pytest tests/test_pipeline.py -q     # end-to-end orchestration
-python -m pytest tests/test_multi_speaker.py -q  # per-speaker dubbing
-python -m pytest tests/test_diarize.py -q      # speaker clustering
-python -m pytest tests/test_audit.py -q        # timbre audit + quality gates
-python -m pytest tests/test_mixing.py -q       # ducking, room matching
-python -m pytest -k accent -q                  # everything accent-related
+python -m pytest tests/test_tts.py -q
+python -m pytest tests/test_pipeline.py -q
+python -m pytest tests/test_voices.py -q
+python -m pytest -k accent -q
 ```
 
-### Auditing a dub's voice, line by line
-
-`audit_timbre.py` measures whether each synthesised line kept the speaker's
-timbre, using the checkpoint's own speaker encoder. It needs a GPU and the base
-checkpoint, because it loads the same model the pipeline does:
-
-```bash
-python audit_timbre.py "output/<input-stem>"
-python audit_timbre.py "output/<input-stem>" --device cpu   # when the GPUs are busy
-```
-
-It reports, per line, `cos(line, reference) − cos(line, accent)` where both
-references are in the **target language** (the blend clip and the accent clip).
-Matching the language is the point: comparing a French line against an English
-donor mixes a language difference into a speaker measurement and makes every line
-look like a collapse. Two anchors give the number a scale — a pure accent-voice
-utterance scores about −0.023, and the reference against itself about +0.023 — so
-"closer to the accent voice" is a measured position, not a threshold.
-
-Measured on this repo's TED talk, with the same donor and accent clip:
-
-| Run | Lines | min margin | median | Closer to the accent voice |
-|---|---|---|---|---|
-| `--accent-blend single-stage` | 55 | −0.0049 | +0.0156 | 5 (9.1%) |
-| `two-stage` (default) | 59 | **+0.0176** | **+0.0257** | **0** |
-
-Read it as a smoke test rather than a controlled experiment: ASR re-segmented the
-two runs differently, so the text differs. Pass `--reference` and `--accent`
-explicitly to measure a single-stage job against another job's blend clip.
-
-A job with several speakers is audited **one speaker at a time**, each against
-their own `reference_blend_<speaker>.wav`, because a line cloned from one voice
-must not be judged against another's. Each group is its own scale — two voices
-have two different "pure accent" floors — so the anchors are printed per group.
-`--reference` overrides that and measures everyone against one clip, which is only
-useful for a deliberate A/B.
-
-### Checking a dub automatically
-
-`audit_qc.py` turns the signals in `report.json` — and, optionally, the timbre
-audit above — into pass/fail gates. It never blocks the pipeline: the dub is
-already written, so a failure is a verdict on the delivery rather than a reason to
-lose the work. Exit status is `0` when every gate passes, `1` when one fails, and
-`2` when the job could not be checked at all, which makes it usable in CI.
-
-```bash
-python audit_qc.py "output/<input-stem>"              # cheap gates, no model
-python audit_qc.py "output/<input-stem>" --timbre      # adds the per-line timbre gate
-python audit_qc.py "output/<input-stem>" --timbre --device cpu   # measure on the CPU
-python audit_qc.py "output/<input-stem>" --json        # machine-readable
-```
-
-| Gate | Checks | Default limit |
-|---|---|---|
-| `sync` | No line starts more than the allowance late | `shifted_seconds_max <= 0.25` (override with `--max-shift`) |
-| `truncation` | No line loses a meaningful share of its words | worst line ≤ 10%, no line over 10% |
-| `loudness` | The dub sits at the source's level | within 1.5 dB (skipped if unmeasurable) |
-| `timbre` | No line followed the accent voice instead of the speaker's | 0% (needs `--timbre`) |
-
-Filling the pause after a line is *not* a failure — overrunning into silence costs
-nothing and is how sync is preserved — so `overrun` is reported as context rather
-than gated. Every limit can be overridden (`--max-shift`, `--max-deleted-ratio`,
-`--max-deleted-lines`, `--max-loudness-delta`, `--max-accent-share`). A gate that
-could not run (no timbre measurement, unmeasurable source loudness) is reported as
-**skipped**, never as a pass.
+The quality tools and their gates are covered in
+[docs/testing-and-quality.md](docs/testing-and-quality.md).
 
 ---
 
-## Troubleshooting
+## Documentation
 
-| Symptom | Cause and fix |
+| Guide | What it covers |
 |---|---|
-| `Missing model: 'whisper_large_v3' …` | Run `python dub.py models --download all` |
-| `Required binary 'ffmpeg' was not found on PATH` | `sudo apt-get install -y ffmpeg` (audio-only jobs still work) |
-| `… contains no audio stream, so there is nothing to transcribe` | The file is video-only. Verify with `ffprobe -v error -show_entries stream=codec_type file.mp4`; mux an audio track in first |
-| `CUDA is unusable for speech recognition … libcublas.so.12` | Informational — ASR fell back to CPU. Install `nvidia-cublas-cu12 nvidia-cudnn-cu12` for GPU ASR (Prerequisites §3) |
-| `No speech detected in the input` | No audible speech, or the wrong audio track. Check with `ffprobe` |
-| `Translation response was not valid JSON` | Lower `LLM_CHUNK_SIZE` in `.env`, or use a model better at JSON |
-| `Translation request to … failed` | The LLM server isn't reachable — check `LLM_BASE_URL` |
-| `--ref-audio requires --ref-text` | Add the exact transcript, or drop both flags to auto-pick a donor |
-| `--accent-audio only applies to --accent-mode reference-accent` | Add that flag, or remove `--accent-audio` |
-| `--accent-mode reference-accent requires --accent-audio` | Add the native-target clip, or use another mode |
-| `--accent-audio requires --accent-text` | Transcribe the accent clip; the codes cannot be aligned without it |
-| `does not support voice cloning` | Pointed at a CustomVoice/VoiceDesign checkpoint; use `tts_base` |
-| `Unsupported language 'xx'` | Use one of the ten supported languages |
-| CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it). On a multi-GPU box, `--device cuda:1` pins the run to the other card |
-| On a long video, repeatedly | See [Memory on a long video](#memory-on-a-long-video): check `report.json` → `tts.oom_retries` and `tts.ceiling_shrinks`. The pipeline budgets each batch by decoded audio and releases cached blocks when free memory falls below 3 GB; if the counters are still non-zero, lower `--tts-batch`, or use a shorter reference clip — it is charged once per line |
-| An unexpected amount of VRAM is in use | `--device cuda:1` now genuinely uses the second GPU; the log line and `report.json` → `device` both report the card that was used |
-| `dtype fp16 is not usable on cpu (cpu); using fp32 instead` | Informational, not an error: half-precision on a CPU is slow and patchy, so float32 is used. Drop `--dtype` to let the capability decide |
-| The GPU is not being used at all | Run `python dub.py info` — it reports the accelerator, the device it would pick, and the precision. If it says `cpu`, torch either sees no GPU or the wrong wheel is installed (see Prerequisites §2 and §3) |
-| Speech recognition is on the CPU when a GPU exists | CTranslate2 links against a specific CUDA major. Run `python dub.py info` and check the `asr device` line; Prerequisites §3 has the fix |
-| Dub sounds rushed or slow | Check `report.json` → `clamped_segments`; tighten the translation |
-| Some words are cut off | `report.json` → `worst_trimmed_lines` names them (`id`, `trimmed`, `needed_ratio`); `needed_below_floor_segments` counts them. A `needed_ratio` below `compress_floor` means the translation was longer than even a 0.75 compression can hold, so the wording, not the tempo, is what to change: check `prefit` (did the pre-synthesis check run, and how much wording did it keep?) and `--length-budget`. Lowering `--min-stretch` further buys room at the cost of sounding hurried |
-| A line lost a lot of words despite a low `trimmed_seconds_total` | Look at `worst_line_deleted_ratio` and `lines_over_10pct_deleted`: damage is usually concentrated in one or two lines, not spread evenly |
-| Lines sound slow or have gaps | `report.json` → `deficit_seconds_total`: the translation is shorter than its slot, i.e. the word ceiling was conservative. Check `delivery_wps` (the probe's measurement) against `speech_rate_wps` (what the voice actually delivered): if the probe reads well under the delivery, raise `--budget-speedup`. See also [Reference pacing](#reference-pacing) |
-| A rewrite did not help | Check `report.json` → `refine` (the measured pass) and → `prefit` (the pre-synthesis one). `attempted: false` means no line overflowed, or the translator cannot rewrite; `improved: 0` means the rewrites did not fit either, and the pre-fit check was skipped or its candidates were not shorter |
-| `delivery_wps` looks wrong for my video | It is measured from one 40-word probe render per voice, so a very expressive or very short-spoken video can differ from `speech_rate_wps` (what the lines actually delivered). Delete `<job>/03a_rate.json` to re-probe, or set `--budget-speedup`/`--min-stretch` yourself and leave the budget out of it with `--length-budget off` |
-| Dub drifts out of sync | Up to `--max-overrun` seconds per line is deliberate: it keeps the last word of a line that would otherwise lose it. Check `shifted_seconds_max` — if it is over the limit, the source speech genuinely overlaps itself, and `--max-overrun 0` restores exact sync at the cost of the line tails |
-| Dub sounds quiet | Check `loudness_delta_vs_source`; `0` means it matches the original. Force a level with `--loudness lufs --lufs -16` |
-| Music/ambience is missing | Install `demucs` (`pip install demucs`); without it the background cannot be separated and is discarded |
-| Music fights the voice | Raise `--duck-db` (default 6 dB) |
-| `Missing model: 'tts_voice_design' …` | The default `native` mode needs it to generate the accent anchor. Run `python dub.py models --download tts_voice_design` (or `--download all`) |
-| `--accent-match only applies to --accent-mode native` | Use `--accent-mode native` (the default), or drop `--accent-match` |
-| The dub still has the speaker's accent | The default `native` mode already borrows a generated anchor. If it is not enough, try `--accent-match gender`, then `--accent-mode speaker-only`, or supply your own clip with `--accent-mode reference-accent` |
-| Still sounds foreign in `reference-accent` mode | Check `--accent-text` matches the clip word for word — mismatched text misaligns the borrowed codes. A longer, more natural accent clip also helps |
-| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — each voice's lines are cloned from that voice's own `reference_blend[_<speaker>].wav`, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](#auditing-a-dubs-voice-line-by-line) |
-| A voice changes *between speakers* rather than mid-line | Expected, unless the two voices are the same person: each speaker is cloned from their own donor. If the count is wrong, see the speaker-threshold rows above |
-| The borrowed accent dominates — the speaker's own voice is barely there | The blend was built too close to the accent voice. Check `report.json` → `donor.blend.donor_ratio`: a low value means it never got far enough to the speaker. Raise `--blend-iters`, or lower `--blend-ratio` if you want more of the accent |
-| The blend reached a donor ratio of only … | Informational: the target was not met within `--blend-iters` passes, and the best pass was used anyway. Raise `--blend-iters` or lower `--blend-ratio` |
-| `--accent-blend only applies to --accent-mode reference-accent` | Add that flag, or drop `--accent-blend` |
-| `--blend-takes only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-takes` |
-| `--blend-iters only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-iters` |
-| `--blend-ratio only applies to --accent-mode reference-accent` | Add that flag, or drop `--blend-ratio` |
-| Every line is dubbed in one voice, but the video has several speakers | Diarization is off or unavailable. Check the log for `Diarization (none)` — it means `--diarizer none` was set, or `funasr` is not installed. Install it (`pip install -r requirements-dev.txt`), then re-run. The detection happens before synthesis, so a cached job needs `--force` to pick up a newly installed backend |
-| One person is being split into two voices | Raise `--speaker-threshold` (e.g. `0.6`); a distance-based threshold is genuinely material-dependent. `02b_speakers.json` shows how the segments were labelled. (Overlap detection is supervised by those labels but does not use this threshold.) |
-| A line sounds like the wrong person, or you can hear two people on it | `report.json` → `overlap` counts segments that hold a second voice; `02c_overlap.json` lists their ids. By default such a line is dubbed in its dominant speaker's voice — run with `--overlap separate` (needs the optional `speechbrain`) to split it and dub both voices. Detection is deliberately conservative (a 2.5 s run that fits another speaker better), so short interruptions are not reported |
-| Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
-| A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
-| `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
-| The dub is rushed, or words are missing | Check `accelerated_segments` and `needed_ratio_min`: the voice is being sped up because the written line is longer than the window holds. Raise `--budget-speedup` only if `deficit_seconds_total` is also high; otherwise the lines are simply long for their slots. See [When a translation is too long for its slot](#when-a-translation-is-too-long-for-its-slot) |
-| `audit_qc.py` reports `SKIP timbre — no accent clip to measure against` | Expected for a `preserve` job: nothing was borrowed, so "did the line follow the accent voice?" has no answer. Pass `--accent <clip>` to force one. The other three gates still report, and the exit code stays 0 |
-| The timbre audit fails while the GPUs are busy | Pass `--device cpu` to `audit_qc.py` or `audit_timbre.py`. The measurement is slower there but identical |
+| [Setup](docs/setup.md) | prerequisites, install, LLM endpoint, models |
+| [Usage](docs/usage.md) | command chooser, worked examples, fast iteration |
+| [Options](docs/options.md) | every flag and its default |
+| [Voices](docs/voices.md) | saved voice prints, cloning, accent modes |
+| [Multi-speaker](docs/multi-speaker.md) | diarization, speaker thresholds, overlap |
+| [Audio and timing](docs/audio-and-timing.md) | music/ambience, room matching, long translations |
+| [Performance](docs/performance.md) | devices, precision, several GPUs, long-video memory |
+| [Outputs and caching](docs/outputs-and-caching.md) | job artifacts, `report.json`, the stage cache |
+| [Testing and quality](docs/testing-and-quality.md) | tests, timbre audit, `audit_qc.py` |
+| [Architecture](docs/architecture.md) | pipeline, module map, project layout |
+| [Troubleshooting](docs/troubleshooting.md) | errors, logs, notes and limitations |
 
-Logs are written to stderr and include a job id, and are mirrored to
-`<job folder>/run.log`. That file is **appended** to, never replaced: one input
-is normally dubbed many times while its options are tuned, so every run keeps its
-lines and opens with a `Run started` line to mark the boundary between them. Once
-it passes `--log-max-bytes` (2 MiB by default) it is renamed to
-`run-<YYYYmmdd-HHMMSS>.log` and a fresh `run.log` begins — at a run boundary, so a
-single run is never split. `--log-file PATH` puts the copy somewhere else,
-`--no-log-file` writes none, and `LOG_FILE` sets the default path. Set
-`LOG_JSON=1` for one JSON object per line, on the terminal and in the file alike.
+The [docs index](docs/README.md) has the same list with reading paths.
 
 ---
 
 ## Project layout
 
+```text
+dub.py                  CLI entry point (dub, models, voices, say, info)
+audit_qc.py             automated quality gate for a finished job
+audit_timbre.py         per-line speaker-timbre audit
+pipeline/               ASR, translation, TTS, timing, mixing, orchestration
+tests/                  pytest suite (no GPU or models needed)
+models/                 downloaded weights (gitignored)
+voices/                 saved voice prints (gitignored)
+output/                 job artifacts (gitignored)
+docs/                   user documentation
+PLAN.md                 vision, roadmap and design decisions
 ```
-dub.py                     CLI entry point (`dub`, `dub info`, `dub models`)
-audit_timbre.py            per-line speaker-timbre audit (--device cpu works)
-audit_qc.py                automated quality gate for a finished job
-LICENSE                    Apache-2.0
-pipeline/
-├── anchors.py             generated accent anchors (analysis + cache)
-├── config.py              job + settings models, device capability, languages
-├── errors.py              domain exception hierarchy
-├── logging_utils.py       job-scoped structured logging
-├── models.py              model registry, download, path resolution
-├── media.py               ffmpeg/ffprobe wrappers, loudness, audio I/O
-├── subtitles.py           SRT rendering
-├── asr.py                 transcription + segmentation
-├── diarize.py             speaker embeddings + clustering (multi-speaker)
-├── overlap_separation.py  SepFormer backend for splitting overlapping voices
-├── separation.py          speech/background split (Demucs)
-├── mixing.py              ducking, bed mix and room matching (pure numpy)
-├── translate.py           OpenAI-compatible translation
-├── tts.py                 per-speaker donor selection + voice cloning
-├── voice.py               one voice: the facts that build its clone prompt
-├── parallel.py            fan-out: tasks, the worker pool, per-device counters
-├── timing.py              stretching backends + timeline assembly
-├── audit.py               timbre measurement + quality gates
-└── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (1051 tests, no GPU or models needed)
-models/                    downloaded weights (gitignored)
-output/                    job artifacts (gitignored)
-clone.py, main.py          standalone TTS demos kept for reference
-pyproject.toml             packaging, entry points, optional extras, pytest config
-.github/workflows/ci.yml   test suite on a CPU-only runner
-PLAN.md                    roadmap: MVP + P1–P6
-.agents/technical-guidelines.md   engineering standards
-```
+
+Full module map: [docs/architecture.md](docs/architecture.md).
 
 ---
 
-## Notes and limitations
+## License and responsible use
 
-- **Voice cloning requires consent.** Clone only voices you have permission to
-  use. Voice is biometric data under GDPR, and synthetic-dubbing disclosure is
-  increasingly required by platforms. A consent gate is planned for P6.
-- **Licence**: this project is Apache-2.0 (see `LICENSE`).
-- **Hardware portability is deliberate, and tested without the hardware.** The
-  dtype follows the GPU's compute capability rather than its name (bfloat16 is
-  unsupported on Pascal and Volta, and choosing it unconditionally was the most
-  likely "works for me, not for you" failure). `--device cuda:N` is honoured
-  exactly, so a second GPU can be pinned. Metal and XPU are usable but never
-  chosen automatically, because speech recognition runs on CTranslate2. The rules
-  are covered by `tests/test_device.py` against fake hardware profiles, so a
-  regression is caught on a CPU-only CI runner.
-- **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
-  Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
-- **Multi-speaker dubbing attributes speakers per segment**, not per word, so
-  overlapping speech is shown as a flag on the segment. By default such a line is
-dubbed in the voice of its dominant speaker and reported (`report.json` →
-  `overlap`, `02c_overlap.json`); `--overlap separate` splits the two voices apart
-  with SepFormer, re-transcribes each and dubs both. The speaker count comes from
-  clustering rather than being declared. Both are tracked in `PLAN.md`.
-- **Known MVP gaps**, all tracked in `PLAN.md`: lip sync, multi-language source
-  videos, and iterative length control in the translation loop. Background
-  preservation, native-accent borrowing and multi-speaker dubbing are
-  implemented (see [Accent modes](#accent-modes) and
-  [Dubbing a video with several speakers](#dubbing-a-video-with-several-speakers)).
-- **Native accent is generated, not downloaded.** The default `native` mode
-  synthesises a short anchor per language with the VoiceDesign checkpoint, cached
-  under `models/anchors/`, so no voice is shipped per language and
-  `reference-accent` with `--accent-audio` remains for choosing one yourself.
-  `--accent-match` fits the anchor's rate (and optionally gender) to the source
-  voice. There is no native-accent-free default path: to keep the source accent,
-  opt in with `--accent-mode preserve`.
-- **Room matching is off by default and adds no reverb unless asked.**
-  `--room match` adds a room-tone floor and a gentler duck, both derived from the
-  separated speech stem. A dry, close voice-over is the correct choice for narrated
-  content, which is why it stays the default. The reverb tail is a separate, opt-in
-  step (`--room-wet-db -20`): an earlier default of −12 dB was rejected on a real
-  listen as an audible echo. `--no-background` removes the stem, so room matching
-  then degrades to a dry dub and says so (`report.json` → `room.applied: false`).
-- **Changing any setting re-runs the whole job** — the cache fingerprint is
-  per-job, not per-stage. Fine for a CLI; worth refining before P6.
+- **License**: Apache-2.0; see [LICENSE](LICENSE).
+- **Consent**: clone only voices you have permission to use. Voice is biometric
+  data under GDPR, and synthetic-dubbing disclosure is increasingly required.
+- **Model licenses**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT. Avoid
+  CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
+- **Known gaps** are tracked in [PLAN.md](PLAN.md): lip sync, multi-language
+  source videos, and iterative length control in the translation loop.

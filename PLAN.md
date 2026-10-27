@@ -8,7 +8,8 @@
 
 ## 0. Implementation status
 
-**MVP (P0) — implemented.** See [`README.md`](README.md) for setup and usage.
+**MVP (P0) — implemented.** See [`README.md`](README.md) for the quick start and
+[`docs/`](docs/README.md) for the full documentation.
 
 | Area | Status | Where |
 |---|---|---|
@@ -27,7 +28,7 @@
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1051 passing | `tests/` |
+| Tests | ✅ 1105 passing | `tests/` |
 
 Verification performed:
 
@@ -1363,6 +1364,74 @@ gain was 23% rather than the ~50% the design targets. A many-voice job on two ca
 (the blend, one task per voice) is also unrun - the blend is the stage that costs the
 most per voice, and it is the one case where no splitting is needed at all.
 before the field existed, so the feature invalidated no existing cache.
+
+### P10 — Saved voice prints: design and cloning (IMPLEMENTED)
+
+**The gap.** Both underlying models were already wrapped — `VoiceDesignEngine`
+turns a text description into a voice, and `TTSEngine` clones one from a clip and
+its transcript — but every use was inline and throwaway. `clone.py` and `main.py`
+were standalone demos, and the only persisted voice assets were the per-language
+accent anchors. There was no way to name a voice once and reuse it.
+
+**What ships.** A *voice print* is a short reference clip plus its exact
+transcript, saved under a label in `pipeline/voices.py`:
+
+- `voices/<label>/voice.wav` — the reference clip (the canonical
+  `ANCHOR_TEXT[language]` passage, rendered in the voice; 20–30 s).
+- `voices/<label>/voice.json` — label, language, source (`design` | `clone`),
+  transcript, instruct, creation time, measured gender and pace band.
+
+Two creation paths and three ways to use one:
+
+```bash
+python dub.py voices --design --prompt "a warm female French voice" --lang fr --label warm-fr
+python dub.py voices --clone --audio me.wav --clone-text "…" --lang fr --label me
+python dub.py voices --list
+python dub.py voices --remove warm-fr
+
+python dub.py say --voice warm-fr --text "Bonjour…"
+python dub.py say --design "a calm narrator" --text "…" --lang en --save-as narrator
+python dub.py --video talk.mp4 --target en --voice warm-fr
+```
+
+**Why it is low-risk.** `--voice` is resolved in `job_config_from_args` into
+`ref_audio` + `ref_text`, the representation the pipeline already understands, so
+no stage, cache fingerprint or fan-out worker changed. The store is pure data
+handling (injectable engine, no model import), modeled on `anchors.py`, so the
+whole feature is testable without a GPU.
+
+**Accent.** A saved voice supplies the timbre, and the print's own language
+decides the accent path: a print already in the target language is cloned
+directly (its speech codes carry a native accent, and the costly blend is
+skipped), while a print in another language uses `--accent-mode native` and
+borrows pronunciation from a generated target-language anchor. An explicit
+`--accent-mode` always wins. This reuses the existing clone/hybrid prompts rather
+than adding a second accent rule.
+
+**Defaults.** Labels are slugified and de-duplicated (`-2`, `-3`), so an
+auto-named voice cannot silently overwrite another; an explicitly named voice is
+never overwritten without `--force`. `dub.py say` writes `output/say/<name>.wav`.
+
+**Deliberately out of scope.** The CustomVoice checkpoint's nine named speakers
+(a preset-voice source, not a described one), embedding-only storage (the
+`qwen_tts` API needs reference audio), and embedding-based de-duplication.
+
+**Verified.**
+
+- **1105 tests pass** (1051 before this work): 36 cover the store and 24 the new
+  CLI surface, all without a model or a GPU. The existing suite is unchanged.
+- **Real voice design** on an RTX 3060: `voices --design` saved a 27.1 s French
+  print; `say --voice` round-tripped through Whisper with the exact text.
+- **Real cloning** from `input/Delphine-Charming.mp3`: a 22.1 s print; `say`
+  round-tripped exactly.
+- **Real dub integration** (15 s French clip, `--voice`, real ASR/TTS/timing/
+  mixing; translation replaced by an echo because no local LLM endpoint was
+  running): 5 segments, synthesis 16.1 s, and the speaker-encoder cosine between
+  the delivered dub and the print was **0.9908** — above the 0.9808 natural
+  same-speaker baseline measured earlier.
+- **The language rule paid for itself immediately.** Before it, the same
+  same-language job spent **122.9 s** in the blend and warned it reached only a
+  0.385 donor ratio; the rule skips the blend entirely.
 
 ### Still open (verified against the code, 2026-10-09)
 

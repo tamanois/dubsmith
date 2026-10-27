@@ -18,6 +18,7 @@ __all__ = [
     "TTSError",
     "TimingError",
     "AuditError",
+    "VoiceNotFoundError",
 ]
 
 
@@ -67,3 +68,7 @@ class TimingError(DubbingError):
 
 class AuditError(DubbingError):
     """A quality audit could not be performed (missing report or reference clip)."""
+
+
+class VoiceNotFoundError(DubbingError):
+    """A saved voice print does not exist or cannot be read."""

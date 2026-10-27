@@ -244,6 +244,10 @@ class Settings(BaseModel):
     duck_db: float = Field(default=6.0, ge=0.0, le=30.0)
 
     models_dir: Path = Path("models")
+    #: Where saved voice prints live (the design/clone library). User data rather
+    #: than a model artifact, so it defaults outside ``models/``: it survives a
+    #: weights re-download and can be shared or versioned on its own.
+    voices_dir: Path = Path("voices")
     log_level: str = "INFO"
     log_json: bool = False
     #: Also keep the run log in a file. ``None`` means the job's own folder, which
@@ -296,6 +300,7 @@ class Settings(BaseModel):
             "separator": pick("BACKGROUND_SEPARATOR", cls.model_fields["separator"].default),
             "duck_db": pick("DUCK_DB", cls.model_fields["duck_db"].default),
             "models_dir": pick("MODELS_DIR", cls.model_fields["models_dir"].default),
+            "voices_dir": pick("VOICES_DIR", cls.model_fields["voices_dir"].default),
             "log_level": pick("LOG_LEVEL", cls.model_fields["log_level"].default),
             "log_json": pick("LOG_JSON", cls.model_fields["log_json"].default),
             "log_file": pick("LOG_FILE", cls.model_fields["log_file"].default),

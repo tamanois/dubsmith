@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from dub import (
     build_dub_parser,
+    build_say_parser,
+    build_voices_parser,
     job_config_from_args,
     log_file_from,
     main,
@@ -22,8 +25,27 @@ from dub import (
 )
 from pipeline import __version__
 from pipeline.config import JobConfig, Settings
-from pipeline.errors import ConfigError
+from pipeline.errors import ConfigError, VoiceNotFoundError
 from pipeline.models import REGISTRY
+from pipeline.voices import save_voice
+
+SAMPLE_RATE = 24_000
+
+
+def _saved_voice(root: Path, label: str = "warm-fr"):
+    """A voice print with no model involvement, for CLI mapping tests."""
+    t = np.linspace(0.0, 1.5, int(1.5 * SAMPLE_RATE), endpoint=False)
+    samples = (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    return save_voice(
+        root,
+        label,
+        samples,
+        SAMPLE_RATE,
+        language="French",
+        source="design",
+        ref_text="Bonjour tout le monde.",
+        instruct="a warm voice",
+    )
 
 
 def test_models_list_never_downloads(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -117,6 +139,223 @@ def test_dtype_and_device_default_to_auto() -> None:
 
     assert job.dtype == "auto"
     assert job.device == "auto"
+
+
+# --------------------------------------------------------------------------- #
+# Voice library
+# --------------------------------------------------------------------------- #
+
+
+def test_voices_list_never_loads_a_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["voices", "--list", "--voices-dir", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "Saved voices" in out
+    assert "none yet" in out
+
+
+def test_voices_parser_defaults_to_listing() -> None:
+    args = build_voices_parser().parse_args([])
+    assert not args.design and not args.clone and not args.list
+
+
+def test_voice_flag_becomes_the_reference_clip(tmp_path: Path) -> None:
+    saved = _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--voice",
+            "warm fr",  # case- and space-insensitive
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    job = job_config_from_args(args)
+
+    assert job.ref_audio == saved.wav
+    assert job.ref_text == saved.ref_text
+
+
+def test_voice_flag_also_supplies_the_preserve_transcript(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--voice",
+            "warm-fr",
+            "--accent-mode",
+            "preserve",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    # No ConfigError: 'preserve' needs a transcript and the voice print has one.
+    assert job_config_from_args(args).ref_text == "Bonjour tout le monde."
+
+
+def test_voice_flag_rejects_an_unknown_label(tmp_path: Path) -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--voice", "nope", "--voices-dir", str(tmp_path)]
+    )
+
+    with pytest.raises(VoiceNotFoundError, match="voices --list"):
+        job_config_from_args(args)
+
+
+def test_voice_flag_conflicts_with_ref_audio(tmp_path: Path) -> None:
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--voice",
+            "warm-fr",
+            "--ref-audio",
+            "me.wav",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(ConfigError, match="cannot be combined"):
+        job_config_from_args(args)
+
+
+def test_voice_in_the_target_language_clones_directly(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)  # French
+
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert job_config_from_args(args).accent_mode == "preserve"
+
+
+def test_voice_in_another_language_keeps_the_native_accent(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)  # French
+
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "en",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert job_config_from_args(args).accent_mode == "native"
+
+
+def test_explicit_accent_mode_wins_over_the_voice_default(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)
+
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--voice",
+            "warm-fr",
+            "--accent-mode",
+            "native",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert job_config_from_args(args).accent_mode == "native"
+
+
+def test_without_voice_the_accent_default_is_unchanged() -> None:
+    args = build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
+
+    assert job_config_from_args(args).accent_mode == "native"
+
+
+def test_say_parser_accepts_a_saved_voice() -> None:
+    args = build_say_parser().parse_args(["--voice", "warm-fr", "--text", "Bonjour"])
+
+    assert args.voice == "warm-fr"
+    assert args.text == "Bonjour"
+    assert args.lang is None
+
+
+def test_say_parser_accepts_an_inline_design() -> None:
+    args = build_say_parser().parse_args(
+        ["--design", "a warm voice", "--text", "Bonjour", "--lang", "fr"]
+    )
+
+    assert args.design == "a warm voice"
+    assert args.lang == "fr"
+
+
+def test_say_parser_requires_a_voice_source() -> None:
+    with pytest.raises(SystemExit):
+        build_say_parser().parse_args(["--text", "Bonjour"])
+
+
+def test_say_parser_requires_text() -> None:
+    with pytest.raises(SystemExit):
+        build_say_parser().parse_args(["--voice", "warm-fr"])
+
+
+def test_say_inline_needs_a_language(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        ["say", "--design", "a voice", "--text", "hi", "--voices-dir", str(tmp_path)]
+    )
+
+    assert code == 1
+    assert "--lang is required" in capsys.readouterr().err
+
+
+def test_voices_design_needs_a_prompt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["voices", "--design", "--lang", "fr", "--voices-dir", str(tmp_path)])
+
+    assert code == 1
+    assert "--prompt" in capsys.readouterr().err
+
+
+def test_voices_clone_needs_clone_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "voices",
+            "--clone",
+            "--audio",
+            "me.wav",
+            "--lang",
+            "fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert code == 1
+    assert "--clone-text" in capsys.readouterr().err
 
 
 def test_native_is_the_default_accent_mode() -> None:

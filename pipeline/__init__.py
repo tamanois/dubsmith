@@ -13,6 +13,7 @@ Module map:
     asr         -- speech recognition and segmentation
     translate   -- OpenAI-compatible translation
     tts         -- voice cloning with Qwen3-TTS
+    voices      -- saved, labeled voice prints (design + clone library)
     timing      -- time-stretching and timeline placement
     orchestrate -- stage runner tying everything together
 """

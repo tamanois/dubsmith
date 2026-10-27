@@ -24,7 +24,7 @@ import argparse
 import sys
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from pipeline import __version__
 from pipeline.asr import asr_device, resolve_compute_type
@@ -41,7 +41,7 @@ from pipeline.config import (
     probe_device,
     release_gpu_memory,
 )
-from pipeline.errors import DubbingError, ModelNotFoundError
+from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError, TTSError
 from pipeline.logging_utils import DEFAULT_MAX_LOG_BYTES, setup_logging
 from pipeline.mixing import (
     DEFAULT_ROOM_DUCK_DB,
@@ -148,6 +148,202 @@ def build_anchors_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_voices_parser() -> argparse.ArgumentParser:
+    """Parser for the ``voices`` subcommand (the saved voice library)."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_PROG} voices",
+        description=(
+            "Create, list and remove saved voice prints. A voice print is a short "
+            "reference clip plus its transcript, so the same voice can be reused by "
+            "name in 'python dub.py say' or in a dubbing run with --voice. Without a "
+            "mode, the library is listed."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--design",
+        action="store_true",
+        help="Create a voice from a text description (VoiceDesign checkpoint).",
+    )
+    mode.add_argument(
+        "--clone",
+        action="store_true",
+        help="Create a voice cloned from --audio and --clone-text (Base checkpoint).",
+    )
+    mode.add_argument(
+        "--list", action="store_true", help="List saved voices (the default)."
+    )
+    mode.add_argument(
+        "--remove", metavar="LABEL", help="Delete a saved voice by label."
+    )
+
+    parser.add_argument(
+        "--prompt",
+        "--instruct",
+        dest="prompt",
+        metavar="TEXT",
+        default=None,
+        help=(
+            "Description of the voice to create, e.g. 'a warm female French voice, "
+            "slow and clear'. Required with --design."
+        ),
+    )
+    parser.add_argument(
+        "--audio",
+        type=Path,
+        metavar="FILE",
+        default=None,
+        help="Reference clip containing the voice to clone. Required with --clone.",
+    )
+    parser.add_argument(
+        "--clone-text",
+        dest="clone_text",
+        metavar="TEXT",
+        default=None,
+        help="Exact transcript of --audio. Required with --clone.",
+    )
+    parser.add_argument(
+        "--lang",
+        default="fr",
+        metavar="LANG",
+        help=(
+            "Language the voice print is recorded in. It is also the accent the "
+            "design model aims for, so pick the language you will speak most."
+        ),
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Name to save the voice under. Defaults to a slug of the description "
+            "(design) or the audio filename (clone)."
+        ),
+    )
+    parser.add_argument(
+        "--speak",
+        default=None,
+        metavar="TEXT",
+        help="Optionally render this text with the new voice and write it to --output.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Where --speak writes its WAV (default: output/say/<label>.wav).",
+    )
+    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Precision for the checkpoint (default: auto).",
+    )
+    parser.add_argument(
+        "--voices-dir",
+        type=Path,
+        default=None,
+        help="Override the voice-library directory (default: VOICES_DIR).",
+    )
+    parser.add_argument(
+        "--models-dir", type=Path, default=None, help="Override the models directory."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing voice with the same label.",
+    )
+    return parser
+
+
+def build_say_parser() -> argparse.ArgumentParser:
+    """Parser for the ``say`` subcommand (standalone speech synthesis)."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_PROG} say",
+        description=(
+            "Speak a text with a saved voice, or with a voice described or cloned "
+            "inline. This is the fast path for making an audio clip: no video, no "
+            "translation, no pipeline."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--voice",
+        metavar="LABEL",
+        help="Saved voice to use (see 'python dub.py voices --list').",
+    )
+    source.add_argument(
+        "--design",
+        metavar="PROMPT",
+        help=(
+            "Describe a voice inline, e.g. 'a warm female French voice'. Not saved "
+            "unless --save-as is given."
+        ),
+    )
+    source.add_argument(
+        "--clone",
+        type=Path,
+        metavar="AUDIO",
+        help="Clone a voice inline from this clip, which --clone-text transcribes.",
+    )
+    parser.add_argument(
+        "--clone-text",
+        dest="clone_text",
+        metavar="TEXT",
+        default=None,
+        help="Exact transcript of --clone. Required with it.",
+    )
+    parser.add_argument(
+        "--text", required=True, metavar="TEXT", help="Text to speak."
+    )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        metavar="LANG",
+        help=(
+            "Target language. Defaults to the saved voice's own language; required "
+            "for an inline --design or --clone."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output WAV (default: output/say/<name>.wav).",
+    )
+    parser.add_argument(
+        "--save-as",
+        dest="save_as",
+        metavar="LABEL",
+        default=None,
+        help="Save an inline --design or --clone as a reusable voice under this label.",
+    )
+    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Precision for the checkpoint (default: auto).",
+    )
+    parser.add_argument(
+        "--voices-dir",
+        type=Path,
+        default=None,
+        help="Override the voice-library directory (default: VOICES_DIR).",
+    )
+    parser.add_argument(
+        "--models-dir", type=Path, default=None, help="Override the models directory."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing voice when --save-as names one.",
+    )
+    return parser
+
+
 def _device_list(value: str) -> list[str]:
     """Parse the comma-separated device list ``--devices`` takes.
 
@@ -193,8 +389,25 @@ def build_dub_parser() -> argparse.ArgumentParser:
             "(where the model conditions on both); ignored by the other modes."
         ),
     )
+    parser.add_argument(
+        "--voice",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Reuse a saved voice print (see 'python dub.py voices --list') as the "
+            "voice for every speaker. It supplies the timbre; pronunciation still "
+            "comes from --accent-mode (native by default), so the accent matches "
+            "the target language. Cannot be combined with --ref-audio."
+        ),
+    )
 
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
+    parser.add_argument(
+        "--voices-dir",
+        type=Path,
+        default=None,
+        help="Override the saved-voice directory used by --voice (default: VOICES_DIR).",
+    )
     parser.add_argument("--device", default="auto", help="auto, cuda:0, cuda:1, mps, or cpu.")
     parser.add_argument(
         "--devices",
@@ -366,15 +579,17 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--accent-mode",
         dest="accent_mode",
-        default="native",
+        default=None,
         choices=["native", "preserve", "speaker-only", "reference-accent"],
         help=(
-            "'native' (default) keeps the speaker's timbre and takes pronunciation "
-            "from a generated native accent anchor; 'preserve' clones the speaker's "
-            "accent along with their voice; 'speaker-only' keeps only the timbre "
-            "embedding so the model uses its own phonetics for the target language; "
-            "'reference-accent' keeps the speaker's timbre but takes pronunciation "
-            "from --accent-audio."
+            "'native' (the default) keeps the speaker's timbre and takes "
+            "pronunciation from a generated native accent anchor; 'preserve' "
+            "clones the speaker's accent along with their voice; 'speaker-only' "
+            "keeps only the timbre embedding so the model uses its own phonetics "
+            "for the target language; 'reference-accent' keeps the speaker's "
+            "timbre but takes pronunciation from --accent-audio. With --voice, a "
+            "saved voice already in the target language clones directly unless "
+            "this flag says otherwise."
         ),
     )
     parser.add_argument(
@@ -861,21 +1076,315 @@ def cmd_anchors(argv: Sequence[str]) -> int:
     return _STOP
 
 
-def job_config_from_args(args: argparse.Namespace) -> JobConfig:
+def _voices_root(args: argparse.Namespace, settings: Settings) -> Path:
+    """The voice library this invocation uses: ``--voices-dir``, else settings."""
+    return Path(args.voices_dir) if args.voices_dir is not None else settings.voices_dir
+
+
+def _write_say_output(
+    path: Path | None, name: str, samples: Any, sample_rate: int
+) -> Path:
+    """Write a ``say``/``--speak`` clip, defaulting to ``output/say/<name>.wav``."""
+    from pipeline.media import write_audio
+    from pipeline.voices import slugify_label
+
+    target = (
+        path
+        if path is not None
+        else Path("output") / "say" / f"{slugify_label(name)}.wav"
+    )
+    return write_audio(target, samples, int(sample_rate))
+
+
+def _anchor_text(language: str) -> str:
+    """The canonical audition passage for a language, or an actionable error.
+
+    Reusing the accent-anchor passage keeps every voice print comparable: the
+    same words, the same phonetic coverage, roughly the same length.
+    """
+    from pipeline.anchors import ANCHOR_TEXT
+
+    try:
+        return ANCHOR_TEXT[language]
+    except KeyError:
+        raise ConfigError(
+            f"No built-in passage for {language!r}; add one to "
+            "pipeline/anchors.ANCHOR_TEXT or pick a supported language."
+        ) from None
+
+
+def cmd_voices(argv: Sequence[str]) -> int:
+    """Handle ``dub.py voices``: create, list and remove saved voice prints."""
+    from pipeline.tts import TTSEngine, VoiceDesignEngine
+    from pipeline.voices import (
+        default_label,
+        delete_voice,
+        list_voices,
+        save_voice,
+        unique_label,
+    )
+
+    args = build_voices_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    root = _voices_root(args, settings)
+
+    if args.remove:
+        removed = delete_voice(root, args.remove)
+        print(f"Removed {args.remove!r} from {removed}")
+        return _STOP
+
+    if args.list or not (args.design or args.clone):
+        saved = list_voices(root)
+        print(f"Saved voices: {root.resolve()}\n")
+        if not saved:
+            print(
+                "  (none yet - create one with "
+                '\'python dub.py voices --design --prompt "..." --lang fr\')'
+            )
+            return _STOP
+        for item in saved:
+            print(f"  {item.summary()}")
+        return _STOP
+
+    language = normalize_language(args.lang)
+    if language == "Auto":
+        raise ConfigError("--lang must be an explicit language, not 'auto'.")
+    anchor_text = _anchor_text(language)
+
+    if args.design:
+        if not args.prompt or not args.prompt.strip():
+            raise ConfigError("--design requires --prompt (a description of the voice).")
+        engine = VoiceDesignEngine(
+            resolve_model("tts_voice_design", models_dir),
+            device=args.device,
+            dtype=pick_dtype(args.device, args.dtype),
+        )
+        samples, sample_rate = engine.generate(anchor_text, args.prompt, language)
+        label = args.label or unique_label(default_label(instruct=args.prompt), root)
+        saved = save_voice(
+            root,
+            label,
+            samples,
+            sample_rate,
+            language=language,
+            source="design",
+            ref_text=anchor_text,
+            instruct=args.prompt,
+            force=args.force,
+        )
+        if args.speak:
+            speech, speech_rate = engine.generate(args.speak, args.prompt, language)
+            out = _write_say_output(args.output, saved.label, speech, speech_rate)
+            print(f"Wrote {out}")
+        release_gpu_memory()
+    else:
+        if args.audio is None:
+            raise ConfigError("--clone requires --audio (a clip of the voice to clone).")
+        if not args.clone_text or not args.clone_text.strip():
+            raise ConfigError(
+                "--clone requires --clone-text (the exact transcript of --audio)."
+            )
+        engine = TTSEngine(
+            resolve_model("tts_base", models_dir),
+            device=args.device,
+            dtype=pick_dtype(args.device, args.dtype),
+        )
+        engine.prepare_prompt_from_file(args.audio, args.clone_text)
+        texts = [anchor_text] + ([args.speak] if args.speak else [])
+        rendered = engine.synthesize(texts, language=language)
+        anchor = rendered[0] if rendered else None
+        if anchor is None:
+            raise TTSError("The cloning model returned no audio for the voice print.")
+        label = args.label or unique_label(default_label(audio=args.audio), root)
+        saved = save_voice(
+            root,
+            label,
+            anchor,
+            engine.sample_rate,
+            language=language,
+            source="clone",
+            ref_text=anchor_text,
+            force=args.force,
+        )
+        if args.speak and len(rendered) > 1 and rendered[1] is not None:
+            out = _write_say_output(
+                args.output, saved.label, rendered[1], engine.sample_rate
+            )
+            print(f"Wrote {out}")
+        release_gpu_memory()
+
+    print(
+        f"Saved voice {saved.label!r} ({saved.language}, {saved.seconds:.1f}s) "
+        f"to {saved.directory}"
+    )
+    print(f'Use it with: python dub.py say --voice {saved.label} --text "..."')
+    return _STOP
+
+
+def cmd_say(argv: Sequence[str]) -> int:
+    """Handle ``dub.py say``: speak a text with a saved, designed or cloned voice."""
+    from pipeline.tts import TTSEngine, VoiceDesignEngine
+    from pipeline.voices import load_voice, save_voice
+
+    args = build_say_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    root = _voices_root(args, settings)
+
+    if not args.text or not args.text.strip():
+        raise ConfigError("--text cannot be empty.")
+
+    if args.voice:
+        saved = load_voice(root, args.voice)
+        language = normalize_language(args.lang) if args.lang else saved.language
+        engine = TTSEngine(
+            resolve_model("tts_base", models_dir),
+            device=args.device,
+            dtype=pick_dtype(args.device, args.dtype),
+        )
+        engine.prepare_prompt_from_file(saved.wav, saved.ref_text)
+        rendered = engine.synthesize([args.text], language=language)
+        speech = rendered[0] if rendered else None
+        if speech is None:
+            raise TTSError("The model returned no audio.")
+        out = _write_say_output(args.output, saved.label, speech, engine.sample_rate)
+        release_gpu_memory()
+        print(f"Wrote {out}")
+        return _STOP
+
+    if args.lang is None:
+        raise ConfigError(
+            "--lang is required when the voice is described or cloned inline."
+        )
+    language = normalize_language(args.lang)
+    if language == "Auto":
+        raise ConfigError("--lang must be an explicit language, not 'auto'.")
+    anchor_text = _anchor_text(language)
+
+    if args.design:
+        engine = VoiceDesignEngine(
+            resolve_model("tts_voice_design", models_dir),
+            device=args.device,
+            dtype=pick_dtype(args.device, args.dtype),
+        )
+        speech, sample_rate = engine.generate(args.text, args.design, language)
+        if args.save_as:
+            samples, anchor_rate = engine.generate(anchor_text, args.design, language)
+            save_voice(
+                root,
+                args.save_as,
+                samples,
+                anchor_rate,
+                language=language,
+                source="design",
+                ref_text=anchor_text,
+                instruct=args.design,
+                force=args.force,
+            )
+        out = _write_say_output(
+            args.output, args.save_as or "design", speech, sample_rate
+        )
+        release_gpu_memory()
+        print(f"Wrote {out}")
+        return _STOP
+
+    if not args.clone_text or not args.clone_text.strip():
+        raise ConfigError(
+            "--clone requires --clone-text (the exact transcript of the clip)."
+        )
+    engine = TTSEngine(
+        resolve_model("tts_base", models_dir),
+        device=args.device,
+        dtype=pick_dtype(args.device, args.dtype),
+    )
+    engine.prepare_prompt_from_file(args.clone, args.clone_text)
+    texts = [args.text] + ([anchor_text] if args.save_as else [])
+    rendered = engine.synthesize(texts, language=language)
+    speech = rendered[0] if rendered else None
+    if speech is None:
+        raise TTSError("The model returned no audio.")
+    if args.save_as:
+        anchor = rendered[1] if len(rendered) > 1 else None
+        if anchor is None:
+            raise TTSError("The model returned no audio for the saved voice print.")
+        save_voice(
+            root,
+            args.save_as,
+            anchor,
+            engine.sample_rate,
+            language=language,
+            source="clone",
+            ref_text=anchor_text,
+            force=args.force,
+        )
+    out = _write_say_output(
+        args.output, args.save_as or "clone", speech, engine.sample_rate
+    )
+    release_gpu_memory()
+    print(f"Wrote {out}")
+    return _STOP
+
+
+def job_config_from_args(
+    args: argparse.Namespace, *, settings: Settings | None = None
+) -> JobConfig:
     """Build the :class:`JobConfig` for a parsed set of dub options.
 
     Extracted from :func:`cmd_dub` so the flag-to-config mapping can be tested
     without running the pipeline. That matters: this function passes *every* flag
     explicitly, including its defaults, so a validator that keys off
     ``model_fields_set`` instead of the value will reject an ordinary run.
+
+    ``--voice`` is resolved here into ``ref_audio``/``ref_text``, which is the
+    representation the pipeline already understands. Doing it at this boundary
+    keeps every downstream stage (fingerprinting, donor selection, prompt
+    building, fan-out workers) unchanged: a saved voice is simply a reference
+    clip whose transcript is known.
     """
+    ref_audio = args.ref_audio
+    ref_text = args.ref_text
+    # ``None`` means "not asked for", which lets a saved voice pick the mode that
+    # fits it without overriding an explicit choice. The pipeline's own default
+    # is still ``native``.
+    accent_mode = args.accent_mode or "native"
+    accent_requested = args.accent_mode is not None
+    voice_label = getattr(args, "voice", None)
+    if voice_label:
+        if ref_audio is not None:
+            raise ConfigError(
+                "--voice cannot be combined with --ref-audio: a saved voice already "
+                "is a reference clip. Pick one."
+            )
+        from pipeline.voices import load_voice
+
+        voices_root = getattr(args, "voices_dir", None)
+        if voices_root is None:
+            voices_root = (
+                settings.voices_dir
+                if settings is not None
+                else Settings.from_env().voices_dir
+            )
+        saved = load_voice(voices_root, voice_label)
+        ref_audio = saved.wav
+        ref_text = saved.ref_text
+        # The print's own language is already the target language, so its speech
+        # codes carry the right accent: cloning it directly is both the most
+        # faithful and the cheapest path (no blend, no donor anchor). A print in
+        # another language keeps the default ``native`` mode, which borrows the
+        # target accent from a generated anchor.
+        if not accent_requested and saved.language == normalize_language(
+            args.target_language
+        ):
+            accent_mode = "preserve"
+
     return JobConfig(
         video=args.video,
         audio=args.audio,
         target_language=args.target_language,
         source_language=args.source_language,
-        ref_audio=args.ref_audio,
-        ref_text=args.ref_text,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
         output_dir=args.output_dir,
         device=args.device,
         devices=args.devices,
@@ -896,7 +1405,7 @@ def job_config_from_args(args: argparse.Namespace) -> JobConfig:
         room_wet_db=args.room_wet_db,
         room_duck_db=args.room_duck_db,
         room_tone_gain_db=args.room_tone_gain_db,
-        accent_mode=args.accent_mode,
+        accent_mode=accent_mode,
         accent_match=args.accent_match,
         accent_audio=args.accent_audio,
         accent_text=args.accent_text,
@@ -944,7 +1453,7 @@ def cmd_dub(argv: Sequence[str]) -> int:
     settings = Settings.from_env()
     # Built before logging starts because the job knows which folder the log
     # belongs in. Nothing in here logs, so the reordering loses no record.
-    job = job_config_from_args(args)
+    job = job_config_from_args(args, settings=settings)
     setup_logging(
         "DEBUG" if args.verbose else settings.log_level,
         settings.log_json,
@@ -967,6 +1476,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = args[1:]
     elif args and args[0] == "anchors":
         handler = cmd_anchors
+        payload = args[1:]
+    elif args and args[0] in {"voices", "voice-library"}:
+        handler = cmd_voices
+        payload = args[1:]
+    elif args and args[0] == "say":
+        handler = cmd_say
         payload = args[1:]
     elif args and args[0] == "info":
         handler = cmd_info

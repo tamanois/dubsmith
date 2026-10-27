@@ -32,11 +32,10 @@ from qwen_tts import Qwen3TTSModel
 # For a French-native timbre, supply your own clip:
 #     REF_AUDIO = "ma_voix_fr.flac"
 #     REF_TEXT  = "<exact French words spoken in ma_voix_fr.flac>"
-REF_AUDIO = "Me - Voice extract.wav"
-REF_TEXT = """Bonjour, je suis Joel, Développeur cloud et Devops avec plus de 9 années d'expérience.
-J'ai 3 certifications cloud et beaucoup d'expérience dans l'automatisation et l'ensemble du SDLC.
-Mon objectif est d'avoir le plus grand impact possible dans le domaine, et surtout dans la vie des gens.
-"""
+REF_AUDIO = "input/Delphine-Charming.mp3"
+REF_TEXT = """
+    Bonjour, je suis delphine. Comment tu vas? Bien j'espère. On a une magnifique journée qui s'annonce. Tu ne trouves pas. Ce ciel bleu, ces nuages, Oh my god, C'est.. Juste... Parfait!
+    """
 
 # --- French text to synthesize in that voice ---------------------------------
 # Must be spelled "French" (checked case-insensitively against the checkpoint's
@@ -45,8 +44,7 @@ Mon objectif est d'avoir le plus grand impact possible dans le domaine, et surto
 TARGET_LANGUAGE = "French"
 TARGET_TEXTS = [
     """
-    Le chat, rapide, traverse la rue grise sans regarder les voitures.
-    Un vent léger murmure à travers les arbres du vieux parc, tandis que le ciel change de couleur lentement.
+    Trop froid dehors? Voici le plan familial parfait. Chez Sauve Qui Peut, résolvez les énigmes ensemble avant la fin du chrono. Puis, célébrez autour d’une bonne poutine chez Poutineville. Plus d’idées sur HotPlaces.
     """,
 ]
 
@@ -75,6 +73,6 @@ wavs, sr = model.generate_voice_clone(
 )
 
 for i, wav in enumerate(wavs, 1):
-    path = f"output_voice_clone_fr_{i}.wav"
+    path = f"output/output_voice_clone_fr_{i}.wav"
     sf.write(path, wav, sr)
     print(f"wrote {path} ({len(wav) / sr:.2f}s @ {sr} Hz)")
