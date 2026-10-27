@@ -15,6 +15,7 @@ from pipeline.translate import (
     TranslationRequest,
     build_messages,
     build_shorten_messages,
+    build_subtitle_messages,
     chunked,
     extract_json_object,
 )
@@ -396,3 +397,15 @@ class TestShortenCalls:
             translator.shorten(
                 [ShortenRequest(id=0, text="x", max_words=1)], target_language="French"
             )
+
+
+def test_subtitle_messages_use_reading_rules_not_a_word_ceiling() -> None:
+    messages = build_subtitle_messages(
+        [TranslationRequest(id=1, text="Hello there.", duration=1.5)],
+        source_language="English",
+        target_language="French",
+    )
+    system = messages[0]["content"].lower()
+    assert "subtitle" in system
+    assert "max_words" not in messages[1]["content"]
+    assert "spoken" not in system

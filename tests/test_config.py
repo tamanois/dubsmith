@@ -13,11 +13,13 @@ from pipeline.config import (
     DEFAULT_ALLOCATOR_CONF,
     JobConfig,
     Settings,
+    SubtitleJobConfig,
     configure_allocator,
     device_free_bytes,
     language_code_for_name,
     language_name_for_code,
     normalize_language,
+    normalize_subtitles_mode,
     peak_reserved_bytes,
     read_env_file,
     release_gpu_memory,
@@ -806,6 +808,10 @@ class TestDevices:
         payload.pop("output_dir", None)
         payload.pop("force", None)
         payload.pop("devices")
+        # The soft default is treated as absent by the fingerprint, for the same
+        # reason the absent device list is: adding the field must not invalidate
+        # every existing cache.
+        payload.pop("subtitles_mode", None)
         blob = json.dumps(payload, sort_keys=True).encode("utf-8")
         expected = hashlib.sha256(blob).hexdigest()[:16]
 
@@ -817,3 +823,41 @@ class TestDevices:
         # Per-worker batching differs from a single worker's, exactly as the batch
         # size already did, so the cache must not be reused across the change.
         assert single.fingerprint() != spread.fingerprint()
+
+
+class TestSubtitleConfig:
+    def test_subtitles_mode_aliases_normalise(self) -> None:
+        assert normalize_subtitles_mode("mux") == "soft"
+        assert normalize_subtitles_mode("burn-in") == "burn"
+        assert normalize_subtitles_mode("none") == "off"
+        with pytest.raises(ConfigError):
+            normalize_subtitles_mode("sideways")
+
+    def test_subtitle_job_requires_exactly_one_input(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="exactly one input"):
+            SubtitleJobConfig(target_language="fr")
+        with pytest.raises(ConfigError, match="exactly one input"):
+            SubtitleJobConfig(
+                video=tmp_path / "a.mp4",
+                audio=tmp_path / "a.wav",
+                target_language="fr",
+            )
+
+    def test_subtitle_job_normalises_language_and_names_its_folder(
+        self, tmp_path: Path
+    ) -> None:
+        job = SubtitleJobConfig(
+            video=tmp_path / "movie.mp4", target_language="fr", output_dir=tmp_path
+        )
+        assert job.target_language == "French"
+        assert job.target_code == "fr"
+        assert job.job_dir == tmp_path / "movie-subtitles"
+
+    def test_subtitle_fingerprint_ignores_output_dir_and_force(
+        self, tmp_path: Path
+    ) -> None:
+        one = SubtitleJobConfig(video=tmp_path / "a.mp4", output_dir=tmp_path / "x")
+        two = SubtitleJobConfig(
+            video=tmp_path / "a.mp4", output_dir=tmp_path / "y", force=True
+        )
+        assert one.fingerprint() == two.fingerprint()

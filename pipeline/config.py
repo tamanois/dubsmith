@@ -33,6 +33,7 @@ __all__ = [
     "normalize_dtype",
     "normalize_language",
     "normalize_loudness_policy",
+    "normalize_subtitles_mode",
     "peak_reserved_bytes",
     "pick_dtype",
     "preferred_dtype",
@@ -191,6 +192,26 @@ def normalize_loudness_policy(value: str) -> str:
     except KeyError:
         supported = ", ".join(sorted(set(_LOUDNESS_POLICIES.values())))
         raise ConfigError(f"Unknown loudness target {value!r}. Use: {supported}") from None
+
+
+#: Accepted spellings for how target subtitles reach the video.
+_SUBTITLES_MODES: dict[str, str] = {
+    "soft": "soft", "mux": "soft", "track": "soft", "embed": "soft",
+    "burn": "burn", "burn-in": "burn", "burnin": "burn", "hard": "burn",
+    "hardcode": "burn",
+    "off": "off", "none": "off", "skip": "off",
+}
+
+
+def normalize_subtitles_mode(value: str) -> str:
+    """Map a user-supplied subtitle delivery mode onto soft/burn/off."""
+    key = str(value).strip().lower().replace("_", "-")
+    try:
+        return _SUBTITLES_MODES[key]
+    except KeyError:
+        raise ConfigError(
+            f"Unknown subtitles mode {value!r}. Use: soft, burn or off"
+        ) from None
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -496,6 +517,11 @@ class JobConfig(BaseModel):
     overlap_separator: str = "auto"
 
     keep_subtitles: bool = True
+    #: How target subtitles reach the video when the input has one.
+    #:   "soft" -> a toggleable subtitle track muxed with the stream copy (default)
+    #:   "burn" -> rendered into the frames, which re-encodes the video
+    #:   "off"  -> write the SRT sidecars only
+    subtitles_mode: str = "soft"
     force: bool = False
 
     @field_validator("loudness_target")
@@ -692,6 +718,11 @@ class JobConfig(BaseModel):
             raise ConfigError(
                 f"Unknown length budget {value!r}. Use: off or words"
             ) from None
+
+    @field_validator("subtitles_mode")
+    @classmethod
+    def _check_subtitles_mode(cls, value: str) -> str:
+        return normalize_subtitles_mode(value)
 
     @field_validator("room")
     @classmethod
@@ -958,6 +989,11 @@ class JobConfig(BaseModel):
         payload = self.model_dump(mode="json")
         for volatile in ("output_dir", "force"):
             payload.pop(volatile, None)
+        # Subtitle embedding only affects the final mux, not a cached stage. A job
+        # that keeps the historical default therefore hashes exactly what it did
+        # before the field existed; only an explicit burn/off re-runs the stages.
+        if payload.get("subtitles_mode") == "soft":
+            payload.pop("subtitles_mode", None)
         # A run that does not spread its work over several cards hashes exactly
         # what it hashed before the field existed, so adding it invalidates no
         # existing cache. A run that *does* spread the work re-synthesises once:
@@ -965,6 +1001,100 @@ class JobConfig(BaseModel):
         # already a fingerprint input for the same reason.
         if not payload.get("devices"):
             payload.pop("devices", None)
+        blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+
+class SubtitleJobConfig(BaseModel):
+    """Everything needed to subtitle one video (or audio file), without dubbing.
+
+    Deliberately small: no voice, timing or mixing fields, because none of the
+    TTS stages run. The same ASR and translation modules the dub uses are reused,
+    so the two features cannot disagree about the transcript or the wording.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Input: exactly one of these.
+    video: Path | None = None
+    audio: Path | None = None
+
+    # Canonical name, not a code: pydantic validators do not run on defaults.
+    target_language: str = "French"
+    source_language: str | None = None  # None -> auto-detect
+
+    whisper_model: str = "large-v3"
+    llm_model: str | None = None  # overrides Settings.llm_model
+    device: str = "auto"
+    output_dir: Path = Path("output")
+    #: How the subtitle reaches the video: soft (default), burn, or off
+    #: (sidecar SRT only).
+    subtitles_mode: str = "soft"
+    #: Longest a cue's text may be before it is split, in characters.
+    max_chars: int = Field(default=42, ge=10, le=200)
+    no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    force: bool = False
+
+    @field_validator("video", "audio", "output_dir")
+    @classmethod
+    def _expand(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
+
+    @field_validator("target_language")
+    @classmethod
+    def _check_target(cls, value: str) -> str:
+        return normalize_language(value)
+
+    @field_validator("subtitles_mode")
+    @classmethod
+    def _check_subtitles_mode(cls, value: str) -> str:
+        return normalize_subtitles_mode(value)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "SubtitleJobConfig":
+        if (self.video is None) == (self.audio is None):
+            raise ConfigError("Provide exactly one input: either --video or --audio")
+        return self
+
+    @property
+    def input_path(self) -> Path:
+        """The single input path (video or audio)."""
+        path = self.video if self.video is not None else self.audio
+        assert path is not None  # guaranteed by the model validator
+        return path
+
+    @property
+    def job_dir(self) -> Path:
+        """Folder this job's artifacts live in.
+
+        Named ``<stem>-subtitles`` rather than ``<stem>`` so a subtitles-only run
+        cannot overwrite a dubbing job's SRT or transcript.
+        """
+        return self.output_dir / f"{self.input_path.stem}-subtitles"
+
+    @property
+    def is_video(self) -> bool:
+        """True when the input is a video file."""
+        return self.video is not None
+
+    @property
+    def target_code(self) -> str | None:
+        """Whisper/metadata code for the target language."""
+        return language_code_for_name(self.target_language)
+
+    @property
+    def source_code(self) -> str | None:
+        """Code for a forced source language, or ``None`` to auto-detect."""
+        return language_code_for_name(self.source_language)
+
+    def fingerprint(self) -> str:
+        """Stable hash of the settings that affect the subtitles produced."""
+        import hashlib
+        import json
+
+        payload = self.model_dump(mode="json")
+        for volatile in ("output_dir", "force"):
+            payload.pop(volatile, None)
         blob = json.dumps(payload, sort_keys=True).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()[:16]
 

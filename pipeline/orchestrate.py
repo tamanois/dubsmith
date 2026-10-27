@@ -269,6 +269,7 @@ class JobResult:
     job_dir: Path
     dub_track: Path
     dubbed_video: Path | None = None
+    burned_video: Path | None = None
     source_srt: Path | None = None
     target_srt: Path | None = None
     report: dict[str, Any] = field(default_factory=dict)
@@ -279,6 +280,8 @@ class JobResult:
         lines = [f"Output directory: {self.job_dir}"]
         if self.dubbed_video is not None:
             lines.append(f"  dubbed video : {self.dubbed_video.name}")
+        if self.burned_video is not None:
+            lines.append(f"  burned video : {self.burned_video.name}")
         lines.append(f"  dub audio    : {self.dub_track.name}")
         if self.source_srt is not None:
             lines.append(f"  source subs  : {self.source_srt.name}")
@@ -2861,12 +2864,31 @@ class Pipeline:
             )
 
         dubbed_video = None
+        burned_video = None
         if self.job.is_video:
+            mode = self.job.subtitles_mode
             dubbed_video = media.mux_audio(
-                self.input_path, dub_track, self.job_dir / "video_dubbed.mp4"
+                self.input_path,
+                dub_track,
+                self.job_dir / "video_dubbed.mp4",
+                # Embed the target subtitles softly by default. ``burn`` is applied
+                # in a second pass, after the dub's audio is in place, so the
+                # re-encoding pass has a finished file to draw over.
+                subtitle_srt=(
+                    target_srt if mode == "soft" and target_srt is not None else None
+                ),
+                subtitle_language=self.job.target_language,
             )
+            if mode == "burn" and target_srt is not None:
+                burned_video = media.burn_subtitles(
+                    dubbed_video,
+                    target_srt,
+                    self.job_dir / "video_burned.mp4",
+                    language=self.job.target_language,
+                )
 
         report = self._build_report(timeline, transcript, script, dubbed_video, loudness)
+        report["subtitles_mode"] = self.job.subtitles_mode
         (self.job_dir / _REPORT_NAME).write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -2876,6 +2898,7 @@ class Pipeline:
             job_dir=self.job_dir,
             dub_track=dub_track,
             dubbed_video=dubbed_video,
+            burned_video=burned_video,
             source_srt=source_srt,
             target_srt=target_srt,
             report=report,

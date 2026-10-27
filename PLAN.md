@@ -17,6 +17,7 @@
 | Config, env, languages | ✅ | `pipeline/config.py` |
 | Model registry / resolution | ✅ | `pipeline/models.py` |
 | Media (ffmpeg, loudness, SRT) | ✅ | `pipeline/media.py`, `pipeline/subtitles.py` |
+| Subtitle embedding (soft default, burn opt-in) | ✅ | `pipeline/media.py`, `pipeline/subtitle_pipeline.py`, `--subtitles-mode` |
 | ASR + VAD gating | ✅ | `pipeline/asr.py` |
 | Translation (OpenAI-compatible) | ✅ | `pipeline/translate.py` |
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
@@ -1520,6 +1521,7 @@ voice timbre**, ideally with the **target language's accent**.
 | D18 | Overlap separation | **SpeechBrain SepFormer (16 kHz) behind an optional `--overlap separate`**, placed simultaneously with the dominant line; the default stays `dominant` | The plan's "no new dependency via funasr" premise was **refuted by inspection**: funasr 1.4.16 registers no separation model and lacks `ss_inference_launch`, and ModelScope ships 8 kHz checkpoints only. SepFormer 16 kHz is the one self-contained two-speaker model at that rate, so `speechbrain` becomes an optional dependency like `funasr`/`demucs`. Separation runs only on flagged segments, and a segment whose streams cannot be matched to distinct speakers keeps the dominant-only treatment, so the stage cannot make a job worse. The default stays `dominant` until a bake-off shows separation is reliably better |
 | D19 | Device portability | **Capability-probed, with a conservative `auto`**: bfloat16 only at CUDA sm_80+ (ROCm 9.4+), float16 at sm_70+, float32 otherwise; `cuda:N` honoured exactly; `auto` picks only what *every* stage supports (CUDA/ROCm, else CPU); Metal and XPU reachable via an explicit `--device` and reported by `dub.py info` | The old rule asked one binary question and answered it with bfloat16, which is unsupported on the Pascal and Volta cards a "consumer hardware" project attracts most. Metal is excluded from `auto` because faster-whisper runs on CTranslate2, which has no Metal backend: choosing it automatically would break a Mac that works today. The rules are unit-tested against fake hardware profiles, so a CPU-only CI runner still proves them |
 | D20 | Distribution | **Apache-2.0, pip-installable, optional backends as extras, CI on a CPU-only runner**; direct dependencies pinned but **no lock file** | An unlicensed repository is not usable by anyone, whatever the code does. Extras make the degradation the pipeline already had (`demucs`, `funasr`, `speechbrain` are all optional by design) visible in the metadata. A `pip freeze` lock built on this box would freeze CUDA wheels into the requirements, which is the opposite of portable — pinning the direct dependencies and documenting the torch index gets the reproducibility without the trap |
+| D21 | Subtitle embedding | **Subtitles are independent of dubbing, and embedded softly by default**; `--subtitles-mode burn` renders them into the frames. A new `dub.py subtitles` command runs ASR (+ translation) only. Soft mux copies every stream and replaces an existing track in the target language; burn-in opts into a video re-encode | Subtitles are useful without a dub, so coupling them to the TTS pipeline would waste the most expensive stages. Soft mux is lossless and toggleable, and preserving other-language tracks keeps information the viewer may still want; replacing the target-language track avoids duplicate streams across runs. Burn-in exists for players that ignore soft tracks, and its re-encode is why it stays opt-in |
 
 ---
 
@@ -1538,7 +1540,9 @@ voice timbre**, ideally with the **target language's accent**.
 - Overlong lines repaired by re-wording rather than by cutting speech (`--refine`).
 - Overlapping-speech separation: a segment carrying two voices is split with
   SepFormer and both voices are dubbed (`--overlap separate`).
-- Audio re-timed to the source timeline (no lip sync).
+- Audio re-timed to the source timeline (no li, embedded in the dubbed video by
+  default as a soft (toggleable) track, or burned into the frames via
+  `--subtitles-mode burn`
 - Subtitles: original (SRT) + translated (SRT) as a bonus deliverable.
 
 **Out (deferred to later phases)**
@@ -1612,10 +1616,12 @@ lines (in memory; 02_transcript.json keeps what ASR said)
    │     measured decay and adds a room-tone floor, before the bed is ducked
    │     more gently)
    ▼
-timing.json, 05_mix.wav, 05_room.json (with --room match), dub.wav
-   │  ⑨ ffmpeg: mux the dub back onto the video (stream copied); write SRTs
+tim│     and embed them — soft (default) or burned in (--subtitles-mode burn)
    ▼
 output/
+  ├─ video_dubbed.mp4        # dub audio + soft subtitle track (default)
+  ├─ video_burned.mp4        # with --subtitles-mode burn (re-encoded)
+  ├─ subs_source.srt         # still written as sidecars
   ├─ video_dubbed.mp4
   ├─ subs_source.srt
   ├─ subs_target.srt
@@ -1651,7 +1657,7 @@ people (D13).
 | Translation | `openai` client → any OpenAI-compatible base URL | local server or cloud; chunked, with a JSON-repair pass |
 | TTS | `qwen-tts` (Qwen3TTSModel, **Base** required) | cloning plus the two-stage blend. `flash-attn` is irrelevant here — see §0 |
 | Timing | `rubberband` → `sox` → `librosa` | three interchangeable backends, auto-detected; stretches clamped to ±15–18% |
-| Loudness | `pyloudnorm` (EBU R128) + a numpy limiter | `match-source` by default |
+| Loudness | `pyloudnorm` (EBU R128) + a numpy limiter | `match-source; soft subtitle track muxed by default (`mov_text` in MP4), or burned in with `--subtitles-mode burn` (re-encodes the video). Other-language subtitle tracks are preserv
 | Mix | numpy ducking | 6 dB under dialogue, 150 ms ramps |
 | Room matching | numpy FFT convolution + a synthetic impulse response | `--room match`: room-tone floor and a 3 dB duck, plus an RT60 measured from the speech stem (clamped to 0.2–3.0 s). The reverb tail is opt-in (`--room-wet-db`, default `0` = none). No new dependency |
 | Quality gate | `audit_qc.py` over `pipeline/audit.py` | sync / truncation / loudness / timbre thresholds; exit 0/1, never blocks the dub |
@@ -1731,6 +1737,7 @@ devices: null                    # list to spread blend+synthesis over (--device
 dtype: auto                      # auto | bf16 | fp16 | fp32
 whisper_model: large-v3
 llm_model: null                  # overrides LLM_MODEL for this run
+subtitles_mode: soft             # soft (default) | burn | off
 tts_batch: 8                     # line-count ceiling on a synthesis batch
 keep_subtitles: true
 output_dir: output/

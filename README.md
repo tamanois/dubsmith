@@ -19,7 +19,7 @@ voice — with a native accent when possible.
 | **Speakers** | One or several: detected automatically, each cloned from their own voice (`--diarizer none` forces one) |
 | **Languages** | Source auto-detected; target: English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
 | **Voice** | Cloned from the source speaker, with a generated native accent by default. Saved voice prints can be designed or cloned once and reused by name |
-| **Output** | Dubbed video/audio + source and translated SRT subtitles, original music/ambience preserved |
+| **Output** | Dubbed video/audio + source and translated SRT subtitles. The target subtitles are embedded in the video as a switchable track by default (other languages kept), or burned in with `--subtitles-mode burn`. Original music/ambience preserved |
 | **Not included** | Lip sync (P4), multi-language source videos (P5) |
 
 ---
@@ -99,10 +99,23 @@ optional models, `MODELS_DIR` — see [docs/setup.md](docs/setup.md).
 **Dub a video or audio file**
 
 ```bash
-python dub.py --video talk.mp4 --target fr          # dubbed video + subtitles
+python dub.py --video talk.mp4 --target fr          # dubbed video + embedded soft subtitles
 python dub.py --audio interview.wav --target es     # audio only, no ffmpeg
 python dub.py --video talk.mp4 --source en --target de
+python dub.py --video talk.mp4 --target fr --subtitles-mode burn   # burn text into frames
 ```
+
+**Add subtitles without dubbing**
+
+```bash
+python dub.py subtitles --video talk.mp4 --target fr
+python dub.py subtitles --video talk.mp4 --target fr --subtitles-mode burn
+python dub.py subtitles --audio interview.wav --target es            # SRT only
+```
+
+A subtitles-only run recognises speech, translates it, writes `subs_target.srt`,
+and embeds it in the video. Existing subtitle tracks in other languages are kept;
+a track already in the target language is replaced. No TTS model is loaded.
 
 **Choose the voice**
 

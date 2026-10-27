@@ -23,14 +23,20 @@ from .errors import DependencyError, MediaError
 __all__ = [
     "MediaInfo",
     "LoudnessResult",
+    "SubtitleStream",
     "require_binary",
     "run_command",
     "probe",
+    "probe_subtitle_streams",
     "extract_audio",
     "load_audio",
     "write_audio",
     "resample",
     "mux_audio",
+    "add_subtitle_track",
+    "burn_subtitles",
+    "language_tag",
+    "language_code_for_metadata",
     "measure_loudness",
     "normalize_loudness",
     "normalize_loudness_detailed",
@@ -110,6 +116,15 @@ class MediaInfo:
 
 
 @dataclass(frozen=True)
+class SubtitleStream:
+    """One subtitle stream in a container and the language it declares."""
+
+    #: Absolute stream index, which is what ffmpeg ``-map 0:<index>`` expects.
+    index: int
+    language: str | None = None
+
+
+@dataclass(frozen=True)
 class LoudnessResult:
     """Outcome of a loudness normalisation pass.
 
@@ -162,6 +177,125 @@ def probe(path: Path | str) -> MediaInfo:
         sample_rate=int(audio["sample_rate"]) if audio and audio.get("sample_rate") else None,
         channels=int(audio["channels"]) if audio and audio.get("channels") else None,
     )
+
+
+#: ISO-639-1 codes plus the ISO-639-2/B and English spellings ffmpeg and ffprobe
+#: commonly report, mapped to the two-letter tag we compare and write.
+_LANGUAGE_TAGS: dict[str, str] = {
+    "zh": "zh", "chi": "zh", "zho": "zh", "chinese": "zh",
+    "en": "en", "eng": "en", "english": "en",
+    "de": "de", "deu": "de", "ger": "de", "german": "de",
+    "it": "it", "ita": "it", "italian": "it",
+    "pt": "pt", "por": "pt", "portuguese": "pt",
+    "es": "es", "spa": "es", "spanish": "es",
+    "ja": "ja", "jpn": "ja", "japanese": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko",
+    "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+    "ru": "ru", "rus": "ru", "russian": "ru",
+}
+
+
+def language_tag(value: str | None) -> str | None:
+    """Normalise a subtitle language tag to an ISO-639-1 code when possible.
+
+    ``fra``/``fre``/``French`` all become ``fr`` so comparing a container's
+    tags against the job's target language does not depend on which spelling the
+    muxer happened to use. Unknown tags are shortened to their first two letters.
+    """
+    if not value:
+        return None
+    key = str(value).strip().lower()
+    if not key:
+        return None
+    return _LANGUAGE_TAGS.get(key, key[:2] if len(key) >= 2 else key)
+
+
+#: ISO-639-1 -> ISO-639-2/B. MP4's ``mov_text`` stores the three-letter form;
+#: writing ``en`` is accepted by ffmpeg but silently leaves the track untagged.
+_LANGUAGE_TAGS_3: dict[str, str] = {
+    "zh": "chi", "en": "eng", "de": "ger", "it": "ita", "pt": "por",
+    "es": "spa", "ja": "jpn", "ko": "kor", "fr": "fra", "ru": "rus",
+}
+
+
+def language_code_for_metadata(value: str | None) -> str | None:
+    """The three-letter language code a muxed subtitle track should carry."""
+    tag = language_tag(value)
+    if tag is None:
+        return None
+    return _LANGUAGE_TAGS_3.get(tag, tag)
+
+
+def probe_subtitle_streams(path: Path | str) -> list[SubtitleStream]:
+    """Return the subtitle streams of ``path`` and their declared languages.
+
+    Stream indices are the container's absolute indices, matching what ffmpeg's
+    ``-map 0:<index>`` and ``-map -0:<index>`` expect.
+    """
+    require_binary("ffprobe", hint="Install ffmpeg (it ships ffprobe).")
+    output = run_command(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(path)]
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:  # pragma: no cover - malformed ffprobe output
+        raise MediaError(f"Could not parse ffprobe output for {path}") from exc
+
+    streams: list[SubtitleStream] = []
+    for stream in payload.get("streams", []):
+        if stream.get("codec_type") != "subtitle":
+            continue
+        try:
+            index = int(stream["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        tags = stream.get("tags") or {}
+        streams.append(SubtitleStream(index=index, language=tags.get("language")))
+    return streams
+
+
+def _build_subtitle_map_args(
+    existing: Sequence[SubtitleStream],
+    language: str | None,
+    *,
+    replace: bool = True,
+) -> tuple[list[str], int]:
+    """ffmpeg ``-map`` arguments that keep every subtitle except the target's.
+
+    Returns the arguments and how many preserved subtitle streams precede the
+    newly added one — the index its ``-metadata:s:s:N`` and ``-c:s:N`` options
+    need.
+
+    Args:
+        existing: The input's subtitle streams, as probed.
+        language: The language of the track being added.
+        replace: When true, drop an existing stream already tagged with
+            ``language`` so the new one replaces it instead of duplicating it.
+
+    Returns:
+        ``(args, preserved)`` where ``args`` maps all subtitle streams and
+        removes the target-language ones, and ``preserved`` counts what remains.
+    """
+    args = ["-map", "0:s?"]
+    target = language_tag(language) if replace else None
+    preserved = 0
+    for stream in existing:
+        if target is not None and language_tag(stream.language) == target:
+            args.extend(["-map", f"-0:{stream.index}"])
+        else:
+            preserved += 1
+    return args, preserved
+
+
+def _escape_filter_path(path: Path | str) -> str:
+    """Quote a path for ffmpeg's ``subtitles=filename=`` filter option."""
+    text = (
+        str(path)
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace(":", "\\:")
+    )
+    return f"'{text}'"
 
 
 def extract_audio(
@@ -228,27 +362,144 @@ def resample(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     )
 
 
-def mux_audio(video: Path | str, audio: Path | str, out: Path | str) -> Path:
+def mux_audio(
+    video: Path | str,
+    audio: Path | str,
+    out: Path | str,
+    *,
+    subtitle_srt: Path | str | None = None,
+    subtitle_language: str | None = None,
+    replace_subtitle_language: bool = True,
+) -> Path:
     """Replace the video's audio track, copying the video stream untouched.
 
     ``-shortest`` prevents an audio track longer than the video from extending
     the container, and the ``-map`` flags avoid accidentally carrying over the
-    original audio or subtitle streams.
+    original audio. When ``subtitle_srt`` is given, that track is added to the
+    result (replacing an existing stream in the same language); subtitle streams
+    in other languages are preserved.
     """
     require_binary("ffmpeg", hint="Install ffmpeg.")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    subtitle_args: list[str] = []
+    new_index = 0
+    command = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(video),
+        "-i", str(audio),
+    ]
+    if subtitle_srt is not None:
+        command.extend(["-i", str(subtitle_srt)])
+        existing = probe_subtitle_streams(video)
+        subtitle_args, new_index = _build_subtitle_map_args(
+            existing, subtitle_language, replace=replace_subtitle_language
+        )
+    else:
+        # Preserve whatever subtitle tracks the source already carries, even when
+        # no new one is being added: dropping another language would silently
+        # remove information the viewer may still want.
+        subtitle_args = ["-map", "0:s?"]
+
+    command.extend([
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        *subtitle_args,
+    ])
+    if subtitle_srt is not None:
+        command.extend(["-map", "2:s:0"])
+    command.extend([
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        # mov_text is the only subtitle codec MP4 carries. Existing tracks in
+        # other languages are converted rather than dropped, so a source that
+        # used SubRip or ASS still keeps its extra languages.
+        "-c:s", "mov_text",
+    ])
+    if subtitle_srt is not None:
+        tag = language_code_for_metadata(subtitle_language)
+        if tag:
+            command.extend([f"-metadata:s:s:{new_index}", f"language={tag}"])
+    command.extend(["-shortest", str(out)])
+    run_command(command)
+    return out
+
+
+def add_subtitle_track(
+    video: Path | str,
+    subtitle_srt: Path | str,
+    out: Path | str,
+    *,
+    language: str | None = None,
+    replace: bool = True,
+) -> Path:
+    """Embed an SRT as a soft, toggleable subtitle track.
+
+    Every input stream is copied: the video, the original audio, and any
+    subtitle streams in other languages. An existing stream already tagged with
+    ``language`` is dropped and replaced, so re-running does not stack duplicate
+    tracks.
+    """
+    require_binary("ffmpeg", hint="Install ffmpeg.")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    existing = probe_subtitle_streams(video)
+    subtitle_args, new_index = _build_subtitle_map_args(
+        existing, language, replace=replace
+    )
+    command = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(video),
+        "-i", str(subtitle_srt),
+        "-map", "0:v?",
+        "-map", "0:a?",
+        *subtitle_args,
+        "-map", "1:s:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-c:s", "mov_text",
+    ]
+    tag = language_code_for_metadata(language)
+    if tag:
+        command.extend([f"-metadata:s:s:{new_index}", f"language={tag}"])
+    command.append(str(out))
+    run_command(command)
+    return out
+
+
+def burn_subtitles(
+    video: Path | str,
+    subtitle_srt: Path | str,
+    out: Path | str,
+    *,
+    language: str | None = None,
+) -> Path:
+    """Render subtitles into the video frames, re-encoding the video.
+
+    The audio and any non-target subtitle streams are copied. An existing
+    subtitle stream already tagged with ``language`` is dropped, because its text
+    is now part of the picture; streams in other languages stay toggleable.
+    """
+    require_binary("ffmpeg", hint="Install ffmpeg.")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    existing = probe_subtitle_streams(video)
+    subtitle_args, _ = _build_subtitle_map_args(existing, language, replace=True)
     run_command(
         [
             "ffmpeg", "-nostdin", "-y",
             "-i", str(video),
-            "-i", str(audio),
+            "-i", str(subtitle_srt),
             "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-shortest",
+            "-map", "0:a?",
+            *subtitle_args,
+            "-vf", f"subtitles=filename={_escape_filter_path(subtitle_srt)}",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-c:s", "mov_text",
             str(out),
         ]
     )

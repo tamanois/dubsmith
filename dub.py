@@ -35,6 +35,7 @@ from pipeline.config import (
     SUPPORTED_LANGUAGES,
     JobConfig,
     Settings,
+    SubtitleJobConfig,
     available_accelerators,
     normalize_language,
     pick_dtype,
@@ -56,6 +57,7 @@ from pipeline.models import (
     resolve_model,
 )
 from pipeline.orchestrate import Pipeline
+from pipeline.subtitle_pipeline import SubtitlesPipeline
 
 _PROG = "dub.py"
 _STOP = 0
@@ -780,6 +782,18 @@ def build_dub_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--subtitles-mode",
+        dest="subtitles_mode",
+        default="soft",
+        choices=["soft", "burn", "off"],
+        help=(
+            "Embed the target subtitles in the video: 'soft' (default) muxes a "
+            "toggleable track and copies every other stream; 'burn' draws them "
+            "into the frames (re-encodes the video); 'off' writes the SRT files "
+            "only."
+        ),
+    )
+    parser.add_argument(
         "--no-subtitles", action="store_true", help="Skip writing SRT files."
     )
     parser.add_argument("--force", action="store_true", help="Ignore cached stages.")
@@ -823,6 +837,87 @@ def build_dub_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+
+
+def build_subtitles_parser() -> argparse.ArgumentParser:
+    """Parser for the ``subtitles`` subcommand (independent of dubbing)."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_PROG} subtitles",
+        description=(
+            "Add target-language subtitles to a video (or transcribe an audio "
+            "file) without dubbing it. The subtitles are embedded softly by "
+            "default; other subtitle languages already in the video are kept."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--video", type=Path, help="Input video file.")
+    source.add_argument("--audio", type=Path, help="Input audio file (SRT only).")
+
+    parser.add_argument(
+        "--target",
+        dest="target_language",
+        default="fr",
+        help=f"Subtitle language ({', '.join(sorted(SUPPORTED_LANGUAGES))}).",
+    )
+    parser.add_argument(
+        "--source",
+        dest="source_language",
+        default=None,
+        help="Source language; omit to auto-detect.",
+    )
+    parser.add_argument(
+        "--subtitles-mode",
+        dest="subtitles_mode",
+        default="soft",
+        choices=["soft", "burn", "off"],
+        help=(
+            "'soft' (default) muxes a toggleable subtitle track; 'burn' draws "
+            "the text into the frames (re-encodes the video); 'off' writes the "
+            "SRT file only."
+        ),
+    )
+    parser.add_argument(
+        "--max-chars",
+        dest="max_chars",
+        type=int,
+        default=42,
+        help="Longest a cue's text may be before it is split.",
+    )
+    parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
+    parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
+    parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
+    parser.add_argument("--device", default="auto", help="auto, cuda:0, mps, or cpu.")
+    parser.add_argument("--force", action="store_true", help="Ignore the cached transcript.")
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        type=Path,
+        default=None,
+        help=(
+            "Also write the run log to this file, appended to across runs. "
+            "Defaults to <job folder>/run.log; LOG_FILE sets the same default."
+        ),
+    )
+    parser.add_argument(
+        "--no-log-file",
+        dest="log_file",
+        action="store_false",
+        help="Log to stderr only, writing no file.",
+    )
+    parser.add_argument(
+        "--log-max-bytes",
+        dest="log_max_bytes",
+        type=int,
+        default=DEFAULT_MAX_LOG_BYTES,
+        help=(
+            "Roll the log file aside to a timestamped name once it reaches this "
+            "many bytes, so it cannot grow without bound; 0 keeps one file "
+            "forever."
+        ),
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
+    return parser
 
 
 def build_info_parser() -> argparse.ArgumentParser:
@@ -1424,6 +1519,7 @@ def job_config_from_args(
         length_budget=args.length_budget,
         budget_speedup=args.budget_speedup,
         keep_subtitles=not args.no_subtitles,
+        subtitles_mode="off" if args.no_subtitles else args.subtitles_mode,
         force=args.force,
     )
 
@@ -1445,6 +1541,36 @@ def log_file_from(
     if settings.log_file is not None:
         return settings.log_file
     return job.job_dir / _LOG_NAME
+
+
+def cmd_subtitles(argv: Sequence[str]) -> int:
+    """Handle the subtitles-only command."""
+    args = build_subtitles_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    job = SubtitleJobConfig(
+        video=args.video,
+        audio=args.audio,
+        target_language=normalize_language(args.target_language),
+        source_language=args.source_language,
+        whisper_model=args.whisper_model,
+        llm_model=args.llm_model,
+        device=args.device,
+        output_dir=args.output_dir,
+        subtitles_mode=args.subtitles_mode,
+        max_chars=args.max_chars,
+        force=args.force,
+    )
+    setup_logging(
+        "DEBUG" if args.verbose else settings.log_level,
+        settings.log_json,
+        log_file=log_file_from(args, settings, job),
+        max_bytes=args.log_max_bytes,
+    )
+
+    result = SubtitlesPipeline(job, settings).run()
+    print()
+    print(result.summary())
+    return _STOP
 
 
 def cmd_dub(argv: Sequence[str]) -> int:
@@ -1485,6 +1611,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = args[1:]
     elif args and args[0] == "info":
         handler = cmd_info
+        payload = args[1:]
+    elif args and args[0] == "subtitles":
+        handler = cmd_subtitles
         payload = args[1:]
     else:
         handler = cmd_dub

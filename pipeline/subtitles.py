@@ -9,8 +9,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
-__all__ = ["Cue", "format_timestamp", "build_srt", "write_srt", "clean_text"]
+__all__ = [
+    "Cue",
+    "format_timestamp",
+    "build_srt",
+    "write_srt",
+    "clean_text",
+    "split_cue_text",
+    "cues_from_segments",
+]
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -81,3 +90,102 @@ def write_srt(cues: list[Cue], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_srt(cues), encoding="utf-8")
     return path
+
+
+def split_cue_text(text: str, *, max_chars: int = 42) -> list[str]:
+    """Split one line into subtitle-sized chunks, preferring word boundaries.
+
+    A chunk never exceeds ``max_chars`` unless a single word is longer than that
+    limit, in which case the word is returned as its own chunk rather than cut.
+    Whitespace-only input yields no chunks, so the caller can skip the cue.
+    """
+    cleaned = clean_text(text)
+    if not cleaned:
+        return []
+    if max_chars <= 0:
+        return [cleaned]
+
+    chunks: list[str] = []
+    current = ""
+    for word in cleaned.split(" "):
+        if not word:
+            continue
+        candidate = f"{current} {word}" if current else word
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_span(
+    start: float, end: float, weights: Sequence[float]
+) -> list[tuple[float, float]]:
+    """Divide ``[start, end]`` into contiguous spans proportional to ``weights``.
+
+    Kept private and dependency-free so ``subtitles.py`` stays pure. The last
+    span always ends exactly at ``end``, so rounding cannot leave a gap.
+    """
+    span = max(0.0, float(end) - float(start))
+    if not weights:
+        return []
+    total = float(sum(weights))
+    if total <= 0.0:
+        weights = [1.0 for _ in weights]
+        total = float(len(weights))
+
+    spans: list[tuple[float, float]] = []
+    cursor = float(start)
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            stop = float(end)
+        else:
+            stop = cursor + span * (float(weight) / total)
+        stop = max(cursor, min(float(end), stop))
+        spans.append((cursor, stop))
+        cursor = stop
+    return spans
+
+
+def cues_from_segments(
+    segments: Sequence[Any],
+    texts: Mapping[int, str] | None = None,
+    *,
+    max_chars: int = 42,
+) -> list[Cue]:
+    """Build cues from ASR segments, splitting long lines into readable chunks.
+
+    Args:
+        segments: Objects exposing ``id``, ``start``, ``end`` and ``text`` —
+            normally :class:`pipeline.asr.Segment`.
+        texts: Optional replacement text keyed by segment id, e.g. the
+            translation. Missing ids fall back to the segment's own text.
+        max_chars: Longest a cue's text may be before it is split.
+
+    Returns:
+        Cues in timeline order. Each segment's span is shared between its chunks
+        in proportion to their word counts, so a split never leaves the original
+        utterance.
+    """
+    cues: list[Cue] = []
+    for segment in segments:
+        start = float(getattr(segment, "start", 0.0))
+        end = float(getattr(segment, "end", start))
+        identifier = int(getattr(segment, "id", 0))
+        text = (
+            texts.get(identifier, getattr(segment, "text", ""))
+            if texts is not None
+            else getattr(segment, "text", "")
+        )
+        chunks = split_cue_text(text, max_chars=max_chars)
+        if not chunks:
+            continue
+        weights = [max(1, len(chunk.split())) for chunk in chunks]
+        for chunk, (chunk_start, chunk_end) in zip(
+            chunks, _split_span(start, end, weights)
+        ):
+            cues.append(Cue(chunk_start, chunk_end, chunk))
+    return cues

@@ -1318,7 +1318,16 @@ class TestVideoJob:
 
         monkeypatch.setattr(media, "extract_audio", fake_extract)
 
-        def fake_mux(video_path: Path | str, audio: Path | str, out: Path | str) -> Path:
+        mux_calls: list[dict[str, Any]] = []
+
+        def fake_mux(
+            video_path: Path | str,
+            audio: Path | str,
+            out: Path | str,
+            **kwargs: Any,
+        ) -> Path:
+            mux_calls.append({"video": Path(video_path), "audio": Path(audio), "out": Path(out), **kwargs})
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
             Path(out).write_bytes(b"muxed")
             return Path(out)
 
@@ -1333,13 +1342,49 @@ class TestVideoJob:
             tts_engine=FakeTTSEngine(),
             stretcher=IdentityStretcher(),
         )
-        return pipeline
+        return pipeline, mux_calls
 
-    def test_video_input_produces_a_dubbed_video(self, video_job: Pipeline) -> None:
-        result = video_job.run()
+    def test_video_input_produces_a_dubbed_video(self, video_job: tuple[Pipeline, list[dict[str, Any]]]) -> None:
+        pipeline, _ = video_job
+        result = pipeline.run()
         assert result.dubbed_video is not None
         assert result.dubbed_video.exists()
         assert result.report["is_video"] is True
+
+    def test_soft_subtitles_are_embedded_by_default(
+        self, video_job: tuple[Pipeline, list[dict[str, Any]]]
+    ) -> None:
+        pipeline, mux_calls = video_job
+        result = pipeline.run()
+        assert result.target_srt is not None
+        assert mux_calls[-1]["subtitle_srt"] == result.target_srt
+        assert mux_calls[-1]["subtitle_language"] == "French"
+
+    def test_burn_mode_produces_a_burned_video(
+        self, video_job: tuple[Pipeline, list[dict[str, Any]]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pipeline, _ = video_job
+        pipeline.job.subtitles_mode = "burn"
+        burned: list[dict[str, Any]] = []
+
+        def fake_burn(video: Path | str, srt: Path | str, out: Path | str, **kwargs: Any) -> Path:
+            burned.append({"video": Path(video), "srt": Path(srt), "out": Path(out), **kwargs})
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+            Path(out).write_bytes(b"burned")
+            return Path(out)
+
+        monkeypatch.setattr(media, "burn_subtitles", fake_burn)
+        result = pipeline.run()
+        assert result.burned_video is not None and result.burned_video.exists()
+        assert burned[-1]["language"] == "French"
+
+    def test_off_mode_does_not_embed(
+        self, video_job: tuple[Pipeline, list[dict[str, Any]]]
+    ) -> None:
+        pipeline, mux_calls = video_job
+        pipeline.job.subtitles_mode = "off"
+        pipeline.run()
+        assert mux_calls[-1]["subtitle_srt"] is None
 
     def test_video_without_audio_stream_is_rejected(
         self, tmp_path: Path, simple_transcript: Transcript, monkeypatch: pytest.MonkeyPatch

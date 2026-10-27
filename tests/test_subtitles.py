@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.subtitles import Cue, build_srt, clean_text, format_timestamp, write_srt
+from pipeline.asr import Segment
+from pipeline.subtitles import (
+    Cue,
+    build_srt,
+    clean_text,
+    cues_from_segments,
+    format_timestamp,
+    split_cue_text,
+    write_srt,
+)
 
 
 class TestFormatTimestamp:
@@ -86,3 +95,40 @@ class TestWriteSrt:
         target = tmp_path / "fr.srt"
         write_srt([Cue(0, 1, "voilà, c'est écrit")], target)
         assert "voilà" in target.read_text(encoding="utf-8")
+
+
+class TestSplitCueText:
+    def test_splits_on_word_boundaries(self) -> None:
+        assert split_cue_text("one two three four five", max_chars=9) == [
+            "one two",
+            "three",
+            "four five",
+        ]
+
+    def test_empty_text_yields_no_chunks(self) -> None:
+        assert split_cue_text("   ") == []
+
+    def test_a_single_long_word_is_not_cut(self) -> None:
+        assert split_cue_text("supercalifragilistic", max_chars=5) == [
+            "supercalifragilistic"
+        ]
+
+
+class TestCuesFromSegments:
+    def test_long_segment_is_split_inside_its_span(self) -> None:
+        segment = Segment(id=0, start=0.0, end=6.0, text="one two three four five six")
+        cues = cues_from_segments([segment], max_chars=10)
+
+        assert len(cues) == 3
+        assert cues[0].start == pytest.approx(0.0)
+        assert cues[-1].end == pytest.approx(6.0)
+        assert all(cue.start <= cue.end for cue in cues)
+
+    def test_replacement_text_is_used(self) -> None:
+        segment = Segment(id=7, start=0.0, end=2.0, text="hello")
+        cues = cues_from_segments([segment], {7: "bonjour"})
+        assert [cue.text for cue in cues] == ["bonjour"]
+
+    def test_empty_translation_produces_no_cue(self) -> None:
+        segment = Segment(id=1, start=0.0, end=2.0, text="hello")
+        assert cues_from_segments([segment], {1: "   "}) == []

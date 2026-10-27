@@ -27,6 +27,7 @@ __all__ = [
     "Translator",
     "OpenAICompatTranslator",
     "build_messages",
+    "build_subtitle_messages",
     "build_shorten_messages",
     "extract_json_object",
     "chunked",
@@ -193,6 +194,60 @@ def build_messages(
     if context:
         joined = "\n".join(f"- {line}" for line in context)
         parts.append(f"Earlier lines for context (already translated, do not repeat):\n{joined}")
+    parts.append("Lines to translate:")
+    parts.extend(_render_line(request) for request in requests)
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+
+SUBTITLE_SYSTEM_PROMPT = """You are a professional subtitle translator.
+
+Translate each numbered line into {target}. {source_clause}
+
+Rules:
+1. Reply with ONLY a JSON object of the form \
+{{"translations":[{{"id":<int>,"text":"<translation>"}}]}}.
+2. Include every requested id exactly once, in the same order. Never invent ids.
+3. Translate each id separately: do not merge or split lines.
+4. Write concise, readable subtitles in natural written {target}. Prefer short \
+sentences and cut padding; a viewer reads faster than a listener hears, but a \
+line that is too long still cannot be read in time.
+5. Keep proper nouns, numbers, units, and acronyms unchanged.
+6. Never add notes, explanations, transliterations, or the untranslated source.
+"""
+
+
+def build_subtitle_messages(
+    requests: Sequence[TranslationRequest],
+    *,
+    source_language: str | None,
+    target_language: str,
+    context: Sequence[str] = (),
+) -> list[dict[str, str]]:
+    """Build the chat messages for one subtitle translation batch.
+
+    Deliberately separate from :func:`build_messages`: the dubbing prompt sizes
+    every line from a measured speaking rate, while a subtitle is constrained by
+    reading speed and by line breaks rather than by a time slot. The transport,
+    chunking and JSON repair are shared.
+    """
+    source_clause = (
+        f"The source language is {source_language}." if source_language else
+        "Detect the source language from the lines themselves."
+    )
+    system = SUBTITLE_SYSTEM_PROMPT.format(
+        target=target_language,
+        source_clause=source_clause,
+    )
+
+    parts: list[str] = []
+    if context:
+        joined = "\n".join(f"- {line}" for line in context)
+        parts.append(
+            f"Earlier lines for context (already translated, do not repeat):\n{joined}"
+        )
     parts.append("Lines to translate:")
     parts.extend(_render_line(request) for request in requests)
     return [
@@ -392,6 +447,37 @@ class OpenAICompatTranslator:
             )
             batch_result = self._translate_batch(batch, messages)
             results.update(batch_result)
+            context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
+
+        return results
+
+    def translate_subtitles(
+        self,
+        requests: Sequence[TranslationRequest],
+        *,
+        source_language: str | None,
+        target_language: str,
+    ) -> dict[int, str]:
+        """Translate subtitle lines with reading-oriented instructions.
+
+        Same transport and validation as :meth:`translate`, but the prompt does
+        not impose a per-line spoken-length ceiling.
+        """
+        if not requests:
+            return {}
+
+        source_name = language_name_for_code(source_language) if source_language else None
+        results: dict[int, str] = {}
+        context: list[str] = []
+
+        for batch in chunked(list(requests), self.chunk_size):
+            messages = build_subtitle_messages(
+                batch,
+                source_language=source_name,
+                target_language=target_language,
+                context=context,
+            )
+            results.update(self._run_batch({r.id for r in batch}, messages))
             context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
 
         return results

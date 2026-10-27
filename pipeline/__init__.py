@@ -16,6 +16,7 @@ Module map:
     voices      -- saved, labeled voice prints (design + clone library)
     timing      -- time-stretching and timeline placement
     orchestrate -- stage runner tying everything together
+    subtitle_pipeline -- subtitles-only pipeline (ASR -> SRT -> video)
 """
 
 from __future__ import annotations

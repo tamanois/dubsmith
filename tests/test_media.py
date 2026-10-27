@@ -332,3 +332,92 @@ class TestMovingAverage:
     def test_single_sample_window_is_identity(self) -> None:
         values = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         assert np.allclose(media.moving_average(values, 1), values)
+
+
+class TestSubtitleStreams:
+    def test_language_tag_normalises_common_spellings(self) -> None:
+        assert media.language_tag("fra") == "fr"
+        assert media.language_tag("French") == "fr"
+        assert media.language_tag("ENG") == "en"
+        assert media.language_tag(None) is None
+
+    def test_metadata_code_uses_the_three_letter_form(self) -> None:
+        # mov_text silently drops a track's language when handed "en".
+        assert media.language_code_for_metadata("French") == "fra"
+        assert media.language_code_for_metadata("English") == "eng"
+        assert media.language_code_for_metadata(None) is None
+
+    def test_probe_reads_only_subtitle_streams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "streams": [
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "subtitle", "tags": {"language": "eng"}},
+                {"index": 3, "codec_type": "subtitle"},
+            ]
+        }
+        monkeypatch.setattr(media, "require_binary", lambda *a, **k: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media, "run_command", lambda *a, **k: json.dumps(payload))
+
+        streams = media.probe_subtitle_streams("movie.mp4")
+        assert [s.index for s in streams] == [2, 3]
+        assert streams[0].language == "eng"
+        assert streams[1].language is None
+
+    def test_map_args_drop_only_the_target_language(self) -> None:
+        existing = [
+            media.SubtitleStream(2, "eng"),
+            media.SubtitleStream(3, "fra"),
+            media.SubtitleStream(4, None),
+        ]
+        args, preserved = media._build_subtitle_map_args(existing, "French")
+        assert args == ["-map", "0:s?", "-map", "-0:3"]
+        assert preserved == 2
+
+    def test_add_subtitle_track_copies_and_tags_the_new_stream(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            media,
+            "probe_subtitle_streams",
+            lambda path: [media.SubtitleStream(2, "eng"), media.SubtitleStream(3, "fra")],
+        )
+        monkeypatch.setattr(media, "require_binary", lambda *a, **k: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(media, "run_command", lambda cmd, **k: captured.append(list(cmd)))
+
+        media.add_subtitle_track(
+            tmp_path / "in.mp4",
+            tmp_path / "subs.srt",
+            tmp_path / "out.mp4",
+            language="French",
+        )
+        command = captured[0]
+        assert command[command.index("-c:v") + 1] == "copy"
+        assert command[command.index("-c:s") + 1] == "mov_text"
+        assert "0:s?" in command and "1:s:0" in command
+        # One preserved non-target stream precedes ours, so ours is index 1.
+        assert "-c:s:1" not in command
+        assert "language=fra" in command
+        assert command[-1] == str(tmp_path / "out.mp4")
+
+    def test_burn_subtitles_reencodes_with_the_subtitles_filter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[list[str]] = []
+        monkeypatch.setattr(media, "probe_subtitle_streams", lambda path: [])
+        monkeypatch.setattr(media, "require_binary", lambda *a, **k: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(media, "run_command", lambda cmd, **k: captured.append(list(cmd)))
+
+        media.burn_subtitles(
+            tmp_path / "in.mp4",
+            tmp_path / "subs.srt",
+            tmp_path / "out.mp4",
+            language="French",
+        )
+        command = captured[0]
+        assert command[command.index("-c:v") + 1] == "libx264"
+        assert command[command.index("-c:a") + 1] == "copy"
+        assert "subtitles=filename=" in command[command.index("-vf") + 1]

@@ -103,12 +103,28 @@ Fixes a long translation by wording rather than by cutting audio.
 | Option | Default | What it achieves |
 |---|---|---|
 | `--output-dir DIR` | `output` | Where job folders are written. Each input gets its own `<stem>` folder. |
-| `--no-subtitles` | off | Skips both SRT files. |
+| `--subtitles-mode MODE` | `soft` | How the target subtitles reach the video: `soft` muxes a toggleable track and copies every other stream (other subtitle languages are kept), `burn` draws them into the frames and re-encodes the video, `off` writes the SRT files only. |
+| `--no-subtitles` | off | Skips both SRT files and implies `--subtitles-mode off`. |
 | `--force` | off | Ignores the stage cache and rebuilds everything. |
 | `--log-file PATH` | `<job folder>/run.log` | Where the run log is also written, alongside stderr. Created with its parent directory, appended to across runs (each one opens with a `Run started` line, so they stay separable), and stamped with the time so a line can be matched against `report.json` → `stage_seconds`. `LOG_FILE` sets the same default, which is why the log never invalidates a cached stage. |
 | `--log-max-bytes N` | `2097152` | Size at which the log is rotated. Once the file reaches it, it is renamed to `run-<YYYYmmdd-HHMMSS>.log` and a fresh one begins — at a run boundary, so a run is never split across two files. `0` keeps a single file forever. |
 | `--no-log-file` | off | Writes no log file at all — the escape hatch when a caller wants stderr alone. |
 | `-v` / `--verbose` | off | Debug logging, including which device each stage actually used. |
+
+## Subtitles only (`dub.py subtitles`)
+
+Subtitles are independent of dubbing: this command runs ASR and translation but
+never loads a TTS model. It accepts the same `--video`/`--audio`, `--target`,
+`--source`, `--output-dir`, `--device` and `--whisper-model` flags, plus:
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--subtitles-mode MODE` | `soft` | `soft` muxes a toggleable track; `burn` renders the text into the frames (re-encodes); `off` writes the SRT only. |
+| `--max-chars N` | `42` | Longest a cue's text may be before it is split. |
+| `--force` | off | Ignores the cached transcript and recognises again. |
+
+When the target language equals the detected source language, translation is
+skipped. Outputs live in `<output>/<stem>-subtitles/`.
 
 ---
 
