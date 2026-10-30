@@ -19,6 +19,15 @@ attempt yet.
 | `--accent-mode reference-accent requires --accent-audio` | Add the native-target clip, or use another mode |
 | `--accent-audio requires --accent-text` | Transcribe the accent clip; the codes cannot be aligned without it |
 | `does not support voice cloning` | Pointed at a CustomVoice/VoiceDesign checkpoint; use `tts_base` |
+| `--style-instruct is only valid with --backend customvoice` | That flag is the CustomVoice delivery instruction. Other backends take `--prosody`/`--emotion`, and `--design` already accepts a free-form prompt |
+| `--style-plan is only valid with --backend customvoice` | The LLM-written verbatim instruction is CustomVoice-only. Other backends use `--prosody-plan llm` for structured prosody |
+| `--style-plan-scope only applies with --style-plan llm` | Add `--style-plan llm`, or drop `--style-plan-scope` |
+| `fish-speech is not installed` | Create `.venv-fish` (see [Voices](voices.md#fish-speech-environment)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
+| `index-tts is not installed` | Create `.venv-indextts` (see [Voices](voices.md#indextts2-environment)) or set `INDEXTTS_PYTHON`; weights: `python dub.py models --download tts_index_tts2` |
+| `--emotion-audio` / `--duration is only valid with --backend indextts2` | Those controls are IndexTTS2-only; add `--backend indextts2` or remove the flag |
+| `--emotion-alpha requires --emotion-audio` | Add an emotion reference clip, or drop `--emotion-alpha` |
+| `Fish Speech S2-Pro needs about 24 GB of VRAM` | The 4.56 B model does not fit on a 12 GB card. Retry with `--device cpu` (slow) or use a larger GPU |
+| `A Fish emotion seems to have no effect` | Fish only has documented tags `[excited]`, `[angry]`, `[sad]`, `[whisper]`, `[laughing]`, `[pause]`; an unknown emotion is dropped with a warning. `pace`, `volume` and `breath` have no tag |
 | `Unsupported language 'xx'` | Use one of the ten supported languages |
 | `No saved voice named …` | List the library with `python dub.py voices --list`, or create the voice first |
 | CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it). On a multi-GPU box, `--device cuda:1` pins the run to the other card |
@@ -68,6 +77,43 @@ it passes `--log-max-bytes` (2 MiB by default) it is renamed to
 single run is never split. `--log-file PATH` puts the copy somewhere else,
 `--no-log-file` writes none, and `LOG_FILE` sets the default path. Set
 `LOG_JSON=1` for one JSON object per line, on the terminal and in the file alike.
+
+`dub.py say` accepts the same logging flags. Its log defaults to
+`output/say/<name>/say.log` for the expressive backends and
+`output/say/<name>.log` for Qwen, and records the backend, the resolved model, the
+prosody plan, per-line render times and a total.
+
+**Reading the timings.** A stage line looks like
+`Stage synthesize: done in 461.2s`. With `-v`, per-batch and per-task lines add
+their own `in 3.42s`, and the expressive backends report the checkpoint load
+separately from generation (`worker load 10.35s, generate 8.16s`). In JSON mode
+every timed record carries `seconds`, stage records also carry `stage`, and a
+completed dub repeats the same numbers in `report.json` → `stage_seconds`.
+Third-party HTTP and model loggers stay at WARNING even under `-v`, so the debug
+output is about this pipeline rather than its dependencies.
+
+**CosyVoice sounds like it has an English accent, or words are added/garbled.**
+A neutral line clones the reference's accent from its speech codes
+(`inference_zero_shot`). Prosody on a non-English line now pairs the instruction
+with the reference transcript (zero-shot, so the speech codes are kept), adds a
+closing language clause (`请用法语说这句话。`), uses Chinese volume wording
+instead of the English clause, and applies pace by time-stretching rather than as
+an instruction — each of those otherwise destabilises French. Give the voice a
+transcript (a saved voice has one; `--clone-text` sets one) and pass `--lang`;
+without a transcript the backend falls back to `inference_instruct2`, which is
+less stable.
+
+**A prosody value seems to have no effect.** CosyVoice only has trained emotion
+instructs for `happy`, `sad` and `angry`; `calm` deliberately adds no clause, and
+`excited` is mapped onto happy. Chatterbox has a single `exaggeration` scalar, so
+`emotion` only changes intensity, and `breath`/`pause`/`laughter` are dropped.
+CustomVoice renders `emotion`/`pace`/`volume` into one instruction sentence and
+drops `breath`/`pause`/`laughter`; pass `--style-instruct` to direct the delivery
+yourself, or `--style-plan llm` to have the model write that instruction.
+Pass `-v` to see the mode each CosyVoice line used (`zero_shot`,
+`cross_lingual`, `instruct2`), the exact instruction sent, and — with
+`--prosody-plan llm` or `--style-plan llm` — every LLM request and reply
+(including the whole-passage overview and each chunk).
 
 ---
 

@@ -418,6 +418,12 @@ class EmbeddingDiarizer:
         labels = cluster_speakers(
             embeddings, durations, threshold=self.threshold, min_seconds=self.min_seconds
         )
+        _LOGGER.info(
+            "Diarization: %d segment(s) -> %d speaker(s) (threshold=%.2f)",
+            len(segment_ids),
+            len({label for label in labels if label}),
+            self.threshold,
+        )
 
         resolved: dict[int, str] = {}
         previous = ""

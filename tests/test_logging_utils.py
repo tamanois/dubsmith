@@ -17,7 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.logging_utils import DEFAULT_MAX_LOG_BYTES, job_logger, setup_logging
+from pipeline.logging_utils import (
+    DEFAULT_MAX_LOG_BYTES,
+    job_logger,
+    setup_logging,
+    timed,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +185,58 @@ class TestLogFile:
 
         assert "Could not write the log file" in err
         assert "still logged" in err
+
+
+class TestTimed:
+    """The one helper every timed step uses, so it is worth pinning down."""
+
+    def test_it_logs_the_duration_and_the_fields(self, caplog) -> None:
+        logger = logging.getLogger("pipeline")
+
+        with caplog.at_level(logging.INFO, logger="pipeline"):
+            with timed(logger, "Did work", lines=3):
+                pass
+
+        record = caplog.records[-1]
+        assert record.getMessage().startswith("Did work in ")
+        assert record.seconds >= 0.0
+        assert record.lines == 3
+
+    def test_it_accepts_fields_discovered_inside_the_block(self, caplog) -> None:
+        logger = logging.getLogger("pipeline")
+
+        with caplog.at_level(logging.INFO, logger="pipeline"):
+            with timed(logger, "Did work") as context:
+                context["lines"] = 7
+
+        assert caplog.records[-1].lines == 7
+
+    def test_it_logs_a_failure_and_re_raises(self, caplog) -> None:
+        logger = logging.getLogger("pipeline")
+
+        with caplog.at_level(logging.INFO, logger="pipeline"):
+            with pytest.raises(RuntimeError, match="boom"):
+                with timed(logger, "Doomed"):
+                    raise RuntimeError("boom")
+
+        record = caplog.records[-1]
+        assert record.getMessage().startswith("Doomed failed after ")
+        assert record.seconds >= 0.0
+
+    def test_it_logs_at_the_level_it_is_given(self, caplog) -> None:
+        logger = logging.getLogger("pipeline")
+
+        with caplog.at_level(logging.DEBUG, logger="pipeline"):
+            with timed(logger, "Quiet step", level=logging.DEBUG):
+                pass
+
+        assert caplog.records[-1].levelno == logging.DEBUG
+
+    def test_verbose_does_not_enable_dependency_debug(self) -> None:
+        setup_logging(level="DEBUG")
+
+        assert logging.getLogger("urllib3").level == logging.WARNING
+        assert logging.getLogger("modelscope").level == logging.WARNING
 
 
 class TestRolling:

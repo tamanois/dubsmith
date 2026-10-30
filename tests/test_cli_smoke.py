@@ -22,6 +22,8 @@ from dub import (
     log_file_from,
     main,
     render_environment,
+    _parse_emotions,
+    _say_lines,
 )
 from pipeline import __version__
 from pipeline.config import JobConfig, Settings
@@ -308,9 +310,361 @@ def test_say_parser_accepts_an_inline_design() -> None:
     assert args.lang == "fr"
 
 
-def test_say_parser_requires_a_voice_source() -> None:
-    with pytest.raises(SystemExit):
-        build_say_parser().parse_args(["--text", "Bonjour"])
+def test_say_without_a_source_is_a_clear_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["say", "--text", "Bonjour"])
+
+    assert code == 1
+    assert "One of --voice, --design or --clone is required" in capsys.readouterr().err
+
+
+def test_say_parser_accepts_customvoice_speaker() -> None:
+    args = build_say_parser().parse_args(
+        ["--backend", "customvoice", "--speaker", "Vivian", "--lang", "en", "--text", "Hi"]
+    )
+
+    assert args.backend == "customvoice"
+    assert args.speaker == "Vivian"
+
+
+def test_say_parser_accepts_a_verbatim_style_instruction() -> None:
+    args = build_say_parser().parse_args(
+        [
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "Hi",
+            "--style-instruct",
+            "Speak with restrained anger.",
+            "--style-instruct",
+            "Speak calmly.",
+        ]
+    )
+
+    assert args.style_instructs == [
+        "Speak with restrained anger.",
+        "Speak calmly.",
+    ]
+
+
+def test_style_instruct_is_rejected_for_other_backends(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--style-instruct",
+            "Speak slowly.",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--style-instruct is only valid" in capsys.readouterr().err
+
+
+def test_style_instruct_must_match_the_line_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Vivian",
+            "--lang",
+            "en",
+            "--text",
+            "one\\ntwo",
+            "--style-instruct",
+            "a",
+            "--style-instruct",
+            "b",
+            "--style-instruct",
+            "c",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--style-instruct: 3 value(s) for 2 line(s)" in capsys.readouterr().err
+
+
+def test_style_instruct_overrides_prosody(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spoken: list[str] = []
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def speakers(self) -> list[str]:
+            return ["Ryan"]
+
+        def generate(
+            self, text: str, speaker: str, instruct: str, language: str
+        ) -> tuple[np.ndarray, int]:
+            spoken.append(instruct)
+            return np.zeros(240, dtype=np.float32), 24000
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.tts.CustomVoiceEngine", FakeEngine)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "Hi",
+            "--style-instruct",
+            "Speak like a robot.",
+            "--prosody",
+            "emotion=happy",
+        ]
+    )
+
+    assert code == 0
+    assert spoken == ["Speak like a robot."]
+    assert "--style-instruct overrides" in capsys.readouterr().err
+
+
+def test_say_parser_accepts_style_plan_flags() -> None:
+    args = build_say_parser().parse_args(
+        [
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "hi",
+            "--style-plan",
+            "llm",
+            "--style-plan-scope",
+            "whole",
+            "--plan-chunk",
+            "4",
+        ]
+    )
+
+    assert args.style_plan == "llm"
+    assert args.style_plan_scope == "whole"
+    assert args.plan_chunk == 4
+
+
+def test_style_plan_is_rejected_for_other_backends(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--style-plan",
+            "llm",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--style-plan is only valid" in capsys.readouterr().err
+
+
+def test_style_plan_scope_requires_style_plan(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "hi",
+            "--style-plan-scope",
+            "whole",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--style-plan-scope only applies" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("per-line", ["Direction for one", "Direction for two"]),
+        ("whole", ["Whole direction.", "Whole direction."]),
+    ],
+)
+def test_style_plan_writes_the_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+    expected: list[str],
+) -> None:
+    spoken: list[str] = []
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def speakers(self) -> list[str]:
+            return ["Ryan"]
+
+        def generate(
+            self, text: str, speaker: str, instruct: str, language: str
+        ) -> tuple[np.ndarray, int]:
+            spoken.append(instruct)
+            return np.zeros(240, dtype=np.float32), 24000
+
+    class FakePlanner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def plan_lines(self, texts, *, speaker=None, language=None):
+            return [f"Direction for {text}" for text in texts]
+
+        def plan_whole(self, texts, *, speaker=None, language=None):
+            return "Whole direction."
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.tts.CustomVoiceEngine", FakeEngine)
+    monkeypatch.setattr("pipeline.prosody.StylePlanner", FakePlanner)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "one\\ntwo",
+            "--style-plan",
+            "llm",
+            "--style-plan-scope",
+            scope,
+        ]
+    )
+
+    assert code == 0
+    assert spoken == expected
+
+
+def test_style_instruct_overrides_style_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spoken: list[str] = []
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def speakers(self) -> list[str]:
+            return ["Ryan"]
+
+        def generate(
+            self, text: str, speaker: str, instruct: str, language: str
+        ) -> tuple[np.ndarray, int]:
+            spoken.append(instruct)
+            return np.zeros(240, dtype=np.float32), 24000
+
+    class FakePlanner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def plan_lines(self, texts, **kwargs):
+            return ["Should not run." for _ in texts]
+
+        def plan_whole(self, texts, **kwargs):
+            return "Should not run."
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.tts.CustomVoiceEngine", FakeEngine)
+    monkeypatch.setattr("pipeline.prosody.StylePlanner", FakePlanner)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--backend",
+            "customvoice",
+            "--speaker",
+            "Ryan",
+            "--lang",
+            "en",
+            "--text",
+            "Hi",
+            "--style-instruct",
+            "Speak like a robot.",
+            "--style-plan",
+            "llm",
+        ]
+    )
+
+    assert code == 0
+    assert spoken == ["Speak like a robot."]
+    assert "--style-instruct overrides --style-plan" in capsys.readouterr().err
+
+
+def test_say_text_treats_a_literal_backslash_n_as_a_line_break() -> None:
+    assert _say_lines("one\\ntwo") == ["one", "two"]
+    assert _say_lines("one\ntwo") == ["one", "two"]
+    assert _say_lines("  one  \\n  two  ") == ["one", "two"]
+
+
+def test_customvoice_requires_a_speaker(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["say", "--backend", "customvoice", "--lang", "en", "--text", "hi"])
+
+    assert code == 1
+    assert "--speaker" in capsys.readouterr().err
+
+
+def test_speaker_is_rejected_for_other_backends(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["say", "--voice", "warm-fr", "--speaker", "Vivian", "--text", "hi"])
+
+    assert code == 1
+    assert "--speaker is only valid" in capsys.readouterr().err
 
 
 def test_say_parser_requires_text() -> None:
@@ -458,6 +812,137 @@ def test_dtype_is_normalised_in_the_config() -> None:
     assert JobConfig(audio="a.wav", dtype="BFloat16").dtype == "bf16"
 
 
+def test_say_parser_accepts_cosyvoice_backend_and_emotion() -> None:
+    args = build_say_parser().parse_args(
+        ["--voice", "x", "--text", "hi", "--backend", "cosyvoice", "--emotion", "calm"]
+    )
+
+    assert args.backend == "cosyvoice"
+    assert args.emotions == ["calm"]
+
+
+def test_say_parser_defaults_to_qwen() -> None:
+    args = build_say_parser().parse_args(["--voice", "x", "--text", "hi"])
+
+    assert args.backend == "qwen"
+    assert args.emotions is None
+    assert args.prosody is None
+    assert args.prosody_plan == "off"
+
+
+@pytest.mark.parametrize("backend", ["cosyvoice3", "chatterbox"])
+def test_say_parser_accepts_the_new_backends(backend: str) -> None:
+    args = build_say_parser().parse_args(
+        ["--voice", "x", "--text", "hi", "--backend", backend]
+    )
+
+    assert args.backend == backend
+
+
+def test_say_parser_accepts_logging_flags() -> None:
+    args = build_say_parser().parse_args(
+        ["--voice", "x", "--text", "hi", "-v", "--no-log-file"]
+    )
+
+    assert args.verbose is True
+    assert args.log_file is False
+
+
+def test_say_parser_accepts_prosody_and_plan() -> None:
+    args = build_say_parser().parse_args(
+        [
+            "--voice",
+            "x",
+            "--text",
+            "hi",
+            "--backend",
+            "cosyvoice3",
+            "--prosody",
+            "emotion=happy, pace=fast",
+            "--prosody",
+            "breath",
+            "--prosody-plan",
+            "llm",
+        ]
+    )
+
+    assert args.prosody == ["emotion=happy, pace=fast", "breath"]
+    assert args.prosody_plan == "llm"
+
+
+def test_say_qwen_rejects_prosody(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--prosody",
+            "emotion=happy",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert code == 1
+    assert "--prosody" in capsys.readouterr().err
+
+
+def test_parse_emotions_flattens_repeatable_and_comma_values() -> None:
+    assert _parse_emotions(["calm, excited"]) == ["calm", "excited"]
+    assert _parse_emotions(["calm", "excited"]) == ["calm", "excited"]
+    assert _parse_emotions(None) is None
+    assert _parse_emotions([]) is None
+    assert _parse_emotions(["  "]) is None
+
+
+def test_say_cosyvoice_rejects_design(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "say",
+            "--design",
+            "a voice",
+            "--text",
+            "hi",
+            "--lang",
+            "fr",
+            "--backend",
+            "cosyvoice",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert code == 1
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_say_qwen_rejects_emotion(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--emotion",
+            "calm",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert code == 1
+    assert "--emotion" in capsys.readouterr().err
+
+
 def test_an_unknown_dtype_is_rejected_in_the_config() -> None:
     with pytest.raises(ConfigError, match="Unknown dtype"):
         JobConfig(audio="a.wav", dtype="float8")
@@ -470,3 +955,371 @@ def test_dtype_is_part_of_the_fingerprint() -> None:
     base = JobConfig(audio="a.wav")
 
     assert base.fingerprint() != JobConfig(audio="a.wav", dtype="fp32").fingerprint()
+
+
+@pytest.mark.parametrize("backend", ["fish", "indextts2"])
+def test_say_parser_accepts_the_new_backends(backend: str) -> None:
+    args = build_say_parser().parse_args(
+        ["--voice", "x", "--text", "hi", "--backend", backend]
+    )
+
+    assert args.backend == backend
+
+
+def test_fish_sampling_flags_are_backend_only(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--fish-temperature",
+            "0.5",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--fish-temperature is only valid" in capsys.readouterr().err
+
+
+def test_duration_is_backend_only(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--duration",
+            "2.0",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--duration is only valid" in capsys.readouterr().err
+
+
+def test_emotion_alpha_requires_emotion_audio(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--backend",
+            "indextts2",
+            "--emotion-alpha",
+            "0.5",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--emotion-alpha requires --emotion-audio" in capsys.readouterr().err
+
+
+def test_fish_dispatch_renders_prosody(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFish:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def synthesize(
+            self,
+            lines,
+            *,
+            reference,
+            prosody=None,
+            ref_text=None,
+            language=None,
+        ):
+            captured["emotions"] = [spec.emotion for spec in prosody]
+            return [np.zeros(240, dtype=np.float32) for _ in lines]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.fish.FishEngine", FakeFish)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+    _saved_voice(tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+            "--backend",
+            "fish",
+            "--text",
+            "hi",
+            "--prosody",
+            "emotion=excited",
+        ]
+    )
+
+    assert code == 0
+    assert captured["emotions"] == ["excited"]
+
+
+def test_fish_tag_mode_is_backend_only(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--fish-tag-mode",
+            "keep",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "--fish-tag-mode is only valid" in capsys.readouterr().err
+
+
+def test_fish_keep_rejects_emotion_flags(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--backend",
+            "fish",
+            "--fish-tag-mode",
+            "keep",
+            "--emotion",
+            "sad",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "sends --text as written" in capsys.readouterr().err
+
+
+def test_fish_llm_rejects_a_prosody_plan(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi",
+            "--backend",
+            "fish",
+            "--fish-tag-mode",
+            "llm",
+            "--prosody-plan",
+            "llm",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "drop --prosody-plan" in capsys.readouterr().err
+
+
+def test_fish_keep_rejects_prompt_tokens(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--text",
+            "hi <|im_end|> there",
+            "--backend",
+            "fish",
+            "--fish-tag-mode",
+            "keep",
+            "--no-log-file",
+        ]
+    )
+
+    assert code == 1
+    assert "reserves for its own prompt" in capsys.readouterr().err
+
+
+def test_fish_keep_sends_the_tags_as_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFish:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def synthesize(
+            self,
+            lines,
+            *,
+            reference,
+            prosody=None,
+            ref_text=None,
+            language=None,
+            tag_mode="render",
+        ):
+            captured["lines"] = list(lines)
+            captured["mode"] = tag_mode
+            return [np.zeros(240, dtype=np.float32) for _ in lines]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.fish.FishEngine", FakeFish)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+    _saved_voice(tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+            "--backend",
+            "fish",
+            "--text",
+            "[excited] hi\\n[pause]\\nthere",
+            "--fish-tag-mode",
+            "keep",
+        ]
+    )
+
+    assert code == 0
+    assert captured["mode"] == "keep"
+    assert captured["lines"] == ["[excited] hi [pause]", "there"]
+
+
+def test_fish_llm_dispatch_lets_emotion_override_the_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePlanner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def plan_lines(self, lines, *, language=None):
+            return [f"[sad] {line}" for line in lines]
+
+    class FakeFish:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def synthesize(
+            self,
+            lines,
+            *,
+            reference,
+            prosody=None,
+            ref_text=None,
+            language=None,
+            tag_mode="render",
+        ):
+            captured["lines"] = list(lines)
+            captured["mode"] = tag_mode
+            return [np.zeros(240, dtype=np.float32) for _ in lines]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.prosody.FishInlinePlanner", FakePlanner)
+    monkeypatch.setattr("pipeline.fish.FishEngine", FakeFish)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+    _saved_voice(tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+            "--backend",
+            "fish",
+            "--text",
+            "one\\ntwo",
+            "--fish-tag-mode",
+            "llm",
+            "--emotion",
+            "angry",
+        ]
+    )
+
+    assert code == 0
+    assert captured["mode"] == "keep"
+    assert captured["lines"] == ["[angry] one", "[angry] two"]
+
+
+def test_indextts2_dispatch_passes_emotion_and_durations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeIndex:
+        sample_rate = 24000
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["emotion"] = kwargs.get("emotion_audio")
+            captured["alpha"] = kwargs.get("emotion_alpha")
+
+        def synthesize(self, lines, *, reference, language=None, durations=None):
+            captured["durations"] = list(durations or [])
+            return [np.zeros(240, dtype=np.float32) for _ in lines]
+
+    emotion = tmp_path / "angry.wav"
+    emotion.write_bytes(b"not really audio")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("pipeline.index_tts.IndexTTSEngine", FakeIndex)
+    monkeypatch.setattr("dub.resolve_model", lambda *args, **kwargs: tmp_path)
+    _saved_voice(tmp_path)
+
+    code = main(
+        [
+            "say",
+            "--voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+            "--backend",
+            "indextts2",
+            "--text",
+            "one\\ntwo",
+            "--emotion-audio",
+            str(emotion),
+            "--emotion-alpha",
+            "0.6",
+            "--duration",
+            "3.0",
+        ]
+    )
+
+    assert code == 0
+    assert captured["alpha"] == 0.6
+    assert captured["durations"] == [3.0, 3.0]

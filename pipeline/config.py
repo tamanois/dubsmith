@@ -253,6 +253,11 @@ class Settings(BaseModel):
     llm_model: str = "local-model"
     llm_timeout_s: float = 180.0
     llm_chunk_size: int = Field(default=40, ge=1)
+    #: Lines per request for the prosody/style planners before they switch to
+    #: the overview + chunked two-pass strategy. Kept separate from
+    #: ``llm_chunk_size`` because planning wants much smaller batches than
+    #: translation to avoid drifting from the passage's overall arc.
+    llm_plan_chunk_size: int = Field(default=10, ge=1)
 
     # Loudness policy. "match-source" puts the dub at the level of the track it
     # replaces; "lufs" forces the absolute target below.
@@ -311,6 +316,10 @@ class Settings(BaseModel):
             "llm_model": pick("LLM_MODEL", cls.model_fields["llm_model"].default),
             "llm_timeout_s": pick("LLM_TIMEOUT_S", cls.model_fields["llm_timeout_s"].default),
             "llm_chunk_size": pick("LLM_CHUNK_SIZE", cls.model_fields["llm_chunk_size"].default),
+            "llm_plan_chunk_size": pick(
+                "LLM_PLAN_CHUNK_SIZE",
+                cls.model_fields["llm_plan_chunk_size"].default,
+            ),
             "loudness_target": pick(
                 "LOUDNESS_TARGET", cls.model_fields["loudness_target"].default
             ),

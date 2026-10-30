@@ -20,15 +20,60 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, MutableMapping
+from typing import Any, Iterator, MutableMapping
 
-__all__ = ["setup_logging", "job_logger", "JobLogger", "DEFAULT_MAX_LOG_BYTES"]
+__all__ = [
+    "setup_logging",
+    "job_logger",
+    "timed",
+    "quiet_dependencies",
+    "JobLogger",
+    "DEFAULT_MAX_LOG_BYTES",
+]
 
 #: Size at which the run log is archived rather than appended to. Roughly twenty
 #: ordinary 11-minute runs, or two at ``--verbose``.
 DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024
+
+#: Dependencies that are extremely chatty at DEBUG (HTTP downloads, model
+#: loading). ``-v`` is about this pipeline's steps, not their request logs, so
+#: these stay at WARNING even when the root level is DEBUG.
+_QUIET_LOGGERS = (
+    "urllib3",
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "openai",
+    "huggingface_hub",
+    "hf_transfer",
+    "modelscope",
+    "modelscope_hub",
+    "modelscope_hub.download",
+    "modelscope.utils.logger",
+    "transformers",
+    "filelock",
+    "asyncio",
+    "matplotlib",
+    "numba",
+    "requests",
+    "urllib3.connectionpool",
+)
+
+
+def quiet_dependencies() -> None:
+    """Keep third-party loggers at WARNING even when the root level is DEBUG.
+
+    ``-v`` is about this pipeline's steps, not about every HTTP request a
+    dependency makes. Applied by :func:`setup_logging` in the parent and by each
+    worker after it configures its own logging.
+    """
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 _RESERVED = {
     "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
@@ -214,6 +259,7 @@ def setup_logging(
     for handler in handlers:
         root.addHandler(handler)
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    quiet_dependencies()
 
     # Announced through the logger itself, so the line lands in the file it names
     # and doubles as the boundary between one run's lines and the next's.
@@ -234,3 +280,49 @@ def setup_logging(
 def job_logger(name: str, job_id: str, **context: Any) -> JobLogger:
     """Build a logger bound to a job id (and any extra context)."""
     return JobLogger(logging.getLogger(name), {"job_id": job_id, **context})
+
+
+@contextmanager
+def timed(
+    logger: logging.Logger | logging.LoggerAdapter,
+    message: str,
+    *,
+    level: int = logging.INFO,
+    **fields: Any,
+) -> Iterator[dict[str, Any]]:
+    """Time a block and log the result, on success and on failure.
+
+    The yielded mapping is merged into the record, so a caller can attach facts
+    it only learns inside the block (line counts, devices, sizes) to the same
+    line that carries the duration. ``seconds`` is always present, which is what
+    makes a JSON log queryable for slow steps.
+
+    Args:
+        logger: Logger or adapter to emit through.
+        message: What the block does, without a duration ("Transcribed audio").
+        level: Level to log at; DEBUG for per-line or per-batch detail.
+        **fields: Extra record fields known before the block starts.
+    """
+    start = time.perf_counter()
+    context: dict[str, Any] = {}
+    try:
+        yield context
+    except BaseException:
+        elapsed = time.perf_counter() - start
+        logger.log(
+            level,
+            "%s failed after %.2fs",
+            message,
+            elapsed,
+            extra={**fields, **context, "seconds": round(elapsed, 3)},
+        )
+        raise
+    else:
+        elapsed = time.perf_counter() - start
+        logger.log(
+            level,
+            "%s in %.2fs",
+            message,
+            elapsed,
+            extra={**fields, **context, "seconds": round(elapsed, 3)},
+        )

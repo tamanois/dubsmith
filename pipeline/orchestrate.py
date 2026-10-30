@@ -13,6 +13,7 @@ and no GPU, models, or binaries.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import shutil
 import time
@@ -422,6 +423,7 @@ class Pipeline:
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         self.log.info("Starting job for %s", self.input_path.name)
+        run_started = time.perf_counter()
         try:
             audio_path = self._stage_audio()
             speech_path = self._stage_separate(audio_path)
@@ -452,6 +454,13 @@ class Pipeline:
             # them - and never past the next line's start, so nothing downstream
             # moves and no sync is traded away.
             self._packed_runs = redistribute_packed(lines)
+            self.log.info(
+                "Source: %s, %.1fs, %d line(s), %d speaker(s)",
+                self.input_path.name,
+                transcript.duration_s,
+                len(lines),
+                len(self._speaker_order(transcript.segments)),
+            )
             if self._packed_runs:
                 self.log.info(
                     "Re-timed %d run(s) of impossible ASR timing (%d line(s), worst "
@@ -496,6 +505,12 @@ class Pipeline:
             return self._stage_deliver(timeline, transcript, lines, script)
         finally:
             self._close_runner()
+            elapsed = time.perf_counter() - run_started
+            self.log.info(
+                "Job finished in %.1fs",
+                elapsed,
+                extra={"seconds": round(elapsed, 3)},
+            )
             # Never leak scratch space, even on failure.
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -504,16 +519,31 @@ class Pipeline:
     def _stage(self, name: str, outputs: Sequence[Path], func: Callable[[], Any]) -> Any:
         """Run a stage unless it is already cached; record timing either way."""
         if self.manifest.is_done(name, outputs) and not self.job.force:
-            self.log.info("Stage %s: cached", name)
+            self.log.info("Stage %s: cached", name, extra={"stage": name})
             return None
 
-        self.log.info("Stage %s: running", name)
+        self.log.info("Stage %s: running", name, extra={"stage": name})
         started = time.perf_counter()
-        result = func()
+        try:
+            result = func()
+        except BaseException:
+            elapsed = time.perf_counter() - started
+            self.log.error(
+                "Stage %s: failed after %.1fs",
+                name,
+                elapsed,
+                extra={"stage": name, "seconds": round(elapsed, 3)},
+            )
+            raise
         elapsed = time.perf_counter() - started
         self._stage_seconds[name] = elapsed
         self.manifest.mark(name, seconds=round(elapsed, 2))
-        self.log.info("Stage %s: done in %.1fs", name, elapsed)
+        self.log.info(
+            "Stage %s: done in %.1fs",
+            name,
+            elapsed,
+            extra={"stage": name, "seconds": round(elapsed, 3)},
+        )
         return result
 
     def _resolve_stretcher(self, tmp_dir: Path) -> Any:
@@ -596,6 +626,7 @@ class Pipeline:
             dtype=self.job.dtype,
             batch_size=self.job.tts_batch,
             x_vector_only=self.job.accent_mode == "speaker-only",
+            verbose=self.log.isEnabledFor(logging.DEBUG),
         )
 
     def _close_runner(self) -> None:

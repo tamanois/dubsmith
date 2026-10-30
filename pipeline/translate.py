@@ -14,12 +14,16 @@ Dubbing-specific concerns handled here:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Iterable, Protocol, Sequence
 
 from pydantic import BaseModel, Field
 
 from .config import language_name_for_code
 from .errors import DependencyError, TranslationError
+from .logging_utils import timed
+
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "TranslationRequest",
@@ -438,16 +442,24 @@ class OpenAICompatTranslator:
         results: dict[int, str] = {}
         context: list[str] = []
 
-        for batch in chunked(list(requests), self.chunk_size):
-            messages = build_messages(
-                batch,
-                source_language=source_name,
-                target_language=target_language,
-                context=context,
-            )
-            batch_result = self._translate_batch(batch, messages)
-            results.update(batch_result)
-            context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
+        batches = list(chunked(list(requests), self.chunk_size))
+        with timed(
+            _LOGGER,
+            f"Translated {len(requests)} line(s)",
+            lines=len(requests),
+            batches=len(batches),
+            target=target_language,
+        ):
+            for batch in batches:
+                messages = build_messages(
+                    batch,
+                    source_language=source_name,
+                    target_language=target_language,
+                    context=context,
+                )
+                batch_result = self._translate_batch(batch, messages)
+                results.update(batch_result)
+                context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
 
         return results
 
@@ -470,15 +482,23 @@ class OpenAICompatTranslator:
         results: dict[int, str] = {}
         context: list[str] = []
 
-        for batch in chunked(list(requests), self.chunk_size):
-            messages = build_subtitle_messages(
-                batch,
-                source_language=source_name,
-                target_language=target_language,
-                context=context,
-            )
-            results.update(self._run_batch({r.id for r in batch}, messages))
-            context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
+        batches = list(chunked(list(requests), self.chunk_size))
+        with timed(
+            _LOGGER,
+            f"Translated {len(requests)} subtitle line(s)",
+            lines=len(requests),
+            batches=len(batches),
+            target=target_language,
+        ):
+            for batch in batches:
+                messages = build_subtitle_messages(
+                    batch,
+                    source_language=source_name,
+                    target_language=target_language,
+                    context=context,
+                )
+                results.update(self._run_batch({r.id for r in batch}, messages))
+                context = ([*context, *(r.text for r in batch)])[-_CONTEXT_LINES:]
 
         return results
 
@@ -497,9 +517,19 @@ class OpenAICompatTranslator:
             return {}
 
         results: dict[int, str] = {}
-        for batch in chunked(list(requests), self.chunk_size):
-            messages = build_shorten_messages(batch, target_language=target_language)
-            results.update(self._run_batch({r.id for r in batch}, messages))
+        batches = list(chunked(list(requests), self.chunk_size))
+        with timed(
+            _LOGGER,
+            f"Shortened {len(requests)} line(s)",
+            lines=len(requests),
+            batches=len(batches),
+            target=target_language,
+        ):
+            for batch in batches:
+                messages = build_shorten_messages(
+                    batch, target_language=target_language
+                )
+                results.update(self._run_batch({r.id for r in batch}, messages))
         return results
 
     # -- internals --------------------------------------------------------- #
@@ -518,12 +548,22 @@ class OpenAICompatTranslator:
         messages: list[dict[str, str]],
     ) -> dict[int, str]:
         """Send one batch and return its ids, repairing a malformed reply once."""
-        parsed = self._call(messages)
+        with timed(
+            _LOGGER,
+            f"Translation batch ({len(expected)} line(s))",
+            level=logging.DEBUG,
+            lines=len(expected),
+        ):
+            parsed = self._call(messages)
         result = _parse_translations(parsed)
         missing = expected - result.keys()
         if not missing:
             return {key: value for key, value in result.items() if key in expected}
 
+        _LOGGER.warning(
+            "Translation reply missed id(s) %s; retrying with a repair instruction.",
+            sorted(missing),
+        )
         repair = [
             *messages,
             {
@@ -553,9 +593,16 @@ class OpenAICompatTranslator:
             "messages": messages,
             "temperature": self.temperature if temperature is None else temperature,
         }
+        _LOGGER.debug(
+            "Chat request: model=%s messages=%d temperature=%s",
+            self.model,
+            len(messages),
+            payload["temperature"],
+        )
 
         try:
-            response = self._request(payload)
+            with timed(_LOGGER, "Chat completion", level=logging.DEBUG):
+                response = self._request(payload)
         except Exception as exc:  # noqa: BLE001 - normalised into a domain error
             raise TranslationError(
                 f"Translation request to {self.base_url} failed: {exc}. "

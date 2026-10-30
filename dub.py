@@ -26,6 +26,8 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
+
 from pipeline import __version__
 from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
@@ -43,7 +45,12 @@ from pipeline.config import (
     release_gpu_memory,
 )
 from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError, TTSError
-from pipeline.logging_utils import DEFAULT_MAX_LOG_BYTES, setup_logging
+from pipeline.logging_utils import (
+    DEFAULT_MAX_LOG_BYTES,
+    job_logger,
+    setup_logging,
+    timed,
+)
 from pipeline.mixing import (
     DEFAULT_ROOM_DUCK_DB,
     DEFAULT_ROOM_TONE_GAIN_DB,
@@ -270,7 +277,7 @@ def build_say_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument(
         "--voice",
         metavar="LABEL",
@@ -291,11 +298,223 @@ def build_say_parser() -> argparse.ArgumentParser:
         help="Clone a voice inline from this clip, which --clone-text transcribes.",
     )
     parser.add_argument(
+        "--speaker",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Preset speaker for --backend customvoice (e.g. 'Vivian', 'Ryan'). "
+            "Required with that backend; rejected by the others."
+        ),
+    )
+    parser.add_argument(
         "--clone-text",
         dest="clone_text",
         metavar="TEXT",
         default=None,
-        help="Exact transcript of --clone. Required with it.",
+        help=(
+            "Exact transcript of --clone. Required for 'qwen'; used by the "
+            "CosyVoice backends to keep the reference's accent (optional there)."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        default="qwen",
+        choices=[
+            "qwen",
+            "customvoice",
+            "cosyvoice",
+            "cosyvoice3",
+            "chatterbox",
+            "fish",
+            "indextts2",
+        ],
+        help=(
+            "Synthesiser: 'qwen' (default) clones with the Qwen Base checkpoint; "
+            "'customvoice' uses a preset Qwen CustomVoice speaker with a tone/"
+            "emotion instruction (needs --speaker, no --voice/--clone/--design); "
+            "'cosyvoice' uses CosyVoice2; 'cosyvoice3' uses CosyVoice3, which adds "
+            "instruct control (emotion, speed, volume) plus paralinguistic tokens "
+            "such as [breath] and [laughter]; 'chatterbox' uses Chatterbox "
+            "Multilingual, whose style control is an emotion exaggeration; 'fish' "
+            "uses Fish Speech S2-Pro, which reads inline [excited]/[whisper] tags "
+            "in the text; 'indextts2' uses IndexTTS2, which takes a separate "
+            "emotion reference and can fit a line to --duration seconds."
+        ),
+    )
+    parser.add_argument(
+        "--emotion",
+        "--instruct",
+        dest="emotions",
+        action="append",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Per-line emotion/style, e.g. 'calm' or 'excited'. Repeat it or pass a "
+            "comma-separated list; a single value applies to every line. "
+            "CosyVoice2 sends it verbatim as the instruct string; CosyVoice3, "
+            "Chatterbox and CustomVoice map it onto their own control (prefer "
+            "--prosody). Ignored by 'qwen'. Alias: --instruct, not --style-instruct."
+        ),
+    )
+    parser.add_argument(
+        "--style-instruct",
+        "--raw-instruct",
+        dest="style_instructs",
+        action="append",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Verbatim delivery instruction for --backend customvoice, e.g. 'Speak "
+            "with restrained anger, then fade to exhaustion.' It is sent to the "
+            "checkpoint unchanged, which is the natural-language form it expects. "
+            "Repeat it once per line, or pass one value to apply everywhere; it "
+            "wins over --prosody/--emotion/--prosody-plan. (--instruct is an alias "
+            "of --emotion, not of this flag.)"
+        ),
+    )
+    parser.add_argument(
+        "--prosody",
+        dest="prosody",
+        action="append",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Per-line prosody, as comma-separated 'key=value' pairs or bare flags: "
+            "emotion=happy, pace=fast, volume=loud, breath, pause, laughter, "
+            "exaggeration=0.8. Repeat it once per line, or pass one value to apply "
+            "everywhere. 'exaggeration' is Chatterbox's own 0.0-1.0 style knob; "
+            "this is the structured form of --emotion."
+        ),
+    )
+    parser.add_argument(
+        "--prosody-plan",
+        dest="prosody_plan",
+        default="off",
+        choices=["off", "llm"],
+        help=(
+            "Let the configured OpenAI-compatible model decide per-line prosody "
+            "from the text. 'off' uses only --prosody/--emotion; 'llm' plans it "
+            "first, with any explicit --prosody value overriding the plan."
+        ),
+    )
+    parser.add_argument(
+        "--style-plan",
+        dest="style_plan",
+        default="off",
+        choices=["off", "llm"],
+        help=(
+            "CustomVoice only: let the configured OpenAI-compatible model write "
+            "the rich verbatim delivery instruction that --style-instruct takes "
+            "by hand. 'llm' plans it first; an explicit --style-instruct still "
+            "wins. Use --style-plan-scope to choose one per line or one for all."
+        ),
+    )
+    parser.add_argument(
+        "--style-plan-scope",
+        dest="style_plan_scope",
+        default="per-line",
+        choices=["per-line", "whole"],
+        help=(
+            "With --style-plan llm: 'per-line' writes one instruction per line "
+            "(chunked, with a whole-passage overview when long); 'whole' writes "
+            "a single instruction for the entire text."
+        ),
+    )
+    parser.add_argument(
+        "--plan-chunk",
+        dest="plan_chunk",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Lines per LLM planning request before --style-plan llm and "
+            "--prosody-plan llm switch to the overview + chunked strategy "
+            "(default: LLM_PLAN_CHUNK_SIZE, 10)."
+        ),
+    )
+    parser.add_argument(
+        "--chatterbox-exaggeration",
+        type=float,
+        default=None,
+        metavar="0..1",
+        help=(
+            "Chatterbox: fixed expression intensity for every line, overriding "
+            "the emotion mapping (default: derive from emotion)."
+        ),
+    )
+    parser.add_argument(
+        "--chatterbox-cfg-weight",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Chatterbox: classifier-free guidance weight (package default 0.5).",
+    )
+    parser.add_argument(
+        "--chatterbox-temperature",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Chatterbox: sampling temperature (package default 0.8).",
+    )
+    parser.add_argument(
+        "--fish-temperature",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fish Speech: sampling temperature (model default 0.7).",
+    )
+    parser.add_argument(
+        "--fish-top-p",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fish Speech: nucleus sampling probability (model default 0.7).",
+    )
+    parser.add_argument(
+        "--fish-tag-mode",
+        dest="fish_tag_mode",
+        default="render",
+        choices=["render", "keep", "llm"],
+        help=(
+            "Fish Speech: how delivery tags reach the model. 'render' (default) "
+            "maps --prosody/--emotion onto [excited]/[whisper]/... tags; 'keep' "
+            "sends --text as written, for hand-written tags; 'llm' has the "
+            "configured model write the tags into the text, guarded so the words "
+            "cannot change."
+        ),
+    )
+    parser.add_argument(
+        "--emotion-audio",
+        type=Path,
+        default=None,
+        metavar="AUDIO",
+        help=(
+            "IndexTTS2 only: a second clip whose emotion colours the delivery, "
+            "while --voice/--clone still fixes the timbre."
+        ),
+    )
+    parser.add_argument(
+        "--emotion-alpha",
+        type=float,
+        default=None,
+        metavar="0..1",
+        help=(
+            "IndexTTS2: how strongly --emotion-audio is applied (default 1.0). "
+            "Requires --emotion-audio."
+        ),
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        action="append",
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "IndexTTS2 only: fit each line to this many seconds. Repeat once per "
+            "line, or pass one value to apply everywhere. The released IndexTTS2 "
+            "has no native duration control, so the line is time-stretched after "
+            "synthesis."
+        ),
     )
     parser.add_argument(
         "--text", required=True, metavar="TEXT", help="Text to speak."
@@ -342,6 +561,35 @@ def build_say_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite an existing voice when --save-as names one.",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        type=Path,
+        default=None,
+        help=(
+            "Also write the say log to this file, appended to across runs. "
+            "Defaults to output/say/<name>/say.log for the expressive backends "
+            "and output/say/<name>.log for Qwen; LOG_FILE sets the same default."
+        ),
+    )
+    parser.add_argument(
+        "--no-log-file",
+        dest="log_file",
+        action="store_false",
+        help="Log to stderr only, writing no file.",
+    )
+    parser.add_argument(
+        "--log-max-bytes",
+        dest="log_max_bytes",
+        type=int,
+        default=DEFAULT_MAX_LOG_BYTES,
+        help=(
+            "Roll the log file aside to a timestamped name once it reaches this "
+            "many bytes, so it cannot grow without bound; 0 keeps one file "
+            "forever."
+        ),
     )
     return parser
 
@@ -1317,6 +1565,709 @@ def cmd_voices(argv: Sequence[str]) -> int:
     return _STOP
 
 
+def _say_lines(text: str) -> list[str]:
+    """Split ``--text`` into lines, treating a literal ``\\n`` as a break.
+
+    A shell does not expand ``\\n`` inside double quotes (and ``$"..."`` is
+    locale quoting, not ANSI-C quoting), so ``--text "one\\ntwo"`` reaches us as
+    the two characters backslash-n. Interpreting that as a line break makes the
+    obvious invocation do the obvious thing; real newlines still work too.
+    """
+    normalized = str(text or "").replace("\\n", "\n")
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+def _parse_emotions(values: Sequence[str] | None) -> list[str] | None:
+    """Flatten repeatable ``--emotion``/``--instruct`` values into one list.
+
+    A value may itself be comma-separated ("calm, excited"). Empty entries are
+    dropped; ``None`` or an all-empty list becomes ``None`` ("no instruction").
+    ``--style-instruct`` is a separate, verbatim flag and never passes through
+    here.
+    """
+    if values is None:
+        return None
+    flat = [
+        part.strip() for value in values for part in value.split(",") if part.strip()
+    ]
+    return flat or None
+
+
+def _one_per_line(
+    values: Sequence[str] | None, lines: Sequence[str], flag: str
+) -> list[str] | None:
+    """Broadcast a single value over every line, or validate one per line."""
+    if values is None:
+        return None
+    items = list(values)
+    if len(items) == 1:
+        return items * len(lines)
+    if len(items) != len(lines):
+        raise ConfigError(
+            f"{flag}: {len(items)} value(s) for {len(lines)} line(s); give one per "
+            "line, or a single one to apply everywhere."
+        )
+    return items
+
+
+def _resolve_prosody_specs(
+    lines: Sequence[str],
+    *,
+    emotions: Sequence[str] | None,
+    values: Sequence[str] | None,
+    plan: str,
+    settings: Settings,
+    backend: str,
+    chunk_size: int | None = None,
+) -> list[Any]:
+    """Per-line :class:`ProsodySpec` from the CLI and, optionally, the LLM.
+
+    Precedence is deliberate: the LLM plans first, an explicit ``--prosody``
+    overrides it, and ``--emotion`` overrides the emotion field. A user who types
+    a value always wins over a model's guess.
+    """
+    from pipeline.prosody import ProsodyPlanner, ProsodySpec, parse_prosody_spec
+
+    specs = [ProsodySpec() for _ in lines]
+    if plan == "llm":
+        planner = ProsodyPlanner(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            timeout_s=settings.llm_timeout_s,
+            backend=backend,
+            chunk_size=chunk_size or settings.llm_plan_chunk_size,
+        )
+        specs = planner.plan(lines)
+
+    if values:
+        parsed = _one_per_line(
+            [parse_prosody_spec(value) for value in values], lines, "--prosody"
+        )
+        assert parsed is not None
+        specs = [base.merged_with(override) for base, override in zip(specs, parsed)]
+
+    if emotions:
+        chosen = _one_per_line(emotions, lines, "--emotion")
+        assert chosen is not None
+        specs = [
+            base.merged_with(ProsodySpec(emotion=emotion))
+            for base, emotion in zip(specs, chosen)
+        ]
+    return specs
+
+
+def _neural_engine(
+    backend: str,
+    models_dir: Path,
+    device: str,
+    *,
+    exaggeration: float | None = None,
+    cfg_weight: float | None = None,
+    temperature: float | None = None,
+    fish_temperature: float | None = None,
+    fish_top_p: float | None = None,
+    emotion_audio: Path | None = None,
+    emotion_alpha: float | None = None,
+    stretcher: str = "auto",
+) -> Any:
+    """Build the engine for one expressive backend."""
+    if backend == "cosyvoice":
+        from pipeline.cosyvoice import COSYVOICE2, CosyVoiceEngine
+
+        return CosyVoiceEngine(
+            resolve_model("tts_cosyvoice", models_dir),
+            device=device,
+            model_type=COSYVOICE2,
+        )
+    if backend == "cosyvoice3":
+        from pipeline.cosyvoice import COSYVOICE3, CosyVoiceEngine
+
+        return CosyVoiceEngine(
+            resolve_model("tts_cosyvoice3", models_dir),
+            device=device,
+            model_type=COSYVOICE3,
+        )
+    if backend == "chatterbox":
+        from pipeline.chatterbox import ChatterboxEngine
+
+        try:
+            model_dir: Path | None = resolve_model("tts_chatterbox", models_dir)
+        except ModelNotFoundError:
+            # Chatterbox fetches its own weights by repo id; a missing local copy
+            # is not an error.
+            model_dir = None
+        return ChatterboxEngine(
+            model_dir,
+            device=device,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+        )
+    if backend == "fish":
+        from pipeline.fish import FishEngine
+
+        return FishEngine(
+            resolve_model("tts_fish", models_dir),
+            device=device,
+            temperature=fish_temperature,
+            top_p=fish_top_p,
+        )
+    if backend == "indextts2":
+        from pipeline.index_tts import IndexTTSEngine
+
+        return IndexTTSEngine(
+            resolve_model("tts_index_tts2", models_dir),
+            device=device,
+            emotion_audio=emotion_audio,
+            emotion_alpha=emotion_alpha if emotion_alpha is not None else 1.0,
+            stretcher=stretcher,
+        )
+    raise ConfigError(
+        f"Unknown backend {backend!r}. Use: qwen, customvoice, cosyvoice, "
+        "cosyvoice3, chatterbox, fish, indextts2"
+    )
+
+
+def _say_name(args: argparse.Namespace) -> str:
+    """The folder/file stem a ``say`` run writes under."""
+    from pipeline.voices import slugify_label
+
+    if getattr(args, "voice", None):
+        return slugify_label(args.voice)
+    if getattr(args, "clone", None) is not None:
+        return slugify_label(Path(args.clone).stem)
+    if getattr(args, "speaker", None):
+        return slugify_label(f"customvoice-{args.speaker}")
+    return slugify_label(args.save_as or "design")
+
+
+def _say_log_file(
+    args: argparse.Namespace, settings: Settings, name: str
+) -> Path | None:
+    """Where this ``say`` run keeps its log.
+
+    Mirrors the dubbing command: an explicit path wins, then ``LOG_FILE``, then a
+    default beside the output. The expressive backends already write a folder per
+    voice, so their log lives inside it; Qwen writes a single WAV, so its log is
+    its sibling.
+    """
+    if args.log_file is False:
+        return None
+    if isinstance(args.log_file, Path):
+        return args.log_file
+    if settings.log_file is not None:
+        return settings.log_file
+    base = Path("output") / "say"
+    if args.backend == "qwen":
+        return base / f"{name}.log"
+    return base / name / "say.log"
+
+
+def _cmd_say_neural(
+    args: argparse.Namespace,
+    models_dir: Path,
+    root: Path,
+    *,
+    backend: str,
+    emotions: list[str] | None,
+    settings: Settings,
+    log: Any,
+) -> int:
+    """The expressive-backend path of ``dub.py say``.
+
+    ``qwen`` is handled separately in :func:`cmd_say`, because it cannot honour
+    prosody and keeps the plain clone call.
+    """
+    from pipeline.config import NAME_TO_CODE
+    from pipeline.media import write_audio
+    from pipeline.voices import load_voice, slugify_label
+
+    if args.design is not None:
+        raise ConfigError(
+            f"--backend {backend} cannot be combined with --design: pass --voice or "
+            "--clone instead."
+        )
+    if args.save_as:
+        raise ConfigError(f"--save-as is not supported with --backend {backend} yet.")
+
+    if args.voice:
+        saved = load_voice(root, args.voice)
+        reference = saved.wav
+        name = saved.label
+        language = normalize_language(args.lang) if args.lang else saved.language
+        ref_text = saved.ref_text
+    elif args.clone is not None:
+        reference = args.clone
+        name = slugify_label(args.clone.stem)
+        # CosyVoice infers the language from the text; Chatterbox's multilingual
+        # model needs the code, so only that backend requires --lang here.
+        language = normalize_language(args.lang) if args.lang else None
+        ref_text = (args.clone_text or "").strip() or None
+        if backend == "chatterbox" and language is None:
+            raise ConfigError(
+                "--lang is required with --backend chatterbox when the voice is "
+                "cloned inline."
+            )
+    else:  # pragma: no cover - argparse requires one of the group
+        raise ConfigError(f"--backend {backend} needs --voice or --clone.")
+
+    lines = _say_lines(args.text)
+    if not lines:
+        raise ConfigError("--text contains no lines to speak.")
+
+    log.info(
+        "Backend %s: reference=%s language=%s lines=%d",
+        backend,
+        reference,
+        language or "auto",
+        len(lines),
+    )
+    with timed(log, f"Resolved {backend} engine", backend=backend):
+        engine = _neural_engine(
+            backend,
+            models_dir,
+            args.device,
+            exaggeration=getattr(args, "chatterbox_exaggeration", None),
+            cfg_weight=getattr(args, "chatterbox_cfg_weight", None),
+            temperature=getattr(args, "chatterbox_temperature", None),
+            fish_temperature=getattr(args, "fish_temperature", None),
+            fish_top_p=getattr(args, "fish_top_p", None),
+            emotion_audio=getattr(args, "emotion_audio", None),
+            emotion_alpha=getattr(args, "emotion_alpha", None),
+            stretcher=getattr(args, "stretcher", "auto"),
+        )
+
+    # Chatterbox has no instruct string, so any expressed emotion has to go
+    # through the structured path even when the user only passed --emotion.
+    # CosyVoice 3 is included because it renders a full instruct sentence, which
+    # is what that checkpoint was trained on. Fish reads tags inline in the text,
+    # so it renders the same spec into tags - unless the caller already wrote or
+    # planned them, in which case a prefix of ours would contradict the line.
+    fish_tag_mode = getattr(args, "fish_tag_mode", "render")
+    structured = (
+        bool(args.prosody)
+        or args.prosody_plan == "llm"
+        or backend in {"cosyvoice3", "chatterbox", "fish"}
+    )
+    if backend == "fish" and fish_tag_mode != "render":
+        structured = False
+    if backend == "indextts2":
+        # IndexTTS2 has no structured/verbatim channel: emotion comes from a
+        # separate reference clip, so prosody values cannot be rendered here.
+        if args.prosody or emotions or args.prosody_plan != "off":
+            log.warning(
+                "IndexTTS2 takes its emotion from --emotion-audio, so --prosody/"
+                "--emotion/--prosody-plan are ignored for this run."
+            )
+        durations = _one_per_line(args.duration, lines, "--duration")
+        with timed(
+            log,
+            f"Synthesised {len(lines)} line(s)",
+            lines=len(lines),
+            backend=backend,
+        ):
+            rendered = engine.synthesize(
+                lines,
+                reference=reference,
+                language=language,
+                durations=durations,
+            )
+    elif backend == "fish" and fish_tag_mode == "llm":
+        # Fish has no side channel, so the plan *is* the text: the model writes
+        # the tags into each line and a guard rejects any change to the words.
+        from pipeline.prosody import FishInlinePlanner, fish_apply_emotion
+
+        planner = FishInlinePlanner(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            timeout_s=settings.llm_timeout_s,
+            chunk_size=args.plan_chunk or settings.llm_plan_chunk_size,
+        )
+        tagged = planner.plan_lines(lines, language=language)
+        if emotions:
+            chosen = _one_per_line(emotions, lines, "--emotion")
+            assert chosen is not None
+            tagged = [
+                fish_apply_emotion(text, emotion)
+                for text, emotion in zip(tagged, chosen)
+            ]
+            log.info("Fish: explicit --emotion overrides the planned tag")
+        for index, text in enumerate(tagged, start=1):
+            log.debug("fish inline %d/%d: %r", index, len(tagged), text)
+        with timed(
+            log,
+            f"Synthesised {len(lines)} line(s)",
+            lines=len(lines),
+            backend=backend,
+        ):
+            rendered = engine.synthesize(
+                tagged,
+                reference=reference,
+                ref_text=ref_text,
+                language=language,
+                tag_mode="keep",
+            )
+    elif backend == "fish" and fish_tag_mode == "keep":
+        # The caller wrote the tags. Reserved <|...|> tokens were rejected in
+        # validation, so this only reports the advisory problems and folds a
+        # tag-only line into its neighbour, which would otherwise be an empty
+        # utterance.
+        from pipeline.prosody import (
+            strip_fish_tags,
+            validate_fish_inline_text,
+        )
+
+        checked: list[str] = []
+        for index, text in enumerate(lines, start=1):
+            for problem in validate_fish_inline_text(text):
+                log.warning("line %d: %s", index, problem)
+            if not strip_fish_tags(text):
+                if not checked:
+                    log.warning("dropping a first line that is only tags: %r", text)
+                    continue
+                log.warning(
+                    "line %d is only tags; merging it into the line before.", index
+                )
+                checked[-1] = f"{checked[-1]} {text}"
+                continue
+            checked.append(text)
+        if not checked:
+            raise ConfigError("--text contains only Fish tags, nothing to speak.")
+        lines = checked
+        log.info("Fish: %d hand-tagged line(s) sent as written", len(lines))
+        with timed(
+            log,
+            f"Synthesised {len(lines)} line(s)",
+            lines=len(lines),
+            backend=backend,
+        ):
+            rendered = engine.synthesize(
+                lines,
+                reference=reference,
+                ref_text=ref_text,
+                language=language,
+                tag_mode="keep",
+            )
+    elif structured:
+        specs = _resolve_prosody_specs(
+            lines,
+            emotions=emotions,
+            values=args.prosody,
+            plan=args.prosody_plan,
+            settings=settings,
+            backend=backend,
+            chunk_size=args.plan_chunk,
+        )
+        log.info(
+            "Prosody: %s for %d line(s)",
+            "LLM plan" if args.prosody_plan == "llm" else "explicit values",
+            len(specs),
+        )
+        for index, spec in enumerate(specs, start=1):
+            log.debug("prosody %d/%d: %s", index, len(specs), spec.model_dump())
+        with timed(
+            log,
+            f"Synthesised {len(lines)} line(s)",
+            lines=len(lines),
+            backend=backend,
+        ):
+            if backend == "chatterbox":
+                rendered = engine.synthesize(
+                    lines,
+                    reference=reference,
+                    prosody=specs,
+                    language=NAME_TO_CODE.get(language),
+                )
+            else:
+                rendered = engine.synthesize(
+                    lines,
+                    reference=reference,
+                    prosody=specs,
+                    ref_text=ref_text,
+                    language=language,
+                )
+    else:
+        log.info("Prosody: raw instruct strings (%d)", len(emotions or []))
+        with timed(
+            log,
+            f"Synthesised {len(lines)} line(s)",
+            lines=len(lines),
+            backend=backend,
+        ):
+            # Historical path: raw instruct strings, unchanged.
+            rendered = engine.synthesize(
+                lines,
+                reference=reference,
+                instructs=emotions,
+                ref_text=ref_text,
+                language=language,
+            )
+
+    out_dir = Path("output") / "say" / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with timed(log, "Wrote output", lines=len(rendered)):
+        for index, wav in enumerate(rendered):
+            write_audio(out_dir / f"line_{index:03d}.wav", wav, engine.sample_rate)
+        combined = (
+            np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.float32)
+        )
+        combined_path = (
+            args.output if args.output is not None else out_dir / "speech.wav"
+        )
+        write_audio(combined_path, combined, engine.sample_rate)
+    release_gpu_memory()
+
+    log.info("Output: %s (combined %s)", out_dir, combined_path)
+    print(f"Wrote {len(rendered)} line(s) to {out_dir} (combined: {combined_path})")
+    return _STOP
+
+
+def _validate_say_source(args: argparse.Namespace) -> None:
+    """Check the source/backend combination argparse cannot express.
+
+    ``--speaker`` and the ``--voice/--design/--clone`` group are alternatives that
+    depend on the backend, so the parser leaves the group unrequired and this
+    enforces exactly one valid source per backend.
+    """
+    if args.style_instructs and args.backend != "customvoice":
+        raise ConfigError(
+            "--style-instruct is only valid with --backend customvoice; the other "
+            "backends take --prosody/--emotion (and --design already accepts a "
+            "free-form prompt)."
+        )
+    if args.style_plan != "off" and args.backend != "customvoice":
+        raise ConfigError(
+            "--style-plan is only valid with --backend customvoice; the other "
+            "backends use --prosody-plan llm for structured prosody."
+        )
+    if args.style_plan_scope != "per-line" and args.style_plan != "llm":
+        raise ConfigError("--style-plan-scope only applies with --style-plan llm.")
+    if args.emotion_audio is not None and args.backend != "indextts2":
+        raise ConfigError("--emotion-audio is only valid with --backend indextts2.")
+    if args.emotion_alpha is not None and args.backend != "indextts2":
+        raise ConfigError("--emotion-alpha is only valid with --backend indextts2.")
+    if args.emotion_alpha is not None and args.emotion_audio is None:
+        raise ConfigError("--emotion-alpha requires --emotion-audio.")
+    if args.emotion_audio is not None and not args.emotion_audio.is_file():
+        raise ConfigError(f"--emotion-audio not found: {args.emotion_audio}")
+    tag_mode = getattr(args, "fish_tag_mode", "render")
+    if tag_mode != "render" and args.backend != "fish":
+        raise ConfigError("--fish-tag-mode is only valid with --backend fish.")
+    if tag_mode == "keep" and (
+        args.prosody or args.emotions or args.prosody_plan != "off"
+    ):
+        raise ConfigError(
+            "--fish-tag-mode keep sends --text as written, so --emotion/"
+            "--prosody/--prosody-plan cannot also apply; drop them, or use "
+            "--fish-tag-mode render."
+        )
+    if tag_mode == "llm" and args.prosody_plan != "off":
+        raise ConfigError(
+            "--fish-tag-mode llm already has the model write the tags; drop "
+            "--prosody-plan (or use --fish-tag-mode render with that plan)."
+        )
+    if tag_mode == "keep":
+        from pipeline.prosody import fish_structural_token
+
+        for index, line in enumerate(_say_lines(args.text), start=1):
+            token = fish_structural_token(line)
+            if token:
+                raise ConfigError(
+                    f"line {index} of --text contains {token!r}, which Fish "
+                    "reserves for its own prompt; remove it."
+                )
+    if args.duration is not None:
+        if args.backend != "indextts2":
+            raise ConfigError("--duration is only valid with --backend indextts2.")
+        if any(value <= 0 for value in args.duration):
+            raise ConfigError("--duration must be a positive number of seconds.")
+    if args.fish_temperature is not None and args.backend != "fish":
+        raise ConfigError("--fish-temperature is only valid with --backend fish.")
+    if args.fish_top_p is not None and args.backend != "fish":
+        raise ConfigError("--fish-top-p is only valid with --backend fish.")
+    if args.backend == "customvoice":
+        if not args.speaker:
+            raise ConfigError(
+                "--backend customvoice needs --speaker (a preset voice, e.g. "
+                "'Vivian' or 'Ryan')."
+            )
+        if args.voice or args.design is not None or args.clone is not None:
+            raise ConfigError(
+                "--backend customvoice uses a preset --speaker and does not take "
+                "--voice/--design/--clone."
+            )
+        return
+    if args.speaker:
+        raise ConfigError("--speaker is only valid with --backend customvoice.")
+    if not (args.voice or args.design is not None or args.clone is not None):
+        raise ConfigError(
+            "One of --voice, --design or --clone is required (unless --backend "
+            "customvoice, which needs --speaker)."
+        )
+
+
+def _cmd_say_customvoice(
+    args: argparse.Namespace,
+    models_dir: Path,
+    settings: Settings,
+    *,
+    emotions: list[str] | None,
+    log: Any,
+) -> int:
+    """The preset-speaker CustomVoice path of ``dub.py say``.
+
+    CustomVoice runs in-process like the Qwen clone backend, but takes a preset
+    ``--speaker`` instead of a reference clip. A tone/emotion instruction is the
+    only style control it accepts: either a verbatim ``--style-instruct`` or, when
+    that is absent, the prosody spec rendered into one.
+    """
+    from pipeline.config import normalize_language
+    from pipeline.media import write_audio
+    from pipeline.prosody import StylePlanner, customvoice_instruct
+    from pipeline.tts import CustomVoiceEngine
+
+    if args.lang is None:
+        raise ConfigError("--lang is required with --backend customvoice.")
+    language = normalize_language(args.lang)
+    if language == "Auto":
+        raise ConfigError("--lang must be an explicit language, not 'auto'.")
+    if args.save_as:
+        raise ConfigError("--save-as is not supported with --backend customvoice.")
+
+    lines = _say_lines(args.text)
+    if not lines:
+        raise ConfigError("--text contains no lines to speak.")
+
+    if args.style_instructs:
+        # A verbatim instruction is the checkpoint's own input format, so it is
+        # sent as typed; anything structural given alongside it is dropped.
+        if args.style_plan != "off":
+            log.warning("--style-instruct overrides --style-plan for this run.")
+        if args.prosody or emotions or args.prosody_plan != "off":
+            log.warning(
+                "--style-instruct overrides --prosody/--emotion/--prosody-plan for "
+                "this run."
+            )
+        instructs = _one_per_line(
+            [value.strip() for value in args.style_instructs], lines, "--style-instruct"
+        )
+        assert instructs is not None
+        specs = None
+        mode = "verbatim"
+        label = "style-instruct"
+    elif args.style_plan == "llm":
+        # The richer form of --prosody-plan: the model writes the verbatim
+        # instruction the checkpoint was trained to read, not a rendered template.
+        if args.prosody or emotions or args.prosody_plan != "off":
+            log.warning(
+                "--style-plan overrides --prosody/--emotion/--prosody-plan for "
+                "this run."
+            )
+        planner = StylePlanner(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            timeout_s=settings.llm_timeout_s,
+            chunk_size=args.plan_chunk or settings.llm_plan_chunk_size,
+            backend="customvoice",
+        )
+        if args.style_plan_scope == "whole":
+            instruction = planner.plan_whole(
+                lines, speaker=args.speaker, language=language
+            )
+            instructs = [instruction] * len(lines)
+        else:
+            instructs = planner.plan_lines(
+                lines, speaker=args.speaker, language=language
+            )
+        specs = None
+        mode = "verbatim-llm"
+        label = "style-plan"
+    else:
+        specs = _resolve_prosody_specs(
+            lines,
+            emotions=emotions,
+            values=args.prosody,
+            plan=args.prosody_plan,
+            settings=settings,
+            backend="customvoice",
+            chunk_size=args.plan_chunk,
+        )
+        instructs = [customvoice_instruct(spec) for spec in specs]
+        mode = "rendered"
+        label = "prosody"
+    log.info(
+        "CustomVoice: speaker=%s language=%s lines=%d instruction=%s",
+        args.speaker,
+        language,
+        len(lines),
+        mode,
+    )
+    for index, instruct in enumerate(instructs, start=1):
+        if specs is None:
+            log.debug("%s %d/%d: %r", label, index, len(instructs), instruct)
+        else:
+            log.debug(
+                "prosody %d/%d: %s -> %r",
+                index,
+                len(specs),
+                specs[index - 1].model_dump(),
+                instruct,
+            )
+
+    engine = CustomVoiceEngine(
+        resolve_model("tts_custom_voice", models_dir),
+        device=args.device,
+        dtype=pick_dtype(args.device, args.dtype),
+    )
+    speakers = engine.speakers()
+    if speakers and args.speaker.lower() not in {name.lower() for name in speakers}:
+        raise ConfigError(
+            f"Unknown --speaker {args.speaker!r}. Available: " + ", ".join(speakers)
+        )
+
+    rendered: list[np.ndarray] = []
+    sample_rate = 0
+    with timed(
+        log,
+        f"Synthesised {len(lines)} line(s)",
+        lines=len(lines),
+        backend="customvoice",
+    ):
+        for index, (text, instruct) in enumerate(zip(lines, instructs), start=1):
+            samples, sample_rate = engine.generate(
+                text, args.speaker, instruct, language
+            )
+            rendered.append(samples)
+            log.debug(
+                "customvoice line %d/%d: %d sample(s), instruct=%r",
+                index,
+                len(lines),
+                samples.size,
+                instruct,
+            )
+
+    out_dir = Path("output") / "say" / _say_name(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with timed(log, "Wrote output", lines=len(rendered)):
+        for index, wav in enumerate(rendered):
+            write_audio(out_dir / f"line_{index:03d}.wav", wav, sample_rate)
+        combined = (
+            np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.float32)
+        )
+        combined_path = (
+            args.output if args.output is not None else out_dir / "speech.wav"
+        )
+        write_audio(combined_path, combined, sample_rate)
+    release_gpu_memory()
+
+    log.info("Output: %s (combined %s)", out_dir, combined_path)
+    print(f"Wrote {len(rendered)} line(s) to {out_dir} (combined: {combined_path})")
+    return _STOP
+
+
 def cmd_say(argv: Sequence[str]) -> int:
     """Handle ``dub.py say``: speak a text with a saved, designed or cloned voice."""
     from pipeline.tts import TTSEngine, VoiceDesignEngine
@@ -1330,21 +2281,88 @@ def cmd_say(argv: Sequence[str]) -> int:
     if not args.text or not args.text.strip():
         raise ConfigError("--text cannot be empty.")
 
+    _validate_say_source(args)
+
+    emotions = _parse_emotions(args.emotions)
+    if args.backend == "qwen" and (
+        emotions or args.prosody or args.prosody_plan != "off"
+    ):
+        raise ConfigError(
+            "--emotion/--prosody/--prosody-plan only applies to --backend "
+            "customvoice, cosyvoice, cosyvoice3 or chatterbox."
+        )
+
+    say_name = _say_name(args)
+    setup_logging(
+        "DEBUG" if args.verbose else settings.log_level,
+        settings.log_json,
+        log_file=_say_log_file(args, settings, say_name),
+        max_bytes=args.log_max_bytes,
+    )
+    log = job_logger("dub.say", f"say-{say_name}")
+    lines = _say_lines(args.text)
+    fish_tag_mode = getattr(args, "fish_tag_mode", "render")
+    if args.style_instructs:
+        prosody_state = "verbatim"
+    elif args.style_plan == "llm":
+        prosody_state = "verbatim-llm"
+    elif args.backend == "fish" and fish_tag_mode == "llm":
+        prosody_state = "inline-llm"
+    elif args.backend == "fish" and fish_tag_mode == "keep":
+        prosody_state = "inline"
+    elif args.prosody_plan == "llm":
+        prosody_state = "llm"
+    elif args.prosody or emotions:
+        prosody_state = "manual"
+    else:
+        prosody_state = "off"
+    log.info(
+        "say: backend=%s voice=%s lines=%d language=%s prosody=%s",
+        args.backend,
+        say_name,
+        len(lines),
+        args.lang or "auto",
+        prosody_state,
+    )
+
+    if args.backend == "customvoice":
+        return _cmd_say_customvoice(
+            args,
+            models_dir,
+            settings,
+            emotions=emotions,
+            log=log,
+        )
+    if args.backend != "qwen":
+        return _cmd_say_neural(
+            args,
+            models_dir,
+            root,
+            backend=args.backend,
+            emotions=emotions,
+            settings=settings,
+            log=log,
+        )
+
     if args.voice:
         saved = load_voice(root, args.voice)
         language = normalize_language(args.lang) if args.lang else saved.language
+        log.info("Qwen: cloning from saved voice %s (%s)", saved.label, language)
         engine = TTSEngine(
             resolve_model("tts_base", models_dir),
             device=args.device,
             dtype=pick_dtype(args.device, args.dtype),
         )
-        engine.prepare_prompt_from_file(saved.wav, saved.ref_text)
-        rendered = engine.synthesize([args.text], language=language)
+        with timed(log, "Prepared the clone prompt"):
+            engine.prepare_prompt_from_file(saved.wav, saved.ref_text)
+        with timed(log, "Synthesised the line", lines=1, backend="qwen"):
+            rendered = engine.synthesize([args.text], language=language)
         speech = rendered[0] if rendered else None
         if speech is None:
             raise TTSError("The model returned no audio.")
         out = _write_say_output(args.output, saved.label, speech, engine.sample_rate)
         release_gpu_memory()
+        log.info("Output: %s", out)
         print(f"Wrote {out}")
         return _STOP
 
@@ -1358,14 +2376,19 @@ def cmd_say(argv: Sequence[str]) -> int:
     anchor_text = _anchor_text(language)
 
     if args.design:
+        log.info("Qwen: designing a voice from a description (%s)", language)
         engine = VoiceDesignEngine(
             resolve_model("tts_voice_design", models_dir),
             device=args.device,
             dtype=pick_dtype(args.device, args.dtype),
         )
-        speech, sample_rate = engine.generate(args.text, args.design, language)
+        with timed(log, "Designed the voice", lines=1, backend="qwen"):
+            speech, sample_rate = engine.generate(args.text, args.design, language)
         if args.save_as:
-            samples, anchor_rate = engine.generate(anchor_text, args.design, language)
+            with timed(log, "Rendered the voice-print passage"):
+                samples, anchor_rate = engine.generate(
+                    anchor_text, args.design, language
+                )
             save_voice(
                 root,
                 args.save_as,
@@ -1381,6 +2404,7 @@ def cmd_say(argv: Sequence[str]) -> int:
             args.output, args.save_as or "design", speech, sample_rate
         )
         release_gpu_memory()
+        log.info("Output: %s", out)
         print(f"Wrote {out}")
         return _STOP
 
@@ -1393,9 +2417,14 @@ def cmd_say(argv: Sequence[str]) -> int:
         device=args.device,
         dtype=pick_dtype(args.device, args.dtype),
     )
-    engine.prepare_prompt_from_file(args.clone, args.clone_text)
+    log.info("Qwen: cloning from %s (%s)", args.clone, language)
+    with timed(log, "Prepared the clone prompt"):
+        engine.prepare_prompt_from_file(args.clone, args.clone_text)
     texts = [args.text] + ([anchor_text] if args.save_as else [])
-    rendered = engine.synthesize(texts, language=language)
+    with timed(
+        log, f"Synthesised {len(texts)} line(s)", lines=len(texts), backend="qwen"
+    ):
+        rendered = engine.synthesize(texts, language=language)
     speech = rendered[0] if rendered else None
     if speech is None:
         raise TTSError("The model returned no audio.")
@@ -1417,6 +2446,7 @@ def cmd_say(argv: Sequence[str]) -> int:
         args.output, args.save_as or "clone", speech, engine.sample_rate
     )
     release_gpu_memory()
+    log.info("Output: %s", out)
     print(f"Wrote {out}")
     return _STOP
 

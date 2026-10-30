@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ import numpy as np
 
 from .config import configure_allocator
 from .errors import TTSError
+from .logging_utils import quiet_dependencies
 from .tts import TTSEngine, resolve_dtype
 from .voice import VoiceSpec, build_prompt
 
@@ -106,6 +108,8 @@ class Result:
     #: Model output rate. Carried because the parent writes the per-line WAVs and
     #: must not have to load an engine just to learn it.
     sample_rate: int = 0
+    #: How long the task took inside :func:`execute`, in seconds.
+    seconds: float = 0.0
     #: The worker's live counters, refreshed with every result.
     stats: dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +135,9 @@ class WorkerConfig:
     dtype: str = "auto"
     batch_size: int = 8
     x_vector_only: bool = False
+    #: Mirror the parent's log level into the child, so `-v` also shows worker
+    #: load and task detail.
+    verbose: bool = False
 
 
 class Runner(Protocol):
@@ -182,6 +189,7 @@ def execute(task: Task, engine: Any, cache: dict[str, Any]) -> Result:
     spread over several cards, so the cache is what keeps that from re-encoding
     the reference once per task.
     """
+    started = time.perf_counter()
     if task.kind == BLEND:
         blended = engine.build_blended_reference(
             accent_audio=task.spec.accent_audio,
@@ -201,6 +209,7 @@ def execute(task: Task, engine: Any, cache: dict[str, Any]) -> Result:
             key=task.spec.key,
             blend=blended,
             sample_rate=int(blended.sample_rate),
+            seconds=round(time.perf_counter() - started, 3),
         )
 
     _ensure_prompt(task.spec, engine, cache)
@@ -210,6 +219,7 @@ def execute(task: Task, engine: Any, cache: dict[str, Any]) -> Result:
             key=task.spec.key,
             rate=float(engine.measure_delivery_rate(task.text, language=task.language)),
             sample_rate=_sample_rate(engine),
+            seconds=round(time.perf_counter() - started, 3),
         )
     if task.kind == SYNTH:
         texts = [text for _segment_id, text in task.lines]
@@ -223,6 +233,7 @@ def execute(task: Task, engine: Any, cache: dict[str, Any]) -> Result:
             key=task.spec.key,
             wavs=wavs,
             sample_rate=_sample_rate(engine),
+            seconds=round(time.perf_counter() - started, 3),
         )
     raise TTSError(f"Unknown synthesis task {task.kind!r}.")
 
@@ -256,6 +267,13 @@ def worker_main(config: WorkerConfig, conn: Any) -> None:
     another card and still report *why* this one was dropped, rather than an
     unexplained "worker stopped".
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s [%(processName)s] %(message)s",
+    )
+    quiet_dependencies()
+    if config.verbose:
+        _LOGGER.setLevel(logging.DEBUG)
     engine: TTSEngine | None = None
     open_error: str | None = None
     cache: dict[str, Any] = {}
@@ -269,7 +287,13 @@ def worker_main(config: WorkerConfig, conn: Any) -> None:
                 return
             if engine is None and open_error is None:
                 try:
+                    load_started = time.perf_counter()
                     engine = _open_engine(config)
+                    _LOGGER.info(
+                        "Loaded the checkpoint on %s in %.2fs",
+                        config.device,
+                        time.perf_counter() - load_started,
+                    )
                 except BaseException as exc:  # noqa: BLE001 - reported, not raised
                     open_error = (
                         f"could not load the checkpoint on {config.device}: {exc}"
@@ -292,6 +316,12 @@ def worker_main(config: WorkerConfig, conn: Any) -> None:
                     return
                 continue
             result.device = config.device
+            _LOGGER.debug(
+                "Task %s on %s finished in %.2fs",
+                task.kind,
+                config.device,
+                result.seconds,
+            )
             try:
                 result.stats = engine.synthesis_stats()
             except Exception:  # noqa: BLE001 - counters must never fail a task
@@ -325,10 +355,24 @@ class InlineRunner:
 
     def run(self, tasks: Sequence[Task]) -> list[Result]:
         results: list[Result] = []
+        started = time.perf_counter()
         for task in tasks:
             result = execute(task, self.engine, self._cache)
             result.device = str(getattr(self.engine, "device", "") or "")
             results.append(result)
+            self.log.debug(
+                "Task %s on %s in %.2fs (%d line(s))",
+                task.kind,
+                result.device or "inline",
+                result.seconds,
+                len(task.lines),
+            )
+        if tasks:
+            self.log.info(
+                "Ran %d synthesis task(s) in %.2fs",
+                len(tasks),
+                time.perf_counter() - started,
+            )
         return results
 
     def stats(self) -> list[dict[str, Any]]:
@@ -456,6 +500,7 @@ class ProcessRunner:
     def run(self, tasks: Sequence[Task]) -> list[Result]:
         if not tasks:
             return []
+        started = time.perf_counter()
         self._start()
         pending: deque[int] = deque(range(len(tasks)))
         attempts: dict[int, int] = {}
@@ -497,6 +542,13 @@ class ProcessRunner:
                     results[index] = outcome
                     worker.served += 1
                     last_device[index] = worker.device
+                    self._log.debug(
+                        "Task %d (%s) on %s in %.2fs",
+                        index,
+                        tasks[index].kind,
+                        worker.device,
+                        outcome.seconds,
+                    )
                     if outcome.stats:
                         self._latest[worker.slot] = dict(outcome.stats)
                     continue
@@ -519,6 +571,12 @@ class ProcessRunner:
                     f"Synthesis failed on every attempted device. Last error: {message}"
                 )
 
+        self._log.info(
+            "Synthesis fan-out: %d task(s) over %d device(s) in %.2fs",
+            len(tasks),
+            len(self._live()),
+            time.perf_counter() - started,
+        )
         return [results[index] for index in range(len(tasks))]
 
     def _pick(

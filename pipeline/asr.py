@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 from pydantic import BaseModel, Field
 
 from .errors import ASRError, DependencyError
+from .logging_utils import timed
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -405,7 +406,18 @@ def transcribe(
             _LOGGER.info("Preloaded %d bundled CUDA libraries; retrying on %s.", count, target_device)
 
         try:
-            return run(target_device)
+            with timed(
+                _LOGGER,
+                f"Transcribed {Path(audio_path).name}",
+                device=target_device,
+            ):
+                transcript = run(target_device)
+            _LOGGER.info(
+                "Speech recognition: %d segment(s), language=%s",
+                len(transcript.segments),
+                transcript.language or "unknown",
+            )
+            return transcript
         except RuntimeError as exc:
             if not _looks_like_cuda_library_failure(exc):
                 raise ASRError(f"Speech recognition failed: {exc}") from exc
@@ -497,7 +509,18 @@ def transcribe_many(
             )
 
         try:
-            return run(target_device)
+            with timed(
+                _LOGGER,
+                f"Transcribed {len(paths)} stream(s)",
+                device=target_device,
+            ):
+                transcripts = run(target_device)
+            _LOGGER.info(
+                "Speech recognition: %d stream(s), %d segment(s) total",
+                len(transcripts),
+                sum(len(transcript.segments) for transcript in transcripts),
+            )
+            return transcripts
         except RuntimeError as exc:
             if not _looks_like_cuda_library_failure(exc):
                 raise ASRError(f"Speech recognition failed: {exc}") from exc

@@ -1,0 +1,292 @@
+"""Fish Speech S2-Pro synthesis, isolated in a child process.
+
+Fish Speech reads emotion and paralinguistics from **inline tags in the text**
+rather than from a side-channel instruct. By default this backend renders the
+neutral :class:`ProsodySpec` into tags
+(:func:`pipeline.prosody.fish_inline_tags`) and sends the decorated lines. When
+the caller already wrote or planned the tags (``tag_mode="keep"``), the lines
+are sent untouched, because adding another prefix would stack a second,
+contradictory direction onto them.
+
+Fish pins ``torch==2.8`` and ``transformers==5.19``, which cannot coexist with
+the Qwen checkpoint's ``transformers==4.57``. The model therefore runs in
+:mod:`pipeline.fish_worker`, like CosyVoice and Chatterbox.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from .config import resolve_device
+from .errors import DependencyError, TTSError
+from .prosody import ProsodySpec, fish_inline_tags, resolve_prosody
+
+_LOGGER = logging.getLogger(__name__)
+
+__all__ = ["FishEngine", "resolve_fish_device"]
+
+#: Fallback when the checkpoint does not expose a rate; the worker reports its own.
+SAMPLE_RATE = 24_000
+
+
+def resolve_fish_device(device: str) -> str:
+    """Fish runs on one CUDA device or the CPU.
+
+    For ``auto`` the plain ``"cuda"`` is returned: the S2-Pro checkpoint in this
+    release is a FishOmni model, whose loader shards it across every visible GPU
+    (it needs ~24 GB, more than one 12 GB card). An explicit ``cuda:N`` is kept.
+    """
+    raw = str(device or "auto").strip().lower()
+    try:
+        resolved = str(resolve_device(device)).lower()
+    except Exception:  # noqa: BLE001 - an unusable device is reported by the model
+        return "cpu"
+    if not resolved.startswith("cuda"):
+        return "cpu"
+    return "cuda" if raw in {"", "auto"} else resolved
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken installs
+        return False
+
+
+class FishEngine:
+    """Synthesiser backed by Fish Speech S2-Pro, run out of process."""
+
+    def __init__(
+        self,
+        model_dir: Path | str,
+        *,
+        device: str = "auto",
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_new_tokens: int | None = None,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.device = device
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_new_tokens = max_new_tokens
+        self._sample_rate = SAMPLE_RATE
+        _LOGGER.debug(
+            "Fish engine: model=%s device=%s temperature=%s top_p=%s",
+            self.model_dir,
+            self.device,
+            temperature,
+            top_p,
+        )
+
+    @property
+    def sample_rate(self) -> int:
+        """Output sample rate, learned from the first successful synthesis."""
+        return self._sample_rate
+
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    def _python_executable(self) -> str:
+        """The interpreter the worker runs in (isolated env, like Chatterbox)."""
+        override = os.environ.get("FISH_PYTHON")
+        if override:
+            return override
+        candidate = self._project_root() / ".venv-fish" / "bin" / "python"
+        if candidate.is_file():
+            return str(candidate)
+        return sys.executable
+
+    def _worker_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(self._project_root())
+        return env
+
+    def _ensure_available(self) -> None:
+        """Whether a usable Fish installation can be found."""
+        if os.environ.get("FISH_PYTHON"):
+            if Path(os.environ["FISH_PYTHON"]).is_file():
+                return
+            raise DependencyError(
+                f"FISH_PYTHON points at {os.environ['FISH_PYTHON']}, which does "
+                "not exist."
+            )
+        if (self._project_root() / ".venv-fish" / "bin" / "python").is_file():
+            return
+        if _module_available("fish_speech"):
+            return
+        raise DependencyError(
+            "fish-speech is not installed. Create the isolated environment "
+            "described in docs/voices.md (Fish pins torch 2.8 / transformers "
+            "5.19, which conflict with Qwen), or set FISH_PYTHON to an "
+            "environment that has it. Weights: "
+            "python dub.py models --download tts_fish"
+        )
+
+    def _run_worker(self, request_path: Path, out_dir: Path) -> dict[str, Any]:
+        """Run the child and return its ``result.json`` payload."""
+        command = [
+            self._python_executable(),
+            "-m",
+            "pipeline.fish_worker",
+            str(request_path),
+        ]
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(  # noqa: S603 - argument list, shell disabled
+                command,
+                cwd=str(self._project_root()),
+                env=self._worker_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:  # pragma: no cover - interpreter failure
+            raise TTSError(f"Could not start the Fish worker: {exc}") from exc
+        elapsed = time.perf_counter() - started
+
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            if "No module named 'fish_speech'" in stderr:
+                raise DependencyError(
+                    "fish_speech could not be imported by the worker. Create the "
+                    ".venv-fish environment described in docs/voices.md, or set "
+                    "FISH_PYTHON."
+                )
+            if "CUDA out of memory" in stderr or "OutOfMemoryError" in stderr:
+                raise TTSError(
+                    "Fish Speech S2-Pro needs about 24 GB of VRAM and does not "
+                    "fit on this GPU. Retry with --device cpu (slower) or use a "
+                    "larger card."
+                )
+            tail = "\n".join(stderr.splitlines()[-12:])
+            raise TTSError(
+                f"Fish worker failed ({completed.returncode}) after "
+                f"{elapsed:.1f}s:\n{tail}"
+            )
+
+        if completed.stderr.strip():
+            _LOGGER.debug(
+                "Fish worker [%s] output:\n%s",
+                self._python_executable(),
+                completed.stderr.strip(),
+            )
+
+        result_path = out_dir / "result.json"
+        if not result_path.is_file():
+            raise TTSError("The Fish worker produced no result manifest.")
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TTSError("The Fish worker returned an invalid result.")
+        return payload
+
+    def synthesize(
+        self,
+        lines: Sequence[str],
+        *,
+        reference: Path | str,
+        prosody: Sequence[ProsodySpec] | None = None,
+        ref_text: str | None = None,
+        language: str | None = None,
+        tag_mode: str = "render",
+    ) -> list[np.ndarray]:
+        """Synthesise each line in the reference voice, tagged for delivery.
+
+        Args:
+            lines: Lines to speak, one utterance each.
+            reference: Clip of the voice to clone.
+            prosody: One spec per line; a single value broadcasts. It is mapped
+                onto Fish's inline emotion/paralinguistic tags when
+                ``tag_mode`` is ``"render"``.
+            ref_text: Transcript of ``reference``; improves cloning fidelity.
+            language: Ignored: Fish infers the language from the text.
+            tag_mode: ``"render"`` decorates the lines with
+                :func:`fish_inline_tags`; ``"keep"`` sends them as given, for
+                hand-written or LLM-written tags.
+
+        Returns:
+            One mono float32 array per line, in order.
+        """
+        if not lines:
+            return []
+
+        if tag_mode == "render":
+            specs = resolve_prosody(lines, prosody)
+            tagged = [
+                fish_inline_tags(line, spec) for line, spec in zip(lines, specs)
+            ]
+        else:
+            # The caller already directed the text; a prefix of ours would
+            # contradict it.
+            tagged = [str(line) for line in lines]
+        self._ensure_available()
+
+        _LOGGER.debug(
+            "Fish request: lines=%d reference=%s device=%s tag_mode=%s "
+            "interpreter=%s",
+            len(lines),
+            reference,
+            self.device,
+            tag_mode,
+            self._python_executable(),
+        )
+        for index, text in enumerate(tagged, start=1):
+            _LOGGER.debug("  line %d: %r", index, text)
+        started = time.perf_counter()
+
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory(prefix="qwen-tts-fish-") as tmp:
+            out_dir = Path(tmp)
+            request_path = out_dir / "request.json"
+            request: dict[str, Any] = {
+                "model_dir": str(self.model_dir),
+                "reference": str(reference),
+                "reference_text": (ref_text or "").strip(),
+                "lines": tagged,
+                "device": resolve_fish_device(self.device),
+                "verbose": _LOGGER.isEnabledFor(logging.DEBUG),
+                "output_dir": str(out_dir),
+            }
+            if self.temperature is not None:
+                request["temperature"] = float(self.temperature)
+            if self.top_p is not None:
+                request["top_p"] = float(self.top_p)
+            if self.max_new_tokens is not None:
+                request["max_new_tokens"] = int(self.max_new_tokens)
+            request_path.write_text(
+                json.dumps(request, ensure_ascii=False), encoding="utf-8"
+            )
+            result = self._run_worker(request_path, out_dir)
+
+            sample_rate = int(result.get("sample_rate", SAMPLE_RATE))
+            arrays: list[np.ndarray] = []
+            for path in result.get("files", []):
+                data, rate = sf.read(str(path), dtype="float32", always_2d=False)
+                if getattr(data, "ndim", 1) > 1:
+                    data = data.mean(axis=-1)
+                arrays.append(
+                    np.ascontiguousarray(
+                        np.asarray(data, dtype=np.float32).reshape(-1)
+                    )
+                )
+                sample_rate = int(rate)
+            if len(arrays) != len(lines):
+                raise TTSError(
+                    f"Fish returned {len(arrays)} clip(s) for {len(lines)} line(s)."
+                )
+            elapsed = time.perf_counter() - started
+            _LOGGER.info("Fish Speech: %d line(s) in %.2fs", len(lines), elapsed)
+            self._sample_rate = sample_rate
+            return arrays

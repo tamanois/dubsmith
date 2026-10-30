@@ -109,7 +109,44 @@ Fixes a long translation by wording rather than by cutting audio.
 | `--log-file PATH` | `<job folder>/run.log` | Where the run log is also written, alongside stderr. Created with its parent directory, appended to across runs (each one opens with a `Run started` line, so they stay separable), and stamped with the time so a line can be matched against `report.json` → `stage_seconds`. `LOG_FILE` sets the same default, which is why the log never invalidates a cached stage. |
 | `--log-max-bytes N` | `2097152` | Size at which the log is rotated. Once the file reaches it, it is renamed to `run-<YYYYmmdd-HHMMSS>.log` and a fresh one begins — at a run boundary, so a run is never split across two files. `0` keeps a single file forever. |
 | `--no-log-file` | off | Writes no log file at all — the escape hatch when a caller wants stderr alone. |
-| `-v` / `--verbose` | off | Debug logging, including which device each stage actually used. |
+| `-v` / `--verbose` | off | Debug logging, including the device each stage used, per-batch/per-task timings and worker detail. Third-party HTTP/model loggers stay at WARNING so the output is about this pipeline. |
+
+`dub.py say` accepts the same `--log-file`, `--no-log-file`, `--log-max-bytes` and
+`-v` flags. Its default log is `output/say/<name>/say.log` for the expressive
+backends and `output/say/<name>.log` for Qwen; each run records the backend, the
+model, the prosody plan, per-line render times and a total.
+
+### `dub.py say` options
+
+`say` takes `--text` and exactly one source: a saved `--voice`, an inline
+`--design`, an inline `--clone`, or — with `--backend customvoice` — a preset
+`--speaker`.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--backend NAME` | `qwen` | `qwen` (clone), `customvoice` (preset speaker + instruction), `cosyvoice`/`cosyvoice3` (clone + per-line prosody), `chatterbox` (clone + expression intensity), `fish` (clone + inline emotion tags), `indextts2` (clone + separate emotion reference, `--duration`). |
+| `--prosody SPEC` | — | Per-line `emotion`/`pace`/`volume`/`exaggeration` and bare `breath`/`pause`/`laughter` flags; repeat per line or broadcast one. |
+| `--emotion TEXT` | — | Shorthand for `emotion=` (alias `--instruct`); repeatable/comma-separated. On `cosyvoice` (CosyVoice2) it is passed to the model verbatim, so prefer `--prosody` there. |
+| `--style-instruct TEXT` | — | `customvoice` only: the delivery instruction, sent **verbatim** to the checkpoint. Repeatable (one per line, or one value broadcast). Wins over `--style-plan`/`--prosody`/`--emotion`/`--prosody-plan`. |
+| `--style-plan {off,llm}` | `off` | `customvoice` only: `llm` writes those verbatim instructions for you, which is the form the checkpoint expects. An explicit `--style-instruct` still wins. Requires the LLM settings. `-v` logs every request and reply. |
+| `--style-plan-scope {per-line,whole}` | `per-line` | With `--style-plan llm`: one instruction per line (chunked, with a whole-passage overview when long), or a single instruction for the entire text. |
+| `--plan-chunk N` | `LLM_PLAN_CHUNK_SIZE` (10) | Lines per planning request before `--style-plan llm` and `--prosody-plan llm` switch to the overview + chunked strategy. |
+| `--prosody-plan {off,llm}` | `off` | `llm` asks the configured OpenAI-compatible model to plan per-line prosody; explicit values still win. Skipped when `--style-instruct` or `--style-plan llm` is given. Long passages get a whole-passage overview first. `-v` logs the raw request and reply. |
+| `--speaker NAME` | — | Preset voice for `--backend customvoice` (e.g. `Vivian`, `Ryan`). |
+| `--chatterbox-exaggeration 0..1` | derive | Fixes Chatterbox's expression intensity for every line. |
+| `--chatterbox-cfg-weight FLOAT` | `0.5` | Chatterbox guidance weight. |
+| `--chatterbox-temperature FLOAT` | `0.8` | Chatterbox sampling temperature. |
+| `--fish-temperature FLOAT` | `0.7` | Fish Speech sampling temperature. |
+| `--fish-top-p FLOAT` | `0.7` | Fish Speech nucleus sampling probability. |
+| `--fish-tag-mode {render,keep,llm}` | `render` | `fish` only. `render` maps `--prosody`/`--emotion` onto the inline tags; `keep` sends `--text` as written for hand-written tags (rejects `--emotion`/`--prosody`/`--prosody-plan`); `llm` has the model write the tags into the text, guarded so the words cannot change. |
+| `--emotion-audio AUDIO` | — | `indextts2` only: a second clip whose emotion colours the delivery, while `--voice`/`--clone` fixes the timbre. |
+| `--emotion-alpha 0..1` | `1.0` | `indextts2`: how strongly `--emotion-audio` applies. Requires `--emotion-audio`. |
+| `--duration SECONDS` | — | `indextts2` only: fit each line to this many seconds. Repeat once per line, or pass one value to apply everywhere. The released IndexTTS2.0 has no native duration control, so the line is time-stretched after synthesis. |
+| `--clone-text TEXT` | — | Transcript of `--clone`; required for `qwen`, optional for CosyVoice (improves accent fidelity). |
+
+`--text` is split into one utterance per line. Both a real newline and a literal
+`\n` are treated as breaks, so `--text "one\ntwo"` works even though a shell does
+not expand `\n` inside double quotes; `$'one\ntwo'` also works.
 
 ## Subtitles only (`dub.py subtitles`)
 

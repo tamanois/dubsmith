@@ -19,6 +19,7 @@ clear error instead of the library's generic one.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -36,11 +37,13 @@ from .config import (
     reset_peak_reserved,
 )
 from .errors import DependencyError, TTSError
+from .logging_utils import timed
 
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "BlendedReference",
+    "CustomVoiceEngine",
     "DonorClip",
     "ReferenceAudio",
     "select_donor",
@@ -547,11 +550,17 @@ class TTSEngine:
         Built once and reused for every line, which avoids re-encoding the
         reference audio on each call.
         """
-        self._prompt = self.model.create_voice_clone_prompt(
-            ref_audio=(np.asarray(donor.samples, dtype=np.float32), int(donor.sample_rate)),
-            ref_text=donor.text,
-            x_vector_only_mode=self.x_vector_only,
-        )
+        with timed(
+            _LOGGER, "Built the clone prompt", level=logging.DEBUG, mode="donor"
+        ):
+            self._prompt = self.model.create_voice_clone_prompt(
+                ref_audio=(
+                    np.asarray(donor.samples, dtype=np.float32),
+                    int(donor.sample_rate),
+                ),
+                ref_text=donor.text,
+                x_vector_only_mode=self.x_vector_only,
+            )
         self.reference_seconds = 0.0 if self.x_vector_only else donor.duration
 
     def prepare_prompt_from_file(self, ref_audio: Path | str, ref_text: str) -> None:
@@ -560,11 +569,14 @@ class TTSEngine:
         # speaker-only mode the text is ignored and may legitimately be absent.
         if not self.x_vector_only and (not ref_text or not ref_text.strip()):
             raise TTSError("ref_text is required to clone from a reference file (ICL mode).")
-        self._prompt = self.model.create_voice_clone_prompt(
-            ref_audio=str(ref_audio),
-            ref_text=ref_text,
-            x_vector_only_mode=self.x_vector_only,
-        )
+        with timed(
+            _LOGGER, "Built the clone prompt", level=logging.DEBUG, mode="file"
+        ):
+            self._prompt = self.model.create_voice_clone_prompt(
+                ref_audio=str(ref_audio),
+                ref_text=ref_text,
+                x_vector_only_mode=self.x_vector_only,
+            )
         self.reference_seconds = 0.0 if self.x_vector_only else _audio_seconds(ref_audio)
 
     def prepare_hybrid_prompt(
@@ -605,29 +617,32 @@ class TTSEngine:
         if timbre is None and timbre_audio is None:
             raise TTSError("prepare_hybrid_prompt needs a timbre source.")
 
-        accent_items = self.model.create_voice_clone_prompt(
-            ref_audio=_reference_audio(accent_audio),
-            ref_text=accent_text,
-            x_vector_only_mode=False,
-        )
+        with timed(
+            _LOGGER, "Built the hybrid prompt", level=logging.DEBUG, mode="hybrid"
+        ):
+            accent_items = self.model.create_voice_clone_prompt(
+                ref_audio=_reference_audio(accent_audio),
+                ref_text=accent_text,
+                x_vector_only_mode=False,
+            )
 
-        # x-vector mode returns the speaker embedding without needing a transcript
-        # (its speech codes are discarded anyway).
-        if timbre is not None:
-            timbre_items = self.model.create_voice_clone_prompt(
-                ref_audio=(
-                    np.asarray(timbre.samples, dtype=np.float32),
-                    int(timbre.sample_rate),
-                ),
-                ref_text=timbre.text,
-                x_vector_only_mode=True,
-            )
-        else:
-            timbre_items = self.model.create_voice_clone_prompt(
-                ref_audio=str(timbre_audio),
-                ref_text="",
-                x_vector_only_mode=True,
-            )
+            # x-vector mode returns the speaker embedding without needing a
+            # transcript (its speech codes are discarded anyway).
+            if timbre is not None:
+                timbre_items = self.model.create_voice_clone_prompt(
+                    ref_audio=(
+                        np.asarray(timbre.samples, dtype=np.float32),
+                        int(timbre.sample_rate),
+                    ),
+                    ref_text=timbre.text,
+                    x_vector_only_mode=True,
+                )
+            else:
+                timbre_items = self.model.create_voice_clone_prompt(
+                    ref_audio=str(timbre_audio),
+                    ref_text="",
+                    x_vector_only_mode=True,
+                )
 
         # Keep the accent item's ref_code/ref_text/flags so `ref_ids` stay aligned
         # with the codes, and swap in the other clip's speaker embedding.
@@ -972,13 +987,22 @@ class TTSEngine:
         if not pending:
             return results
 
+        started = time.perf_counter()
+        batches = 0
         while pending:
             batch = self._take_batch(pending)
+            batches += 1
             self._release_when_tight()
             # Measured per batch, so the ceiling below reacts to what *this* call
             # asked for rather than to a high-water mark from earlier in the run.
             reset_peak_reserved(self.device)
-            wavs, sample_rate = self._generate(batch, language)
+            with timed(
+                _LOGGER,
+                f"TTS batch ({len(batch)} line(s))",
+                level=logging.DEBUG,
+                lines=len(batch),
+            ):
+                wavs, sample_rate = self._generate(batch, language)
             if len(wavs) != len(batch):
                 raise TTSError(
                     f"Model returned {len(wavs)} clips for a batch of {len(batch)} lines."
@@ -991,6 +1015,13 @@ class TTSEngine:
                     np.asarray(wav, dtype=np.float32).reshape(-1)
                 )
             pending = pending[len(batch) :]
+        elapsed = time.perf_counter() - started
+        _LOGGER.info(
+            "Synthesised %d line(s) in %d batch(es) in %.2fs",
+            len(texts),
+            batches,
+            elapsed,
+        )
         return results
 
     def measure_delivery_rate(self, text: str, *, language: str) -> float:
@@ -1013,12 +1044,21 @@ class TTSEngine:
         words = len(text.split())
         if words == 0:
             return 0.0
-        rendered = self.synthesize([text], language=language)
+        with timed(_LOGGER, "Delivery-rate probe", lines=1):
+            rendered = self.synthesize([text], language=language)
         samples = rendered[0] if rendered else None
         if samples is None or not np.asarray(samples).size:
+            _LOGGER.warning("Delivery-rate probe returned no audio.")
             return 0.0
         seconds = len(np.asarray(samples).reshape(-1)) / float(self.sample_rate)
-        return words / seconds if seconds > 0 else 0.0
+        rate = words / seconds if seconds > 0 else 0.0
+        _LOGGER.info(
+            "Delivery rate: %.2f words/s (%d word(s) in %.2fs)",
+            rate,
+            words,
+            seconds,
+        )
+        return rate
 
     def _take_batch(
         self, pending: Sequence[tuple[int, str]]
@@ -1290,4 +1330,106 @@ class VoiceDesignEngine:
         samples = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
         if samples.size == 0:
             raise TTSError("The voice-design model returned an empty clip.")
+        return samples, int(sample_rate)
+
+
+class CustomVoiceEngine:
+    """Speech synthesiser backed by the Qwen3-TTS CustomVoice checkpoint.
+
+    CustomVoice is a *named-speaker* model: it has nine preset voices and, on the
+    1.7B checkpoint, accepts a natural-language ``instruct`` that controls tone,
+    emotion and style. It is the one Qwen model that pairs a fixed voice with
+    instruction-based delivery, which is what makes it usable as a ``say``
+    backend without a reference clip. It does not clone or design a voice.
+
+    Note:
+        The 0.6B CustomVoice checkpoint ignores ``instruct``; this engine targets
+        the 1.7B checkpoint the registry points at.
+    """
+
+    #: Only the CustomVoice checkpoint implements ``generate_custom_voice``.
+    SUPPORTED_MODEL_TYPES = ("custom_voice",)
+
+    def __init__(
+        self,
+        model_dir: Path | str,
+        *,
+        device: str = "auto",
+        dtype: Any | None = None,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.device = device
+        self._dtype = dtype
+        self._model: Any | None = None
+
+    @property
+    def model(self) -> Any:
+        """Load the checkpoint on first use and keep it resident."""
+        if self._model is None:
+            self._model = self._load()
+        return self._model
+
+    def _load(self) -> Any:
+        try:
+            from qwen_tts import Qwen3TTSModel
+        except ImportError as exc:  # pragma: no cover - config dependent
+            raise DependencyError(
+                "qwen-tts is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+
+        from .config import resolve_device
+
+        device = resolve_device(self.device)
+        self.device = device
+        model = Qwen3TTSModel.from_pretrained(
+            str(self.model_dir),
+            device_map=device,
+            dtype=self._dtype if self._dtype is not None else resolve_dtype(device),
+            attn_implementation="sdpa",
+            local_files_only=True,
+        )
+        model_type = getattr(model.model, "tts_model_type", None)
+        if model_type not in self.SUPPORTED_MODEL_TYPES:
+            raise TTSError(
+                f"Checkpoint at {self.model_dir} has tts_model_type={model_type!r}, "
+                "which does not support custom voices. Download it with: "
+                "python dub.py models --download tts_custom_voice"
+            )
+        return model
+
+    def speakers(self) -> list[str]:
+        """The preset speaker names this checkpoint exposes, if any."""
+        try:
+            names = self.model.get_supported_speakers()
+        except Exception:  # noqa: BLE001 - a checkpoint may not expose the list
+            return []
+        return [str(name) for name in (names or [])]
+
+    def generate(
+        self,
+        text: str,
+        speaker: str,
+        instruct: str,
+        language: str,
+    ) -> tuple[np.ndarray, int]:
+        """Synthesise ``text`` in ``speaker``'s voice, styled by ``instruct``.
+
+        Returns:
+            ``(samples, sample_rate)`` for a single mono clip.
+
+        Raises:
+            TTSError: If the model returns nothing usable.
+        """
+        wavs, sample_rate = self.model.generate_custom_voice(
+            text=text,
+            speaker=speaker,
+            language=language,
+            instruct=instruct or None,
+            non_streaming_mode=True,
+        )
+        if not wavs:
+            raise TTSError("The custom-voice model returned no audio.")
+        samples = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            raise TTSError("The custom-voice model returned an empty clip.")
         return samples, int(sample_rate)

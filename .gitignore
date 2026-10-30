@@ -8,7 +8,7 @@
 *.webm
 models/
 .venv
-
+.venv*
 # Job artifacts (dubbed video, subtitles, reports, manifests). The glob covers
 # ad-hoc roots such as `output_cpu/` used for hardware comparisons.
 output*/
@@ -16,6 +16,9 @@ input/
 
 # Saved voice prints: reference audio and its transcript are personal data.
 voices/
+
+# Third-party checkouts and the CosyVoice transformers overlay.
+third_party/
 
 # Local configuration: may contain API keys
 .env

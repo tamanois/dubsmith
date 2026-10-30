@@ -14,6 +14,7 @@ from pipeline.asr import Segment
 from pipeline.errors import TTSError
 from pipeline.tts import (
     BlendedReference,
+    CustomVoiceEngine,
     DonorClip,
     TTSEngine,
     _donor_ratio,
@@ -1160,3 +1161,58 @@ class TestKnnSpeakerSelection:
         engine = engine_with(FakeQwenModel())
         with pytest.raises(TTSError, match="ref_text is required"):
             engine.prepare_prompt_from_file("ref.wav", "")
+
+
+class _FakeCustomModel:
+    """Minimal CustomVoice model recording the generation call."""
+
+    def __init__(self) -> None:
+        self.kwargs: dict[str, Any] = {}
+
+    def get_supported_speakers(self) -> list[str]:
+        return ["Vivian", "Ryan"]
+
+    def generate_custom_voice(self, **kwargs: Any):
+        self.kwargs = kwargs
+        return [np.zeros(100, dtype=np.float32)], SR
+
+
+class TestCustomVoiceEngine:
+    def test_generates_with_an_instruct(self) -> None:
+        engine = CustomVoiceEngine("m", device="cpu")
+        fake = _FakeCustomModel()
+        engine._model = fake
+
+        samples, rate = engine.generate(
+            "hello", "Vivian", "Speak in an angry tone.", "English"
+        )
+
+        assert rate == SR
+        assert samples.size == 100
+        assert fake.kwargs["speaker"] == "Vivian"
+        assert fake.kwargs["instruct"] == "Speak in an angry tone."
+        assert fake.kwargs["language"] == "English"
+
+    def test_forwards_a_long_instruction_unchanged(self) -> None:
+        engine = CustomVoiceEngine("m", device="cpu")
+        fake = _FakeCustomModel()
+        engine._model = fake
+        instruction = (
+            "Speak with restrained anger. Begin quietly, with controlled "
+            'frustration. Gradually increase the intensity, emphasizing "not", '
+            "then finish with a disappointed, exhausted tone."
+        )
+
+        engine.generate(
+            "I told you not to open that door.", "Ryan", instruction, "English"
+        )
+
+        assert fake.kwargs["instruct"] == instruction
+        assert fake.kwargs["speaker"] == "Ryan"
+        assert fake.kwargs["language"] == "English"
+
+    def test_lists_speakers(self) -> None:
+        engine = CustomVoiceEngine("m", device="cpu")
+        engine._model = _FakeCustomModel()
+
+        assert engine.speakers() == ["Vivian", "Ryan"]

@@ -139,8 +139,61 @@ python dub.py voices --clone --audio me.wav --clone-text "…" --lang fr --label
 python dub.py voices --list
 
 python dub.py say --voice warm-fr --text "Bonjour, ceci est un test."
+python dub.py say --voice warm-fr --backend cosyvoice --text "…" --prosody "emotion=excited"
+python dub.py say --voice warm-fr --backend cosyvoice3 --text "…" --prosody "emotion=happy, pace=fast, breath"
+python dub.py say --voice warm-fr --backend chatterbox --text "…" --prosody "emotion=happy, exaggeration=0.8" --lang fr
+python dub.py say --backend customvoice --speaker Vivian --lang en --text "…" --prosody "emotion=excited, pace=fast"
+python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
+  --style-instruct "Speak with restrained anger, then fade to exhaustion."
+python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
+  --style-plan llm
+python dub.py say --voice warm-fr --backend fish --text "…" --emotion excited
+python dub.py say --voice warm-fr --backend indextts2 --text "…" \
+  --emotion-audio colere.wav --emotion-alpha 0.8 --duration 3.2
 python dub.py --video talk.mp4 --target en --voice warm-fr
 ```
+
+Expressive backends (`cosyvoice`, `cosyvoice3`, `chatterbox`, `fish` and
+`indextts2` clone the voice from the same reference clip; `customvoice` pairs a
+preset speaker with an instruction):
+
+| Backend | Languages | What it adds |
+|---|---|---|
+| `customvoice` | 10 | preset Qwen speaker + tone/emotion instruction (no clone) |
+| `cosyvoice` (CosyVoice2) | zh, en, ja, ko, yue | per-line emotion/style instruct |
+| `cosyvoice3` | 9, **incl. French** | emotion, pace, volume, `[breath]`, `[laughter]` |
+| `chatterbox` | 23, **incl. French** | configurable expression intensity (+ natural prosody) |
+| `fish` (Fish Speech S2-Pro) | ~100 | cloned voice + inline `[excited]`/`[whisper]`/`[sad]` tags |
+| `indextts2` | zh, en, ja | cloned voice + a separate emotion reference + `--duration` fit |
+
+CustomVoice speakers: `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`, `Eric` (Chinese),
+`Ryan`, `Aiden` (English), `Ono_Anna` (Japanese), `Sohee` (Korean) — descriptions
+and native languages in
+[docs/voices.md](docs/voices.md#expressive-backends-cosyvoice3-and-chatterbox).
+
+`--prosody` is the structured per-line control (repeat once per line, or pass one
+value to apply everywhere):
+
+| Field | Accepted values |
+|---|---|
+| `emotion` | free-form; CosyVoice uses the trained `happy`/`sad`/`angry` (aliases map) |
+| `pace` | `normal`, `slow`, `fast` |
+| `volume` | `normal`, `soft`, `loud` |
+| `exaggeration` | `0.0`–`1.0` (Chatterbox's own intensity knob) |
+| `breath`, `pause`, `laughter` | bare flags |
+
+`--prosody-plan llm` lets the configured OpenAI-compatible model choose those
+values from the text; an explicit `--prosody`/`--emotion` then overrides it.
+`--style-instruct TEXT` (`customvoice` only) sends a full delivery instruction
+verbatim instead, which is the natural-language form that checkpoint expects and
+the most expressive option; it wins over `--prosody`. `--style-plan llm`
+(`customvoice` only) has the model write that instruction for you, one per line
+(`--style-plan-scope whole` writes a single one for the whole text); above
+`LLM_PLAN_CHUNK_SIZE` lines (default 10, or `--plan-chunk`) it first reads the
+whole text for an overview, then plans each chunk against it. Note that
+`--instruct` is an alias of `--emotion`, not of `--style-instruct`.
+Per-backend limitations (Chatterbox has no breath/laughter tokens; CosyVoice2
+languages) and the full value lists are in [docs/voices.md](docs/voices.md).
 
 **Multi-speaker videos**
 
@@ -179,7 +232,7 @@ python -m pytest
 ```
 
 ```text
-1105 passed
+1270 passed
 ```
 
 Run one area while iterating:
