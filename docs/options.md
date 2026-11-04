@@ -55,6 +55,9 @@ should be delivered.
 | `--fish-top-p FLOAT` | `0.7` | `fish` nucleus sampling probability. |
 | `--fish-quantize {int8,off}` | `int8` | `fish` weight format: `int8` fits a 12 GB card, `off` loads the bf16 weights. |
 
+Fish S2-Pro weights are non-commercial; see [Model licenses](model-licenses.md).
+The default `qwen` path does not use Fish.
+
 The plan is written from the **translated** lines; a long video is chunked with
 a whole-passage overview so the delivery keeps one arc. Fish has no side
 channel, so its plan is the text itself: tags are written into each line, guarded
@@ -150,6 +153,36 @@ Fixes a long translation by wording rather than by cutting audio.
 | `--llm-model NAME` | from `.env` | Overrides `LLM_MODEL` for this run. |
 | `--tts-batch N` | `8` | Most lines synthesised in one model call. The engine additionally budgets a batch by the audio that will be **decoded**, which includes the clone reference once per line — that term dominates, so this is the ceiling and the escape hatch. Lower it if a long video still runs out of GPU memory; see [Memory on a long video](performance.md#memory-on-a-long-video). |
 | `MODELS_DIR` (env) | `models` | Where weights live. Set in `.env`; the download command also takes `--models-dir`. |
+
+### Environment variables
+
+Real environment variables win over `.env`. `dub info` shows the resolved paths
+and optional packages.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLM_BASE_URL` | `http://127.0.0.1:8080/v1` | OpenAI-compatible endpoint used for translation and optional planning |
+| `LLM_API_KEY` | `not-needed` | API key for that endpoint |
+| `LLM_MODEL` | `local-model` | Model name sent to the endpoint |
+| `LLM_TIMEOUT_S` | `180` | Per-request timeout |
+| `LLM_CHUNK_SIZE` | `40` | Lines per translation request |
+| `LLM_PLAN_CHUNK_SIZE` | `10` | Lines per prosody/style planning request |
+| `LOUDNESS_TARGET` | `match-source` | `match-source` or `lufs` |
+| `LOUDNESS_LUFS` | `-16` | Absolute target when `LOUDNESS_TARGET=lufs` |
+| `KEEP_BACKGROUND` | `true` | Keep and duck the original music/ambience |
+| `BACKGROUND_SEPARATOR` | `auto` | `auto`, `demucs`, or `none` |
+| `DUCK_DB` | `6.0` | Background attenuation under dialogue |
+| `MODELS_DIR` | `models` | Weight directory |
+| `VOICES_DIR` | `voices` | Saved voice library |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `LOG_JSON` | `0` | `1` emits one JSON object per line |
+| `LOG_FILE` | unset | Also write the log here; CLI default is the job folder |
+| `CHATTERBOX_PYTHON` | `.venv-chatterbox/bin/python` | Interpreter for the Chatterbox worker |
+| `FISH_PYTHON` | `.venv-fish/bin/python` | Interpreter for the Fish worker |
+| `FISH_MAX_SEQ_LEN` | `4096` | Context cap for Fish line-level work |
+| `COSYVOICE_PYTHONPATH` | unset | Extra paths prepended to the CosyVoice child process |
+| `HF_TOKEN` | unset | Hugging Face token for gated model downloads (read by `huggingface_hub`) |
+| `HF_HUB_OFFLINE` | unset | Set to `1` to prevent network access to the Hub |
 
 ## Output and caching
 

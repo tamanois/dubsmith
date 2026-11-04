@@ -113,8 +113,11 @@ def build_models_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--download",
-        metavar="NAME|all",
-        help="Download one model by name, or 'all' for the MVP-required set.",
+        metavar="NAME|all|everything",
+        help=(
+            "Download one model by name, 'all' for the MVP-required set, or "
+            "'everything' to include optional backends."
+        ),
     )
     parser.add_argument(
         "--force", action="store_true", help="Re-download even when already present."

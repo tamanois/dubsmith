@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/tamanois/dubsmith/blob/main/docs/README.md
+    about: Setup, usage, options, voices, troubleshooting
+  - name: Security report
+    url: https://github.com/tamanois/dubsmith/security/advisories/new
+    about: Report a vulnerability privately

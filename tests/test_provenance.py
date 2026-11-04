@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from pipeline.prosody import ProsodySpec
 from pipeline.provenance import (
     LineProvenance,
     NullRecorder,
@@ -12,7 +13,6 @@ from pipeline.provenance import (
     describe_transformations,
     timed_provenance_path,
 )
-from pipeline.prosody import ProsodySpec
 
 
 def test_timed_path_is_unique_within_a_second(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@
 #   AMD (ROCm)   see https://pytorch.org/get-started/locally/
 #
 # Install numpy and typing_extensions FIRST if your environment struggles to
-# resolve them together with torch (see packages.md).
+# resolve them together with torch.
 #
 # System binaries (ffmpeg, rubberband) are NOT installed here.
 # See README.md -> "Prerequisites" for the copy-paste install commands.
@@ -36,6 +36,7 @@ pydantic==2.13.5
 # Pipeline stages
 qwen-tts==0.1.1        # voice cloning / TTS (Qwen3-TTS)
 faster-whisper==1.2.1  # ASR (ships its own Silero VAD, no extra dependency)
+huggingface-hub>=0.23  # model download and cache resolution
 pyloudnorm==0.2.0      # EBU R128 loudness measurement + normalisation
 openai==3.19.0         # OpenAI-compatible client used for translation
 
@@ -68,7 +69,7 @@ openai==3.19.0         # OpenAI-compatible client used for translation
 # ~/.cache/speechbrain.
 #
 # Optional, like demucs and funasr: uncomment, or install the packaged extra.
-#   pip install "qwen-tts-dub[separation]"
+#   pip install "dubsmith[separation]"
 #speechbrain
 
 # Optional: CUDA 12 runtime libraries for **GPU speech recognition**.

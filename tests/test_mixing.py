@@ -96,7 +96,7 @@ class TestDuckAndMix:
         dubbed[int(3.0 * SR) : int(5.0 * SR)] = tone(2.0, amplitude=0.5)
         bed = tone(8.0, amplitude=0.2)
 
-        mixed = duck_and_mix(dubbed, bed, [(3.0, 5.0)], SR, duck_db=6.0)
+        duck_and_mix(dubbed, bed, [(3.0, 5.0)], SR, duck_db=6.0)
 
         # Compare the bed-only region with the ducked region's non-speech floor by
         # mixing a silent dub in, so only the bed is present.

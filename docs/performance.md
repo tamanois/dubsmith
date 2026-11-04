@@ -58,7 +58,7 @@ that does not ask for a fan-out does exactly what it did before. Repeating a nam
 allowed (`--devices cpu,cpu`), which is how the fan-out is tested on a machine with
 one processor.
 
-A full dub was run this way (`input/change-the-world.mp4`, 22 s, `--accent-mode
+A full dub was run this way (a 22 s speech clip, `--accent-mode
 preserve`): both cards took work, the peaks were 5.31 GiB and 4.93 GiB — each inside
 its own ceiling and independent of the other — and `audit_qc.py` exited 0.
 

@@ -13,7 +13,6 @@ import pytest
 from pipeline.asr import Segment
 from pipeline.errors import TTSError
 from pipeline.tts import (
-    BlendedReference,
     CustomVoiceEngine,
     DonorClip,
     TTSEngine,

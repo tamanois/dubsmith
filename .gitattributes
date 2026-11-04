@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+*.py text diff=python
+*.md text
+*.toml text
+*.yaml text
+*.yml text
+
+*.wav binary
+*.mp3 binary
+*.flac binary
+*.m4a binary
+*.mp4 binary
+*.mkv binary
+*.mov binary
+*.webm binary
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

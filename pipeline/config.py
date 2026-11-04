@@ -141,7 +141,7 @@ def language_code_for_name(name: str | None) -> str | None:
         return None
     if key.lower() in CODE_TO_NAME:
         return key.lower()
-    return NAME_TO_CODE.get(key, None)
+    return NAME_TO_CODE.get(key)
 
 
 # --------------------------------------------------------------------------- #

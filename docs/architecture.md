@@ -49,7 +49,7 @@ Three design points worth knowing:
 ## Project layout
 
 ```
-dub.py                     CLI entry point (`dub`, `dub info`, `dub models`, `dub voices`, `dub say`)
+dub.py                     CLI entry point (`dub`, `dub info`, `dub models`, `dub voices`, `dub say`, `dub subtitles`, `dub anchors`)
 audit_timbre.py            per-line speaker-timbre audit (--device cpu works)
 audit_qc.py                automated quality gate for a finished job
 LICENSE                    Apache-2.0
@@ -67,24 +67,28 @@ pipeline/
 ├── separation.py          speech/background split (Demucs)
 ├── mixing.py              ducking, bed mix and room matching (pure numpy)
 ├── translate.py           OpenAI-compatible translation
-├── tts.py                 per-speaker donor selection + voice cloning
+├── tts.py                 per-speaker donor selection + Qwen voice cloning
+├── backends.py            CosyVoice3 / Chatterbox / Fish engine construction
 ├── voice.py               one voice: the facts that build its clone prompt
-├── voices.py              saved voices: clip + manifest + stored encoding
+├── voices.py              saved voices: clip + manifest + stored encoding (cards)
 ├── provenance.py          emotion/prosody provenance artifact (schema + recorder)
 ├── parallel.py            fan-out: tasks, the worker pool, per-device counters
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (1105 tests, no GPU or models needed)
+tests/                     pytest suite (1354 tests, no GPU or models needed)
 models/                    downloaded weights (gitignored)
-voices/                    saved voices: clip, manifest and encoding (gitignored)
+voices/                    saved voices: clip, manifest, encoding and provenance (gitignored)
 output/                    job artifacts (gitignored)
-docs/                      user documentation (this folder)
-clone.py, main.py          standalone TTS demos kept for reference
+docs/                      user documentation, model licenses, development guidelines
+docs/voice-generation.md   `dub say`, expressive backends and emotion
+docs/model-licenses.md     code vs weights licenses and commercial boundaries
 pyproject.toml             packaging, entry points, optional extras, pytest config
 .github/workflows/ci.yml   test suite on a CPU-only runner
 PLAN.md                    roadmap: MVP + P1–P10
-.agents/technical-guidelines.md   engineering standards
+NOTICE                     Apache-2.0 attribution
+CONTRIBUTING.md            DCO, development setup and docs policy
+SECURITY.md                private vulnerability reporting
 ```
 
 ---

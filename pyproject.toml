@@ -5,24 +5,38 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Named `qwen-tts-dub`, not `qwen-tts`: that name belongs to the TTS checkpoint's
-# own package, which is a *dependency* here.
-name = "qwen-tts-dub"
+# Named `dubsmith`: `qwen-tts` belongs to the TTS checkpoint's own package, which
+# is a *dependency* here. The public identity stays independent of one backend.
+name = "dubsmith"
 # Single-sourced from pipeline/__init__.py so the CLI, the package metadata and
 # `dub.py --version` cannot disagree.
 dynamic = ["version"]
-description = "Dub a video into another language while keeping each speaker's own voice timbre."
+authors = [{ name = "The Dubsmith authors" }]
+maintainers = [{ name = "The Dubsmith authors" }]
+description = "AI dubbing and expressive voice generation with local voice cloning."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
-keywords = ["dubbing", "translation", "tts", "voice-cloning", "whisper"]
+license-files = ["LICENSE", "NOTICE"]
+keywords = [
+    "dubbing",
+    "translation",
+    "tts",
+    "voice-cloning",
+    "voice-design",
+    "emotion",
+    "whisper",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 dependencies = [
@@ -34,9 +48,17 @@ dependencies = [
     "pydantic>=2.0",
     "qwen-tts",
     "faster-whisper",
+    "huggingface-hub>=0.23",
     "pyloudnorm",
     "openai",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tamanois/dubsmith"
+Repository = "https://github.com/tamanois/dubsmith"
+Issues = "https://github.com/tamanois/dubsmith/issues"
+Documentation = "https://github.com/tamanois/dubsmith/blob/main/docs/README.md"
+Changelog = "https://github.com/tamanois/dubsmith/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # Every one of these degrades gracefully when absent, so they are extras rather
@@ -49,7 +71,15 @@ separation = ["speechbrain"]
 # The pipeline preloads them itself, so no LD_LIBRARY_PATH is needed.
 gpu-asr = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 full = ["demucs", "funasr", "modelscope", "speechbrain"]
-dev = ["pytest>=8.0", "funasr", "modelscope"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
+    "build",
+    "twine",
+    "funasr",
+    "modelscope",
+]
 
 [project.scripts]
 dub = "dub:main"
@@ -71,3 +101,34 @@ addopts = "-q --strict-markers"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "SIM", "S", "A", "BLE"]
+# E501: the codebase already contains long help strings and docs; formatting is
+# a separate cleanup. B905: zip(strict=) is a Python 3.10+ style choice, not a
+# correctness gate for this code yet. The remaining ignores are deliberate
+# patterns (invariant asserts, best-effort cleanup, test probes).
+ignore = [
+    "E501",
+    "B905",
+    "S101",
+    "B017",
+    "A002",
+    "SIM117",
+    "SIM105",
+    "S110",
+    "E731",
+    "B007",
+    "B018",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S603", "S607"]
+
+[tool.coverage.run]
+source = ["pipeline", "dub", "audit_qc", "audit_timbre"]
+omit = ["pipeline/*_worker.py"]

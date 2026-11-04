@@ -10,7 +10,7 @@ Full installation and configuration. For the copy-paste happy path, see
 | **Disk** | ~10 GB of model weights (`models/` is gitignored), plus your media and the generated accent anchors |
 | **GPU** | Optional, but strongly recommended. ~12 GB VRAM runs the default path comfortably: each TTS checkpoint is ~3.5 GB in bfloat16 and Whisper large-v3 ~3 GB. The two TTS checkpoints are never resident together |
 | **CPU only** | Works end to end and produces the same *result*. Measured on a 12-core box: a 22 s clip dubs in **2:10** (`preserve`) or **5:18** (`reference-accent`), with every quality gate passing. Synthesis is ~4.3× realtime in float32, so the real constraint is **RAM** (12.7–17.2 GB peak), not patience |
-| **Python** | 3.10 or newer |
+| **Python** | 3.10–3.12. `numpy==1.26.4` has no 3.13 wheels, so `pip install .` fails on 3.13 |
 
 The precision follows the hardware rather than the device name — bfloat16 on
 Ampere and newer, float16 on older accelerators (Turing, Volta), float32 on CPU.
@@ -31,6 +31,15 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg rubberband-cli sox
 ```
 
+On macOS:
+
+```bash
+brew install ffmpeg rubberband sox
+```
+
+On Windows, use WSL2 and follow the Debian instructions. Native Windows is not
+currently tested; `ffmpeg` must be on `PATH` either way.
+
 | Binary | Required? | Used for | If missing |
 |---|---|---|---|
 | `ffmpeg` / `ffprobe` | **Required for video** | audio extraction, muxing, probing | video input fails with a clear error; **audio-only input still works** |
@@ -48,12 +57,14 @@ input genuinely requires `ffmpeg`.
 
 ### 2. Python
 
-Python **3.10+** is required (developed and tested on 3.10.12).
+Python **3.10–3.12** is required (developed and tested on 3.10.12; CI covers
+3.10, 3.11 and 3.12).
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install .              # or: pip install -r requirements.txt
+pip check
 ```
 
 The package installs a `dub` command, so `python dub.py --target fr` and
@@ -75,12 +86,23 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install .
 ```
 
-> If dependency resolution is awkward, install the two pins first — this is what
-> [`packages.md`](../packages.md) refers to:
+> If dependency resolution is awkward, install the two pins first:
 > ```bash
 > pip install numpy==1.26.4 typing_extensions
 > pip install -r requirements.txt
 > ```
+
+After installing, verify the CLI and the environment:
+
+```bash
+dub --version
+dub info
+dub models --list
+```
+
+If a checkpoint is gated on Hugging Face, authenticate once with `hf auth login`
+(or set `HF_TOKEN`). For an offline machine, pre-download the weights and set
+`HF_HUB_OFFLINE=1`.
 
 **GPU is optional.** With CUDA or ROCm the pipeline runs there; without one
 everything still runs on CPU, just much slower. Speech recognition always uses
@@ -95,6 +117,7 @@ Python packages installed by `requirements.txt`:
 | `torch` | model runtime |
 | `qwen_tts` | voice-cloning TTS |
 | `faster-whisper` | ASR (bundles its own Silero VAD) |
+| `huggingface-hub` | model download and cache resolution |
 | `pyloudnorm` | EBU R128 loudness normalisation |
 | `openai` | client for the OpenAI-compatible translation endpoint |
 | `librosa`, `soundfile` | audio I/O, resampling, fallback stretching |
@@ -188,8 +211,9 @@ Optional models (registered but not needed for the MVP):
 |---|---|---|
 | `tts_custom_voice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 premium named voices + emotion instructions |
 | `tts_tokenizer` | `Qwen/Qwen3-TTS-Tokenizer-12Hz` | standalone tokenizer (already bundled in `tts_base`) |
-| `tts_cosyvoice3` | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | cloned voice + per-line emotion/pace/volume (`dub say --backend cosyvoice3`) |
-| `tts_fish` | `fishaudio/s2-pro` | Fish Speech S2-Pro: cloned voice + inline tags (`dub say --backend fish`) |
+| `tts_cosyvoice3` | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | cloned voice + per-line emotion/pace/volume (`--backend cosyvoice3`) |
+| `tts_chatterbox` | `ResembleAI/chatterbox` | cloned voice + expression intensity (`--backend chatterbox`) |
+| `tts_fish` | `fishaudio/s2-pro` | Fish Speech S2-Pro: cloned voice + inline tags (`--backend fish`); **non-commercial weights** |
 
 You can also copy a model directory in by hand — anything present under `MODELS_DIR`
 is detected automatically. Override the location with `MODELS_DIR` in `.env`, which
@@ -267,11 +291,33 @@ and unlike the previous generation it covers French and a handful of other
 European languages. See
 [Voices](voices.md#expressive-backends-cosyvoice3-chatterbox-and-fish).
 
+## Chatterbox (optional, expressive speech)
+
+`dub say --backend chatterbox` or `dub --backend chatterbox` adds a single
+expression-intensity control to a cloned voice. It is optional; the default Qwen
+path works without it.
+
+Chatterbox pins `torch==2.6` and `transformers==5.2`, which cannot coexist with
+the Qwen checkpoint or the CosyVoice overlay. Keep it in its own environment at
+`.venv-chatterbox` (or wherever `CHATTERBOX_PYTHON` points):
+
+```bash
+python3 -m venv .venv-chatterbox
+.venv-chatterbox/bin/pip install torch==2.6.0 torchaudio==2.6.0 \
+  --index-url https://download.pytorch.org/whl/cu124
+.venv-chatterbox/bin/pip install chatterbox-tts==0.1.7
+python dub.py models --download tts_chatterbox   # weights, ~3 GB
+```
+
+On a CPU-only machine, install the CPU torch wheel instead of the CUDA index.
+The backend runs in a child process; no `PYTHONPATH` export is needed.
+
 ## Fish Speech S2-Pro (optional, expressive speech)
 
-`dub say --backend fish` clones a voice and reads emotion/paralinguistic tags
-inline in the text. It is optional, and loads its weights **int8 by default**, so
-it runs on a 12 GB card (~6 GB resident, ~11 GB peak).
+`dub say --backend fish` or `dub --backend fish` clones a voice and reads
+emotion/paralinguistic tags inline in the text. It is optional, and loads its
+weights **int8 by default**, so it runs on a 12 GB card (~6 GB resident, ~11 GB
+peak).
 
 Fish pins `torch==2.8` and `transformers==5.19`, which conflict with the Qwen
 checkpoint. Install it in its own environment:

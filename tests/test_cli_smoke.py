@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 
 from dub import (
+    _parse_emotions,
+    _say_lines,
     build_dub_parser,
     build_say_parser,
     build_voices_parser,
@@ -22,8 +24,6 @@ from dub import (
     log_file_from,
     main,
     render_environment,
-    _parse_emotions,
-    _say_lines,
 )
 from pipeline import __version__
 from pipeline.config import JobConfig, Settings
@@ -1288,7 +1288,7 @@ def test_dtype_is_part_of_the_fingerprint() -> None:
 
 
 @pytest.mark.parametrize("backend", ["fish"])
-def test_say_parser_accepts_the_new_backends(backend: str) -> None:
+def test_say_parser_accepts_the_fish_backend(backend: str) -> None:
     args = build_say_parser().parse_args(
         ["--voice", "x", "--text", "hi", "--backend", backend]
     )

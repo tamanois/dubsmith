@@ -43,8 +43,8 @@ from .asr import (
     transcribe_many,
 )
 from .config import (
-    JobConfig,
     NAME_TO_CODE,
+    JobConfig,
     Settings,
     configure_allocator,
     language_code_for_name,
@@ -52,11 +52,16 @@ from .config import (
     probe_device,
     release_gpu_memory,
 )
-from .diarize import NullDiarizer, assign_streams, detect_diarizer, single_speaker_labels
-from .errors import ASRError, DubbingError, MediaError, TTSError, TimingError
+from .diarize import (
+    NullDiarizer,
+    assign_streams,
+    detect_diarizer,
+    single_speaker_labels,
+)
+from .errors import ASRError, MediaError, TTSError
 from .logging_utils import job_logger
-from .models import anchors_dir, resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
+from .models import anchors_dir, resolve_model
 from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
 from .parallel import (
     BLEND,
@@ -2623,8 +2628,8 @@ class Pipeline:
         Blank lines map to ``None`` (they are never sent to the engine), matching
         the Qwen path so the timing stage can emit a matching stretch of silence.
         """
-        from .provenance import LineProvenance, describe_transformations
         from .prosody import ProsodySpec
+        from .provenance import LineProvenance, describe_transformations
 
         prosody = prosody or {}
         engine = self._resolve_expressive_engine()

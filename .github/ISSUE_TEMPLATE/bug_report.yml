@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a crash, wrong output, or setup failure
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Do not upload real voices, private media, API keys, or
+        full transcripts. Use synthetic or public-domain samples.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the exact command and what you expected.
+      placeholder: |
+        Command:
+        Expected:
+        Actual:
+    validations:
+      required: true
+  - type: textarea
+    id: info
+    attributes:
+      label: Environment
+      description: Paste `python dub.py info` (remove paths/secrets if needed) and the OS/Python version.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log or report
+      description: Paste `report.json`, `prosody.json`, or the relevant log lines.
+      render: text
+  - type: dropdown
+    id: backends
+    attributes:
+      label: Optional backends installed
+      multiple: true
+      options:
+        - None
+        - Demucs
+        - FunASR / ModelScope
+        - SpeechBrain
+        - Chatterbox
+        - CosyVoice3
+        - Fish Speech
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed secrets and private voice data from this report.
+          required: true
+        - label: I searched existing issues.
+          required: true

@@ -376,7 +376,7 @@ def transcribe(
         ASRError: If no usable speech is found, or every device fails.
     """
     try:
-        from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel  # noqa: F401 - availability probe
     except ImportError as exc:  # pragma: no cover - exercised via CLI paths
         raise DependencyError(
             "faster-whisper is not installed. Run: pip install -r requirements.txt"

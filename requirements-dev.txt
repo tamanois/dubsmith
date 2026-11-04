@@ -6,6 +6,10 @@
 -r requirements.txt
 
 pytest>=8.0
+pytest-cov
+ruff
+build
+twine
 
 # The optional multi-speaker backend, so the diarization path is covered here
 # rather than silently skipped. See requirements.txt for the constraints note.

@@ -1,3 +1,49 @@
+# Local data, weights and artifacts. Anchor these so a future source directory
+# named `models/` or `voices/` is not swallowed by accident.
+/models/
+/voices/
+/input/
+/output*/
+/third_party/
+/.venv*/
+/.stretch_tmp/
+
+# Saved voice prints: reference audio and transcripts are personal data.
+
+# Local configuration: may contain API keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Logs and OS/tooling cruft
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# Model weights outside models/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+
+# Media (audio/video)
 *.wav
 *.mp3
 *.flac
@@ -6,30 +52,7 @@
 *.mkv
 *.mov
 *.webm
-models/
-.venv
-.venv*
-# Job artifacts (dubbed video, subtitles, reports, manifests). The glob covers
-# ad-hoc roots such as `output_cpu/` used for hardware comparisons.
-output*/
-input/
 
-# Saved voice prints: reference audio and its transcript are personal data.
-voices/
-
-# Third-party checkouts and the CosyVoice transformers overlay.
-third_party/
-
-# Local configuration: may contain API keys
-.env
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.stretch_tmp/
-
-# Packaging artifacts
-build/
-dist/
-*.egg-info/
+# …but allow small, consented demo assets.
+!docs/media/**
+!examples/media/**

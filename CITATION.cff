@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Dubsmith: AI dubbing and expressive voice generation"
+abstract: "Dub video into another language while keeping each speaker's voice timbre, or generate speech from a saved or designed voice with per-line emotion."
+type: software
+license: Apache-2.0
+version: 0.2.0
+date-released: 2026-11-04
+authors:
+  - name: "The Dubsmith authors"
+repository-code: "https://github.com/tamanois/dubsmith"
+keywords:
+  - dubbing
+  - text-to-speech
+  - voice-cloning
+  - speech-translation
+  - whisper
+  - qwen3-tts

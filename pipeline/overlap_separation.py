@@ -22,7 +22,7 @@ TTS in the matched speaker's own voice.
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import numpy as np
 

@@ -1,7 +1,8 @@
 # Voices
 
-The saved voice library, the four accent modes, and how to borrow a native accent
-without losing the speaker's timbre.
+The saved voice library, voice cards, the four accent modes, and how to borrow a
+native accent without losing the speaker's timbre. For a task-oriented overview of
+`dub say` and expressive backends, see [Voice generation](voice-generation.md).
 
 ## Voice library (saved voices)
 
@@ -18,14 +19,14 @@ python dub.py voices --design \
   --lang fr --label warm-fr
 
 # 2. encode a donated clip once (Base checkpoint) — nothing is re-synthesised
-python dub.py voices --clone --audio input/Delphine-Charming.mp3 \
-  --clone-text "Bonjour, je suis Delphine. Comment tu vas ?" \
-  --lang fr --label delphine
+python dub.py voices --clone --audio me.wav \
+  --clone-text "Bonjour, je m'appelle Camille." \
+  --lang fr --label me
 
 # 3. register a clip verbatim: no model, no GPU, no processing
-python dub.py voices --add input/me.wav \
-  --clone-text "Bonjour, je m'appelle Joël." --lang fr --label me
-python dub.py voices --add input/me.wav --transcribe --label me  # text from the audio
+python dub.py voices --add me.wav \
+  --clone-text "Bonjour, je m'appelle Camille." --lang fr --label me
+python dub.py voices --add me.wav --transcribe --label me  # text from the audio
 
 python dub.py voices --list                 # the library
 python dub.py voices --remove warm-fr       # delete one
@@ -83,9 +84,11 @@ hash of the clip + transcript it was derived from. A card whose clip or text no
 longer matches is ignored (it would be a different voice), and an unreadable or
 deleted card costs one encode, not the voice.
 
-The first `say` on a voice without a card writes one, so a voice encodes at most
-once per model (`VOICES_PROMPT_CACHE=0` turns that off). `voices --list` shows it:
-`clone + qwen card`, or `×2` when the voice has cards for two models.
+The first Qwen `say` on a voice without a card writes one, so a voice encodes at
+most once per Qwen model (`VOICES_PROMPT_CACHE=0` turns that off). The
+expressive backends currently read `voice.wav` directly. `voices --list` shows
+the card state: `clone + qwen card`, or `×2` when the voice has cards for two
+models.
 
 Reference them:
 
@@ -147,9 +150,9 @@ read — and all clone the voice from a reference clip.
 
 | Backend | Languages | Controls | Setup |
 |---|---|---|---|
-| `--backend cosyvoice3` | 9, including **French** | emotion, pace, volume, `[breath]`, `[laughter]` | `python dub.py models --download tts_cosyvoice3` |
-| `--backend chatterbox` | 23, including **French** | emotion exaggeration (one intensity) | `python dub.py models --download tts_chatterbox` + the isolated env below |
-| `--backend fish` | ~100 | delivery as **inline tags** in `--text` (34 documented tags + free-form) | `python dub.py models --download tts_fish` + the isolated env below |
+| `--backend cosyvoice3` | 9, including **French** | emotion, pace, volume, `[breath]`, `[laughter]` | `python dub.py models --download tts_cosyvoice3`; [Setup](setup.md#cosyvoice-3-optional-expressive-speech) |
+| `--backend chatterbox` | 23, including **French** | emotion exaggeration (one intensity) | `python dub.py models --download tts_chatterbox`; [Setup](setup.md#chatterbox-optional-expressive-speech) |
+| `--backend fish` | ~100 | delivery as **inline tags** in `--text` (34 documented tags + free-form) | `python dub.py models --download tts_fish`; [Setup](setup.md#fish-speech-s2-pro-optional-expressive-speech) |
 
 ```bash
 # CosyVoice3, with real per-line direction
@@ -407,52 +410,12 @@ prompt. A paragraph pasted without line breaks is split into sentences for
 planning and still produces one clip. `--fish-temperature` and `--fish-top-p`
 expose the sampler (model defaults 0.7 / 0.7).
 
-### Isolated Chatterbox environment
+### Optional backend environments
 
-Chatterbox pins `torch==2.6` and `transformers==5.2`, which cannot coexist with
-the Qwen checkpoint (`transformers==4.57`) or the CosyVoice overlay (4.51.3).
-Keep it in its own environment; the backend finds it automatically at
-`.venv-chatterbox`, or wherever `CHATTERBOX_PYTHON` points:
-
-```bash
-python3 -m venv .venv-chatterbox
-.venv-chatterbox/bin/pip install torch==2.6.0 torchaudio==2.6.0 \
-  --index-url https://download.pytorch.org/whl/cu124
-.venv-chatterbox/bin/pip install chatterbox-tts==0.1.7
-python dub.py models --download tts_chatterbox   # weights, ~3 GB
-```
-
-### Fish Speech environment
-
-Fish pins `torch==2.8` and `transformers==5.19`, so it also lives in its own
-environment at `.venv-fish` (or wherever `FISH_PYTHON` points):
-
-```bash
-python3 -m venv .venv-fish
-git clone --depth 1 https://github.com/fishaudio/fish-speech.git third_party/fish-speech
-.venv-fish/bin/pip install -e third_party/fish-speech
-.venv-fish/bin/pip install torchao==0.13.0   # int8 loading (default)
-python dub.py models --download tts_fish   # fishaudio/s2-pro, ~11 GB
-```
-
-Fish's `pyaudio` dependency needs PortAudio headers (`apt install
-portaudio19-dev`). Without them, install the runtime dependencies from its
-`pyproject.toml` and then `.venv-fish/bin/pip install --no-deps -e
-third_party/fish-speech`; the worker never uses audio input.
-
-S2-Pro is published only in bf16, which needs ~24 GB of VRAM. The backend
-therefore loads it **int8 weight-only by default**: the worker quantizes the 201
-linear layers while the model is still on the CPU and only then moves it to the
-card, keeping ~6 GB resident and peaking around 11 GB for a short line. It was
-verified end to end on a 12 GB RTX 3060 (3 s of audio in ~16 s once loaded);
-`--fish-quantize off` restores the bf16 path for a 24 GB card, and CPU runs
-always use bf16 (a 2 s line takes about 90 s on a 12-core CPU). The worker caps
-the checkpoint's 32k context at 4096 tokens for line-level work (override with
-`FISH_MAX_SEQ_LEN`). The model runs in `pipeline.fish_worker`, so the Qwen stack
-is untouched.
-
-Peak int8 memory grows with prompt and generated length, so on a card that also
-drives a display prefer short lines, or use `--device cuda:1` on a multi-GPU box.
+Chatterbox and Fish pin conflicting `torch`/`transformers` versions, so each runs
+in its own child environment. Installation steps are in
+[Setup → Chatterbox](setup.md#chatterbox-optional-expressive-speech) and
+[Setup → Fish](setup.md#fish-speech-s2-pro-optional-expressive-speech).
 
 CosyVoice, Chatterbox and Fish all run in child processes for the same
 version-conflict reason. `--save-as` and `--design` are not supported on the

@@ -9,16 +9,35 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Ruff
+        run: ruff check .
+
   tests:
     name: tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        # The documented floor, plus a current release: the suite must not quietly
-        # start depending on newer stdlib behaviour than requires-python promises.
-        python-version: ["3.10", "3.12"]
+        # The documented floor, plus the versions between it and the current
+        # release. The upper bound is enforced by requires-python.
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -41,9 +60,45 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install "pytest>=8.0"
+          pip install "pytest>=8.0" pytest-cov
 
-      # `-o addopts=""` clears the `-q` in pyproject.toml, which would otherwise
-      # hide the collected/passed counts from the log.
+      # `-o addopts=""` clears the `-q` in pyproject.toml, but must not clear
+      # `--strict-markers`; pass it explicitly.
       - name: Run the test suite
-        run: pytest -o addopts=""
+        run: >
+          pytest -o addopts="" --strict-markers
+          --cov=pipeline --cov=dub --cov=audit_qc --cov=audit_timbre
+          --cov-report=term-missing
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build artifacts
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Install the wheel and smoke the CLI
+        run: |
+          pip install dist/*.whl
+          dub --version
+          dub --help
+
+  docs:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check local Markdown links and anchors
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --include-fragments README.md docs CONTRIBUTING.md SECURITY.md CHANGELOG.md

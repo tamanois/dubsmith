@@ -11,6 +11,8 @@ We want to use as most as possible open models that can be run on consumer. For 
 
 
 # Important
-- technical guidelines for the project are here: .agents/technical-guidelines.md
+- engineering guidelines for the project are here: docs/development/guidelines.md
+- contribution, security and code-of-conduct policies are at the repository root
 - plan and roadmap (MVP + future improvements) are here: PLAN.md
 - user documentation (setup, usage, voices, troubleshooting) is here: docs/README.md
+- the project is Apache-2.0; contributions use DCO sign-off, not a CLA

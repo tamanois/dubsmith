@@ -1,46 +1,51 @@
-# AI Video Dubbing
+# Dubsmith — AI dubbing + expressive voice generation
 
-Dub a video into another language while keeping each speaker's **own voice timbre**.
-Runs entirely on local, open models; no cloud required.
+**Keep the voice. Change the language.**
 
-Take a video, detect the language of the speakers, identify each voice, and
-produce a new video where the speakers speak a target language in their own
-voice — with a native accent when possible.
+Dub a video into another language while keeping each speaker's **own voice
+timbre**, or generate speech in a saved or designed voice with per-line emotion.
+The models run locally; the only network call is the configured
+OpenAI-compatible LLM endpoint, which can be local or cloud.
 
-- [Vision and roadmap](PLAN.md) · [Documentation](docs/README.md) · [Engineering guidelines](.agents/technical-guidelines.md)
+[![CI](https://github.com/tamanois/dubsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/tamanois/dubsmith/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python 3.10–3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](pyproject.toml)
+
+[Documentation](docs/README.md) · [Roadmap](PLAN.md) · [Contributing](CONTRIBUTING.md) · [Model licenses](docs/model-licenses.md) · [Engineering guidelines](docs/development/guidelines.md)
 
 ---
 
 ## What it does
 
-| Capability | Detail |
+| Mode | What you get |
 |---|---|
-| **Input** | One video, or one audio file |
-| **Speakers** | One or several: detected automatically, each cloned from their own voice (`--diarizer none` forces one) |
-| **Languages** | Source auto-detected; target: English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian |
-| **Voice** | Cloned from the source speaker, with a generated native accent by default. Saved voice prints can be designed or cloned once and reused by name |
-| **Output** | Dubbed video/audio + source and translated SRT subtitles. The target subtitles are embedded in the video as a switchable track by default (other languages kept), or burned in with `--subtitles-mode burn`. Original music/ambience preserved |
-| **Not included** | Lip sync (P4), multi-language source videos (P5) |
+| **Video dubbing** | Detect the language, separate speakers, clone each voice, translate, synthesise, and mux a new video/audio track. Ten target languages, native-accent anchors, background/room preservation, and multi-speaker support |
+| **Subtitles only** | ASR + translation + SRT, with optional soft-embedded or burned-in subtitles. No TTS model is loaded |
+| **Speech generation** | `dub say` turns text into speech with a saved, designed, cloned, or preset voice. Translation is not involved |
+| **Voice library** | Design from a prompt, clone from a clip, or import an existing clip with `--add`; reuse by label in `say` or a dub. Qwen voice cards cache the encode; other backends read `voice.wav` |
+| **Emotion and prosody** | Dubbing: `--backend cosyvoice3`, `chatterbox`, or `fish` with an LLM-planned `--prosody-plan`. Speech: manual `--prosody`, `--emotion`, `--style-instruct`, or `--prosody-plan` |
+| **Quality and provenance** | `report.json`, `prosody.json`, timestamped `provenance/`, `audit_qc.py`, and `audit_timbre.py` |
+| **Not included** | Lip sync (P4) and multi-language source videos (P5) |
 
 ---
 
 ## Quick start
 
-From a fresh clone to a first dub.
+From a fresh clone to a first dub or a first generated line.
 
 **Requirements**
 
-- Python **3.10+**
+- Python **3.10–3.12** (`numpy==1.26.4` has no 3.13 wheels)
 - `ffmpeg` and `ffprobe` for video input (audio-only needs neither)
-- ~10 GB of disk for the model weights
+- ~10 GB of disk for the core weights; optional expressive backends add ~3–11 GB each
 - A GPU is optional but strongly recommended (~12 GB VRAM for the default path)
-- An **OpenAI-compatible** LLM endpoint for translation
+- An **OpenAI-compatible** LLM endpoint for translation and optional prosody planning
 
 **1. Clone and install**
 
 ```bash
-git clone <repository-url> qwen-tts
-cd qwen-tts
+git clone https://github.com/tamanois/dubsmith.git
+cd dubsmith
 python3 -m venv .venv
 source .venv/bin/activate
 pip install .
@@ -77,6 +82,7 @@ python dub.py models --download all
 
 ```bash
 python dub.py info          # device, precision, optional packages, models
+python dub.py models --list
 ```
 
 **5. Dub**
@@ -89,8 +95,18 @@ The result is `output/talk/video_dubbed.mp4`, with `dub.wav`, subtitles and
 `report.json` beside it. A first run also generates the French accent anchor,
 cached under `models/anchors/`.
 
+**6. Generate speech without a video**
+
+```bash
+python dub.py voices --design --prompt "a warm female French voice" --lang fr --label warm-fr
+python dub.py say --voice warm-fr --text "Bonjour, ceci est un test."
+```
+
+`say` needs no translation step or LLM endpoint unless you use
+`--prosody-plan llm` or `--style-plan llm`.
+
 For the full setup matrix — CPU-only installs, CUDA 12 libraries for GPU ASR,
-optional models, `MODELS_DIR` — see [docs/setup.md](docs/setup.md).
+optional backends, macOS notes, `MODELS_DIR` — see [docs/setup.md](docs/setup.md).
 
 ---
 
@@ -104,6 +120,23 @@ python dub.py --audio interview.wav --target es     # audio only, no ffmpeg
 python dub.py --video talk.mp4 --source en --target de
 python dub.py --video talk.mp4 --target fr --subtitles-mode burn   # burn text into frames
 ```
+
+**Dub with per-line emotion**
+
+`qwen` is the default dubbing backend: it clones the voice but has no prosody
+channel. Pick an expressive backend and let the configured LLM plan each
+translated line:
+
+```bash
+python dub.py --video talk.mp4 --target fr --backend chatterbox --prosody-plan auto
+python dub.py --video talk.mp4 --target fr --backend cosyvoice3 --prosody-plan llm
+python dub.py --video talk.mp4 --target fr --backend fish --prosody-plan auto
+```
+
+`--prosody-plan auto` is the dubbing default: it plans when the LLM endpoint is
+reachable and falls back to neutral otherwise. `off` speaks neutral; `llm` fails
+if the endpoint is unreachable. `customvoice` is **speech-generation only** and
+is not a dubbing backend.
 
 **Add subtitles without dubbing**
 
@@ -122,6 +155,9 @@ a track already in the target language is replaced. No TTS model is loaded.
 ```bash
 # clone a specific recording (the transcript must match the audio exactly)
 python dub.py --video talk.mp4 --target fr --ref-audio me.wav --ref-text "…"
+
+# reuse a saved voice print
+python dub.py --video talk.mp4 --target fr --voice warm-fr
 
 # keep the speaker's timbre, borrow a native accent
 python dub.py --video talk.mp4 --target fr \
@@ -148,27 +184,34 @@ python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
 python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
   --style-plan llm
 python dub.py say --voice warm-fr --backend fish --text "[excited] Je n'arrive pas à y croire !"
-python dub.py --video talk.mp4 --target en --voice warm-fr
 ```
 
-Expressive backends (`cosyvoice3`, `chatterbox` and `fish` clone the voice from
-the same reference clip; `customvoice` pairs a preset speaker with an
-instruction):
+`--add` registers a clip verbatim, with no model or GPU. The first synthesis
+writes a per-backend card under `voices/<label>/prompts/`; `provenance/` records
+how the voice was made. See [docs/voices.md](docs/voices.md) for the full
+library and card behavior.
 
-| Backend | Languages | What it adds |
-|---|---|---|
-| `customvoice` | 10 | preset Qwen speaker + tone/emotion instruction (no clone) |
-| `cosyvoice3` | 9, **incl. French** | emotion, pace, volume, `[breath]`, `[laughter]` |
-| `chatterbox` | 23, **incl. French** | configurable expression intensity (+ natural prosody) |
-| `fish` (Fish Speech S2-Pro) | ~100 | cloned voice + inline tags in the text (34 documented tags, free-form allowed) |
+**Standalone speech generation**
+
+`dub say` takes text and exactly one voice source: `--voice`, `--design`,
+`--clone`, or `--speaker` with `--backend customvoice`. It does not translate.
+
+| Backend | Used by | Languages | Controls | Weights license |
+|---|---|---|---|---|
+| `qwen` (default) | dub + say | 10 | voice clone, accent modes | Apache-2.0 |
+| `customvoice` | say only | 10 | preset speaker + instruction | Apache-2.0 |
+| `cosyvoice3` | dub + say | 9, incl. French | emotion, pace, volume, `[breath]`, `[laughter]` | Apache-2.0 |
+| `chatterbox` | dub + say | 23, incl. French | expression intensity | MIT |
+| `fish` (S2-Pro) | dub + say | ~100 | inline `[tags]` in the text | **non-commercial** |
+
+The default path does not require Fish. See
+[docs/model-licenses.md](docs/model-licenses.md) before commercial use.
 
 CustomVoice speakers: `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`, `Eric` (Chinese),
-`Ryan`, `Aiden` (English), `Ono_Anna` (Japanese), `Sohee` (Korean) — descriptions
-and native languages in
-[docs/voices.md](docs/voices.md#expressive-backends-cosyvoice3-and-chatterbox).
+`Ryan`, `Aiden` (English), `Ono_Anna` (Japanese), `Sohee` (Korean).
 
-`--prosody` is the structured per-line control (repeat once per line, or pass one
-value to apply everywhere):
+`--prosody` is the structured per-line control for `say` (repeat once per line,
+or pass one value to apply everywhere):
 
 | Field | Accepted values |
 |---|---|
@@ -178,18 +221,16 @@ value to apply everywhere):
 | `exaggeration` | `0.0`–`1.0` (Chatterbox's own intensity knob) |
 | `breath`, `pause`, `laughter` | bare flags |
 
-`--prosody-plan llm` lets the configured OpenAI-compatible model choose those
-values from the text; an explicit `--prosody`/`--emotion` then overrides it.
-`--style-instruct TEXT` (`customvoice` only) sends a full delivery instruction
-verbatim instead, which is the natural-language form that checkpoint expects and
-the most expressive option; it wins over `--prosody`. `--style-plan llm`
-(`customvoice` only) has the model write that instruction for you, one per line
-(`--style-plan-scope whole` writes a single one for the whole text); above
-`LLM_PLAN_CHUNK_SIZE` lines (default 10, or `--plan-chunk`) it first reads the
-whole text for an overview, then plans each chunk against it. Note that
-`--instruct` is an alias of `--emotion`, not of `--style-instruct`.
-Per-backend limitations (Chatterbox has no breath/laughter tokens; Fish has no
-prosody channel, only tags in the text) and the full value lists are in
+For `say`, `--prosody-plan` defaults to `off`; `llm` asks the configured model to
+plan delivery from the text. For dubbing, `--prosody-plan auto` is the default.
+An explicit `--prosody`/`--emotion` overrides the plan. `--style-instruct TEXT`
+(`customvoice` only) sends a full delivery instruction verbatim and wins over
+`--prosody`. `--style-plan llm` (`customvoice` only) has the model write that
+instruction for you, one per line; `--style-plan-scope whole` writes a single
+instruction for the entire text. Above `LLM_PLAN_CHUNK_SIZE` lines (default 10,
+or `--plan-chunk`) it first reads the whole text for an overview, then plans each
+chunk against it. `--instruct` is an alias of `--emotion`, not of
+`--style-instruct`. Per-backend limitations and the full value lists are in
 [docs/voices.md](docs/voices.md).
 
 **Multi-speaker videos**
@@ -211,6 +252,7 @@ python audit_qc.py "output/talk" --timbre      # adds the per-line timbre gate
 
 ```bash
 python dub.py models --list
+python dub.py models --download everything   # include optional backends
 python dub.py info
 ```
 
@@ -229,7 +271,7 @@ python -m pytest
 ```
 
 ```text
-1270 passed
+1354 passed
 ```
 
 Run one area while iterating:
@@ -238,6 +280,7 @@ Run one area while iterating:
 python -m pytest tests/test_tts.py -q
 python -m pytest tests/test_pipeline.py -q
 python -m pytest tests/test_voices.py -q
+python -m pytest tests/test_provenance.py -q
 python -m pytest -k accent -q
 ```
 
@@ -250,17 +293,21 @@ The quality tools and their gates are covered in
 
 | Guide | What it covers |
 |---|---|
-| [Setup](docs/setup.md) | prerequisites, install, LLM endpoint, models |
+| [Setup](docs/setup.md) | prerequisites, install, LLM endpoint, models, optional backends |
 | [Usage](docs/usage.md) | command chooser, worked examples, fast iteration |
-| [Options](docs/options.md) | every flag and its default |
-| [Voices](docs/voices.md) | saved voice prints, cloning, accent modes |
+| [Options](docs/options.md) | every flag, default, and environment variable |
+| [Voices](docs/voices.md) | voice library, cloning, cards, accent modes |
+| [Voice generation](docs/voice-generation.md) | `dub say`, voice design/clone/import, expression |
 | [Multi-speaker](docs/multi-speaker.md) | diarization, speaker thresholds, overlap |
 | [Audio and timing](docs/audio-and-timing.md) | music/ambience, room matching, long translations |
 | [Performance](docs/performance.md) | devices, precision, several GPUs, long-video memory |
-| [Outputs and caching](docs/outputs-and-caching.md) | job artifacts, `report.json`, the stage cache |
+| [Outputs and caching](docs/outputs-and-caching.md) | job artifacts, `report.json`, `prosody.json`, provenance |
 | [Testing and quality](docs/testing-and-quality.md) | tests, timbre audit, `audit_qc.py` |
+| [Model licenses](docs/model-licenses.md) | code, weights, and commercial-use boundaries |
 | [Architecture](docs/architecture.md) | pipeline, module map, project layout |
 | [Troubleshooting](docs/troubleshooting.md) | errors, logs, notes and limitations |
+| [Contributing](CONTRIBUTING.md) | development setup, tests, DCO, docs policy |
+| [Security](SECURITY.md) | private vulnerability reporting and scope |
 
 The [docs index](docs/README.md) has the same list with reading paths.
 
@@ -269,16 +316,21 @@ The [docs index](docs/README.md) has the same list with reading paths.
 ## Project layout
 
 ```text
-dub.py                  CLI entry point (dub, models, voices, say, info)
+dub.py                  CLI entry point (dub, models, voices, say, subtitles, anchors, info)
 audit_qc.py             automated quality gate for a finished job
 audit_timbre.py         per-line speaker-timbre audit
-pipeline/               ASR, translation, TTS, timing, mixing, orchestration
+pipeline/               ASR, translation, TTS, expressive backends, timing, mixing, orchestration
+  backends.py           CosyVoice3 / Chatterbox / Fish engine construction
+  provenance.py         per-line emotion and text-transformation record
 tests/                  pytest suite (no GPU or models needed)
 models/                 downloaded weights (gitignored)
-voices/                 saved voice prints (gitignored)
+voices/                 saved voices, cards and provenance (gitignored)
 output/                 job artifacts (gitignored)
-docs/                   user documentation
+docs/                   user documentation, model licenses, development guidelines
 PLAN.md                 vision, roadmap and design decisions
+NOTICE                  Apache-2.0 attribution
+CONTRIBUTING.md         DCO, development setup, docs policy
+SECURITY.md             private vulnerability reporting
 ```
 
 Full module map: [docs/architecture.md](docs/architecture.md).
@@ -287,10 +339,19 @@ Full module map: [docs/architecture.md](docs/architecture.md).
 
 ## License and responsible use
 
-- **License**: Apache-2.0; see [LICENSE](LICENSE).
+- **Code**: Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+- **Docs**: CC BY 4.0 unless a file says otherwise; see
+  [docs/LICENSE.md](docs/LICENSE.md).
+- **Model weights are separate.** Qwen3-TTS and Whisper are Apache-2.0 / MIT;
+  CosyVoice3 is Apache-2.0; Chatterbox is MIT; **Fish S2-Pro is
+  non-commercial**. The default path does not use Fish. See
+  [docs/model-licenses.md](docs/model-licenses.md) and
+  [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 - **Consent**: clone only voices you have permission to use. Voice is biometric
   data under GDPR, and synthetic-dubbing disclosure is increasingly required.
-- **Model licenses**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT. Avoid
-  CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
+- **Privacy**: there is no telemetry. Job artifacts contain transcripts and can
+  contain reference audio; `voices/`, `input/`, `output/` and `models/` are
+  gitignored. Translation and optional prosody planning send text to the
+  configured OpenAI-compatible LLM endpoint.
 - **Known gaps** are tracked in [PLAN.md](PLAN.md): lip sync, multi-language
   source videos, and iterative length control in the translation loop.

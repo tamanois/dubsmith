@@ -17,7 +17,7 @@ import pytest
 import soundfile as sf
 
 from pipeline.cosyvoice import CosyVoiceEngine
-from pipeline.cosyvoice_worker import _normalize_instruct, NEUTRAL_INSTRUCT
+from pipeline.cosyvoice_worker import NEUTRAL_INSTRUCT, _normalize_instruct
 from pipeline.errors import DependencyError, TTSError
 from pipeline.prosody import ProsodySpec
 

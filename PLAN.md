@@ -1,8 +1,12 @@
 # AI Video Translation — Plan & Roadmap
 
-> Companion to `AGENTS.md` (project vision) and `.agents/technical-guidelines.md`
-> (production engineering rules). This file records the MVP scope and the phased
+> Companion to `AGENTS.md` (project vision) and
+> [`docs/development/guidelines.md`](docs/development/guidelines.md)
+> (engineering rules). This file records the MVP scope and the phased
 > plan to reach the full vision. Keep it updated as decisions change.
+>
+> Measurement notes refer to local clips under `input/`; those files are not
+> distributed with the repository.
 
 ---
 
@@ -21,6 +25,10 @@
 | ASR + VAD gating | ✅ | `pipeline/asr.py` |
 | Translation (OpenAI-compatible) | ✅ | `pipeline/translate.py` |
 | Voice cloning + donor selection | ✅ | `pipeline/tts.py` |
+| Voice library: design / clone / import, cards | ✅ | `pipeline/voices.py`, `dub.py voices` |
+| Standalone speech generation + emotion | ✅ | `dub.py say`, `pipeline/prosody.py` |
+| Expressive dubbing backends | ✅ | `pipeline/backends.py`, `--backend`, `--prosody-plan` |
+| Emotion/prosody provenance | ✅ | `pipeline/provenance.py`, `prosody.json`, `provenance/` |
 | Speaker diarization (P1) | ✅ | `pipeline/diarize.py` |
 | Overlap detection + separation (P1) | ✅ | `pipeline/diarize.py`, `pipeline/overlap_separation.py`, `pipeline/orchestrate.py` |
 | Timing / isochrony | ✅ | `pipeline/timing.py` |
@@ -29,7 +37,7 @@
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1105 passing | `tests/` |
+| Tests | ✅ 1354 passing | `tests/` |
 
 Verification performed:
 
@@ -1173,12 +1181,12 @@ against a fake `torch` module — so the hardware rules are checked on a CPU-onl
 runner rather than asserted. `tests/test_cli_smoke.py` covers the command surface:
 `models --list`, `--version`, `info`, `--dtype` reaching the config, and dtype
 invalidating the fingerprint. The metadata and wheel were built directly and
-checked (`Name: qwen-tts-dub`, `Version: 0.1.0`, three console scripts, `pipeline/`
+checked (`Name: dubsmith`, `Version: 0.1.0`, three console scripts, `pipeline/`
 and the three CLI modules present, `LICENSE` included) with deprecation warnings
 promoted to errors.
 
 **Deviations from the plan, both deliberate.** The distribution is named
-`qwen-tts-dub`, not `qwen-tts`: that name belongs to the TTS checkpoint's own
+`dubsmith`, not `qwen-tts`: that name belongs to the TTS checkpoint's own
 package, which is a dependency here. And the lock file was dropped, for the reason
 above.
 
@@ -1419,8 +1427,8 @@ never overwritten without `--force`. `dub.py say` writes `output/say/<name>.wav`
 
 **Verified.**
 
-- **1105 tests pass** (1051 before this work): 36 cover the store and 24 the new
-  CLI surface, all without a model or a GPU. The existing suite is unchanged.
+- **The full suite passes** (1354 tests at the time of the public release): 36
+  cover the store and 24 the new CLI surface, all without a model or a GPU.
 - **Real voice design** on an RTX 3060: `voices --design` saved a 27.1 s French
   print; `say --voice` round-tripped through Whisper with the exact text.
 - **Real cloning** from `input/Delphine-Charming.mp3`: a 22.1 s print; `say`
@@ -1471,7 +1479,7 @@ above is not read as "finished".
 - **P2's remaining nicety**: the optional voice-conversion path is unnecessary —
   the generated anchor supplies native prosody directly — so P2 is closed.
 
-**Engineering standards** (`.agents/technical-guidelines.md`, tracked separately)
+**Engineering standards** ([`docs/development/guidelines.md`](docs/development/guidelines.md))
 
 - No `mypy --strict`, Black or Ruff: `pyproject.toml` carries packaging metadata and
   pytest settings, and `requirements-dev.txt` only `pytest`, `funasr`, `modelscope`.
@@ -1747,11 +1755,10 @@ force: false                     # ignore the stage cache
 ### 3.5 Repository layout (tool-sized, service-ready)
 
 ```text
-qwen-tts/
+dubsmith/
 ├── dub.py                    # CLI entrypoint (argparse) + model downloads
 ├── audit_timbre.py           # per-line speaker-timbre audit (--device cpu works)
 ├── audit_qc.py               # automated quality gate for a finished job
-├── main.py, clone.py         # scratch experiments, not part of the pipeline
 ├── pipeline/
 │   ├── config.py             # Pydantic job schema, env settings, languages
 │   ├── models.py             # model registry, download, path resolution
@@ -1764,7 +1771,10 @@ qwen-tts/
 │   ├── mixing.py             # ducking, bed mix and room matching (pure numpy)
 │   ├── translate.py          # OpenAI-compatible client, chunking, shorten()
 │   ├── tts.py                # Qwen3-TTS wrapper, donor selection, blend
+│   ├── backends.py           # CosyVoice3 / Chatterbox / Fish engine construction
 │   ├── voice.py              # one voice: the facts that build its clone prompt
+│   ├── voices.py             # voice library, cards, provenance
+│   ├── provenance.py         # per-line prosody and transformation records
 │   ├── parallel.py           # fan-out: tasks, worker pool, per-device counters
 │   ├── timing.py             # stretching backends, timeline assembly
 │   ├── subtitles.py          # SRT writer
@@ -1775,13 +1785,10 @@ qwen-tts/
 └── PLAN.md
 ```
 
-Module boundaries mirror the future `app/{api,services,ai_workers,media}` layout,
-so P6 is mostly "add a queue + API in front of these functions". Note that the
-names differ from `technical-guidelines.md`'s §2 tree: this is a flat `pipeline/`
-package rather than `app/{core,services,ai_workers,media,utils}`, and there is no
-`scripts/` or `Dockerfile` yet. The engineering standards that document declares —
-mypy `--strict`, Black/Ruff, >85% coverage, CI — are also not configured or
-enforced; that gap sits outside this roadmap and is tracked separately.
+This is intentionally a flat `pipeline/` package for a local CLI, not a
+service-oriented `app/` tree. The engineering conventions this project actually
+follows are in [`docs/development/guidelines.md`](docs/development/guidelines.md).
+Optional backends run in child processes; the default Qwen path stays in-process.
 
 ### 3.6 Definition of Done
 
@@ -2017,8 +2024,9 @@ users who want to choose the accent themselves.
 
 ### P6 — Service-ification
 
-- Wrap the tool behind **FastAPI** (async) + **Celery/Redis** per
-  `technical-guidelines.md`.
+- If the project ever adds a service, use **FastAPI** (async) + Celery/Redis or
+  equivalent, and keep the pipeline functions independent so they can be wrapped
+  without moving model code into the API layer.
 - **Model residency**: LLM in an OpenAI-compatible model server; audio models
   pinned per worker type; lip-sync in its own pool (see "model residency"
   decision in the appendix).

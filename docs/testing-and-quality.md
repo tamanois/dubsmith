@@ -15,7 +15,7 @@ python -m pytest
 ```
 
 ```
-1105 passed
+1354 passed
 ```
 
 Run a single area while iterating:
@@ -28,7 +28,8 @@ python -m pytest tests/test_diarize.py -q      # speaker clustering
 python -m pytest tests/test_audit.py -q        # timbre audit + quality gates
 python -m pytest tests/test_mixing.py -q       # ducking, room matching
 python -m pytest -k accent -q                  # everything accent-related
-python -m pytest tests/test_voices.py -q       # saved voice prints
+python -m pytest tests/test_voices.py -q       # saved voices and cards
+python -m pytest tests/test_provenance.py -q   # prosody/provenance records
 ```
 
 ## Real dubs against the local checkpoints

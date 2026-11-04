@@ -12,6 +12,8 @@ Choose a command, copy a worked example, and iterate quickly.
 | a reusable voice from a clip you already have | `python dub.py voices --add me.wav --transcribe` | registers the clip as-is, no model or GPU involved; `--clone` encodes it once instead |
 | to use a saved voice for a dub | `--voice warm-fr` | timbre from the saved voice, including its stored encoding; accent still follows `--accent-mode` |
 | to speak text with a saved or inline voice | `python dub.py say --voice warm-fr --text "…"` | standalone speech synthesis — no video, no translation |
+| emotional delivery in a dub | `--backend chatterbox --prosody-plan auto` | plans per-line emotion for the translated lines; `off` is neutral, `llm` requires the endpoint |
+| emotional delivery in `say` | `--backend cosyvoice3 --prosody "emotion=happy, breath"` | manual per-line prosody; `--prosody-plan llm` plans it instead |
 | an anchor fitted to the source voice | `--accent-match rate` (or `gender`) | generates a per-speaker anchor matching the speaker's rate (and gender) |
 | to keep the source accent | `--accent-mode preserve` | clones the speaker's accent along with their voice |
 | to drop the source accent using the model's own phonetics | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
@@ -144,13 +146,14 @@ accent source gives near-native pronunciation with almost no speech lost. Full
 run takes about 2 minutes 45 seconds.
 
 The timing knobs were measured on a longer, harder job: an 11-minute English →
-French video with two speakers (`input/louisavy-11m.mp4`), where the source talks
-at 4.7 words/s and the French clone delivers 3.6. `--max-overrun` is the knob that
+French video with two speakers (a local test clip, not distributed with the
+repo), where the source talks at 4.7 words/s and the French clone delivers 3.6.
+`--max-overrun` is the knob that
 decides whether a line that still does not fit loses its tail or starts late:
 
 | Command | Result |
 |---|---|
-| `--video louisavy-11m.mp4 --target fr` (defaults) | **run**: 4.69 s of speech deleted across **31** lines; lateness bounded at `shifted_seconds_max` 0.25 s; synthesis 461 s; `audit_qc.py` passes sync |
+| `--video long.mp4 --target fr` (defaults) | **run**: 4.69 s of speech deleted across **31** lines; lateness bounded at `shifted_seconds_max` 0.25 s; synthesis 461 s; `audit_qc.py` passes sync |
 | `… --max-overrun 0` | **simulated** on the same job's fitted durations: 8.90 s deleted across 66 lines, every line exactly on its source time |
 | `… --max-overrun 0.75` | **simulated** on the same durations: 0.40 s deleted across 4 lines, worst line 0.75 s late (`audit_qc.py --max-shift 0.75` accepts it) |
 

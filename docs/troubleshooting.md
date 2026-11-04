@@ -22,7 +22,7 @@ attempt yet.
 | `--style-instruct is only valid with --backend customvoice` | That flag is the CustomVoice delivery instruction. Other backends take `--prosody`/`--emotion`, and `--design` already accepts a free-form prompt |
 | `--style-plan is only valid with --backend customvoice` | The LLM-written verbatim instruction is CustomVoice-only. Other backends use `--prosody-plan llm` for structured prosody |
 | `--style-plan-scope only applies with --style-plan llm` | Add `--style-plan llm`, or drop `--style-plan-scope` |
-| `fish-speech is not installed` | Create `.venv-fish` (see [Voices](voices.md#fish-speech-environment)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
+| `fish-speech is not installed` | Create `.venv-fish` (see [Setup](setup.md#fish-speech-s2-pro-optional-expressive-speech)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
 | `--backend fish ... has no --prosody/--emotion/--prosody-plan channel` | Fish takes its delivery from `[tag]` cues in `--text`: write them yourself, or pass `--fish-tag-mode llm` and let the model write them |
 | `Fish Speech S2-Pro needs about 24 GB of VRAM` | That message means the bf16 weights were requested (`--fish-quantize off`) or the int8 path could not start. Drop the flag to use the int8 default, retry with `--device cpu` (slow), or use a larger GPU |
 | `int8 Fish Speech needs torchao` | `.venv-fish/bin/pip install torchao==0.13.0`, or pass `--fish-quantize off` (needs ~24 GB) |
@@ -140,8 +140,12 @@ Pass `-v` to see the mode each CosyVoice line used (`zero_shot`,
   chosen automatically, because speech recognition runs on CTranslate2. The rules
   are covered by `tests/test_device.py` against fake hardware profiles, so a
   regression is caught on a CPU-only CI runner.
-- **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT.
-  Avoid CPML-licensed models (e.g. XTTS-v2) if you need commercial rights.
+- **Model licences**: Qwen3-TTS and Whisper weights are Apache-2.0 / MIT;
+  CosyVoice3 is Apache-2.0; Chatterbox is MIT; **Fish S2-Pro is
+  non-commercial**. The default path does not use Fish. See
+  [Model licenses](model-licenses.md).
+- **Python**: 3.10–3.12. `numpy==1.26.4` has no 3.13 wheels, so installation on
+  3.13 fails until the pin is updated.
 - **Multi-speaker dubbing attributes speakers per segment**, not per word, so
   overlapping speech is shown as a flag on the segment. By default such a line is
   dubbed in the voice of its dominant speaker and reported (`report.json` →
