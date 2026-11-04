@@ -2295,6 +2295,8 @@ class Pipeline:
             blend=blends.get(name),
             ref_audio=self.job.ref_audio,
             ref_text=self.job.ref_text or "",
+            prompt=self.job.ref_prompt,
+            prompt_seconds=self.job.ref_prompt_seconds,
             donor=donor,
             timbre_label=label,
             shared=self._prompt_is_shared(blends),

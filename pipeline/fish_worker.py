@@ -33,9 +33,74 @@ DECODER_CONFIG = "modded_dac_vq"
 #: S2-Pro allocates its KV cache and a max_seq_len x max_seq_len causal mask
 #: from the checkpoint config (32768 -> a 1 GiB mask alone). It also reserves
 #: 2048 tokens for generation, so the cap must leave prompt + 2048. 4096 keeps
-#: the buffers small for line-level work; the 4.56 B weights still need ~24 GB
-#: on GPU. Override with FISH_MAX_SEQ_LEN (0 disables the cap).
+#: the buffers small for line-level work. Override with FISH_MAX_SEQ_LEN (0
+#: disables the cap).
 DEFAULT_MAX_SEQ_LEN = 4096
+
+#: How the weights are loaded. int8 weight-only keeps ~5.8 GB resident, so the
+#: model runs on a 12 GB card; bf16 is the upstream requirement of ~24 GB.
+DEFAULT_QUANTIZE = "int8"
+
+
+def _quantize_mode(request: dict[str, object], device: str) -> str:
+    """Resolve the requested mode to ``"int8"`` or ``"bf16"``.
+
+    int8 only pays off on CUDA (its matmul kernels are CUDA-only and the CPU
+    path is memory-bound anyway), so a CPU run stays bf16/fp32.
+    """
+    raw = str(request.get("quantize") or DEFAULT_QUANTIZE).strip().lower()
+    if raw in {"off", "none", "bf16", "false", "0"}:
+        return "bf16"
+    if raw not in {"int8", "q8", "auto", "on", "true", "1"}:
+        raise ValueError(f"unknown quantize mode {raw!r}; use int8 or off")
+    return "int8" if str(device).startswith("cuda") else "bf16"
+
+
+def _patch_int8_loader(logger: logging.Logger) -> None:
+    """Load the dual-AR checkpoint in int8 weight-only, on the CPU first.
+
+    ``init_model`` always materialises the bf16 weights and only then moves them
+    to the device, which needs ~24 GB. Replacing it lets the quantization happen
+    while the model is still on the CPU, so only ~5.8 GB ever reaches the card.
+    The engine keeps its own queue and decoder; only the loader changes.
+    """
+    try:
+        from torchao.quantization import int8_weight_only, quantize_
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "int8 Fish Speech needs torchao: "
+            ".venv-fish/bin/pip install torchao==0.13.0 (or pass "
+            "--fish-quantize off to load bf16, which needs ~24 GB of VRAM)."
+        ) from exc
+
+    import fish_speech.models.text2semantic.inference as inference
+    from fish_speech.models.text2semantic.llama import DualARTransformer
+
+    if getattr(inference, "_qwen_tts_int8", False):
+        return
+
+    def init_model_int8(
+        checkpoint_path,
+        device,
+        precision,
+        compile=False,
+        reference_sampling=None,
+    ):
+        if compile:
+            raise ValueError("compiling is not supported with int8 quantization")
+        if reference_sampling is not None:
+            raise ValueError("reference sampling is for Drama 3 checkpoints only")
+        model = DualARTransformer.from_pretrained(
+            checkpoint_path, load_weights=True
+        )
+        quantize_(model, int8_weight_only())
+        logger.info("int8 weight-only: quantized the dual-AR backbone")
+        model = model.to(device=device)
+        model._cache_setup_done = False
+        return model.eval(), inference.decode_one_token_ar
+
+    inference.init_model = init_model_int8
+    inference._qwen_tts_int8 = True
 
 
 def _shadow_checkpoint(model_dir: Path, max_seq_len: int) -> Path:
@@ -138,6 +203,17 @@ def main(argv: list[str]) -> int:
     else:
         decoder_device = device
         model_family = "s2"
+
+    quantize = _quantize_mode(request, device)
+    if quantize == "int8" and model_family != "s2":
+        logger.warning(
+            "int8 quantization covers S2-Pro (dual-AR) only; loading this "
+            "FishOmni checkpoint in bf16."
+        )
+        quantize = "bf16"
+    if quantize == "int8":
+        _patch_int8_loader(logger)
+    logger.info("Fish weights: %s on %s", quantize, device)
 
     load_started = time.perf_counter()
     llama_queue = launch_thread_safe_queue(

@@ -1,12 +1,10 @@
 """Fish Speech S2-Pro synthesis, isolated in a child process.
 
 Fish Speech reads emotion and paralinguistics from **inline tags in the text**
-rather than from a side-channel instruct. By default this backend renders the
-neutral :class:`ProsodySpec` into tags
-(:func:`pipeline.prosody.fish_inline_tags`) and sends the decorated lines. When
-the caller already wrote or planned the tags (``tag_mode="keep"``), the lines
-are sent untouched, because adding another prefix would stack a second,
-contradictory direction onto them.
+(``[sad]``, ``[sigh]``, ``[whisper in small voice]``, ...) rather than from a
+side-channel instruct, so the lines are sent to the model exactly as the caller
+wrote or planned them. There is deliberately no prosody renderer here: the tag is
+the interface.
 
 Fish pins ``torch==2.8`` and ``transformers==5.19``, which cannot coexist with
 the Qwen checkpoint's ``transformers==4.57``. The model therefore runs in
@@ -30,7 +28,6 @@ import numpy as np
 
 from .config import resolve_device
 from .errors import DependencyError, TTSError
-from .prosody import ProsodySpec, fish_inline_tags, resolve_prosody
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,9 +40,8 @@ SAMPLE_RATE = 24_000
 def resolve_fish_device(device: str) -> str:
     """Fish runs on one CUDA device or the CPU.
 
-    For ``auto`` the plain ``"cuda"`` is returned: the S2-Pro checkpoint in this
-    release is a FishOmni model, whose loader shards it across every visible GPU
-    (it needs ~24 GB, more than one 12 GB card). An explicit ``cuda:N`` is kept.
+    For ``auto`` the plain ``"cuda"`` is returned, which resolves to ``cuda:0`` -
+    the single card the int8 weights fit on. An explicit ``cuda:N`` is kept.
     """
     raw = str(device or "auto").strip().lower()
     try:
@@ -75,17 +71,22 @@ class FishEngine:
         temperature: float | None = None,
         top_p: float | None = None,
         max_new_tokens: int | None = None,
+        quantize: str | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.device = device
         self.temperature = temperature
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens
+        #: ``int8`` (default in the worker) fits a 12 GB card; ``off`` loads the
+        #: bf16 weights Fish documents as needing ~24 GB.
+        self.quantize = quantize
         self._sample_rate = SAMPLE_RATE
         _LOGGER.debug(
-            "Fish engine: model=%s device=%s temperature=%s top_p=%s",
+            "Fish engine: model=%s device=%s quantize=%s temperature=%s top_p=%s",
             self.model_dir,
             self.device,
+            quantize,
             temperature,
             top_p,
         )
@@ -166,9 +167,9 @@ class FishEngine:
                 )
             if "CUDA out of memory" in stderr or "OutOfMemoryError" in stderr:
                 raise TTSError(
-                    "Fish Speech S2-Pro needs about 24 GB of VRAM and does not "
-                    "fit on this GPU. Retry with --device cpu (slower) or use a "
-                    "larger card."
+                    "Fish Speech ran out of VRAM. The int8 default needs ~6 GB "
+                    "resident (~11 GB peak) and --fish-quantize off needs ~24 "
+                    "GB; retry with --device cpu (slower) or a larger card."
                 )
             tail = "\n".join(stderr.splitlines()[-12:])
             raise TTSError(
@@ -196,24 +197,20 @@ class FishEngine:
         lines: Sequence[str],
         *,
         reference: Path | str,
-        prosody: Sequence[ProsodySpec] | None = None,
         ref_text: str | None = None,
         language: str | None = None,
-        tag_mode: str = "render",
     ) -> list[np.ndarray]:
-        """Synthesise each line in the reference voice, tagged for delivery.
+        """Synthesise each line in the reference voice, tags included.
+
+        Fish reads delivery from ``[tag]`` cues inside the text and has no
+        separate style channel, so the lines are sent exactly as given: the
+        caller writes them (``--text``) or the planner does.
 
         Args:
-            lines: Lines to speak, one utterance each.
+            lines: Lines to speak, one utterance each, tags included.
             reference: Clip of the voice to clone.
-            prosody: One spec per line; a single value broadcasts. It is mapped
-                onto Fish's inline emotion/paralinguistic tags when
-                ``tag_mode`` is ``"render"``.
             ref_text: Transcript of ``reference``; improves cloning fidelity.
             language: Ignored: Fish infers the language from the text.
-            tag_mode: ``"render"`` decorates the lines with
-                :func:`fish_inline_tags`; ``"keep"`` sends them as given, for
-                hand-written or LLM-written tags.
 
         Returns:
             One mono float32 array per line, in order.
@@ -221,24 +218,14 @@ class FishEngine:
         if not lines:
             return []
 
-        if tag_mode == "render":
-            specs = resolve_prosody(lines, prosody)
-            tagged = [
-                fish_inline_tags(line, spec) for line, spec in zip(lines, specs)
-            ]
-        else:
-            # The caller already directed the text; a prefix of ours would
-            # contradict it.
-            tagged = [str(line) for line in lines]
+        tagged = [str(line) for line in lines]
         self._ensure_available()
 
         _LOGGER.debug(
-            "Fish request: lines=%d reference=%s device=%s tag_mode=%s "
-            "interpreter=%s",
+            "Fish request: lines=%d reference=%s device=%s interpreter=%s",
             len(lines),
             reference,
             self.device,
-            tag_mode,
             self._python_executable(),
         )
         for index, text in enumerate(tagged, start=1):
@@ -265,6 +252,8 @@ class FishEngine:
                 request["top_p"] = float(self.top_p)
             if self.max_new_tokens is not None:
                 request["max_new_tokens"] = int(self.max_new_tokens)
+            if self.quantize:
+                request["quantize"] = str(self.quantize)
             request_path.write_text(
                 json.dumps(request, ensure_ascii=False), encoding="utf-8"
             )

@@ -1,11 +1,11 @@
-"""CosyVoice speech synthesis, isolated in a child process.
+"""CosyVoice 3 speech synthesis, isolated in a child process.
 
-Supports CosyVoice 2 and 3. The repo pins ``transformers==4.51.3`` while the Qwen
-TTS checkpoint this project uses pins ``transformers==4.57.3``. Loading both in
-one interpreter silently produces garbled audio — the LLM runs, but its codes
-decode to noise. The engine therefore runs CosyVoice in a child whose
-``PYTHONPATH`` starts with a small transformers-4.51.3 overlay, leaving the main
-environment on the version Qwen needs.
+The repo pins ``transformers==4.51.3`` while the Qwen TTS checkpoint this project
+uses pins ``transformers==4.57.3``. Loading both in one interpreter silently
+produces garbled audio - the LLM runs, but its codes decode to noise. The engine
+therefore runs CosyVoice in a child whose ``PYTHONPATH`` starts with a small
+transformers-4.51.3 overlay, leaving the main environment on the version Qwen
+needs.
 
 The child is :mod:`pipeline.cosyvoice_worker`. This module only builds the
 request, runs it, and reads the WAVs back, so it needs no CosyVoice import of its
@@ -46,37 +46,16 @@ _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "CosyVoiceEngine",
-    "detect_cosyvoice_type",
     "resolve_cosyvoice_device",
-    "resolve_instructs",
 ]
 
 #: CosyVoice synthesises at 24 kHz; the worker reports the checkpoint's own rate.
 SAMPLE_RATE = 24_000
 
-COSYVOICE2 = "cosyvoice2"
-COSYVOICE3 = "cosyvoice3"
-
 #: Duration multipliers used to apply ``pace`` by time-stretching. On CosyVoice 3
 #: a pace clause in the instruct destabilises non-English speech, so pace is
 #: applied to the audio instead (>1 is slower, <1 is faster).
 _PACE_RATIOS = {"slow": 1.12, "fast": 0.90}
-
-
-def detect_cosyvoice_type(model_dir: Path | str) -> str:
-    """The checkpoint generation in ``model_dir``.
-
-    Reads the directory name first, because the model may not be downloaded yet
-    when the engine is constructed, then the config file that distinguishes the
-    two generations (``cosyvoice2.yaml`` / ``cosyvoice3.yaml``).
-    """
-    path = Path(model_dir)
-    name = path.name.lower()
-    if "cosyvoice3" in name:
-        return COSYVOICE3
-    if (path / "cosyvoice3.yaml").is_file():
-        return COSYVOICE3
-    return COSYVOICE2
 
 
 def resolve_cosyvoice_device(device: str) -> str | None:
@@ -95,25 +74,6 @@ def resolve_cosyvoice_device(device: str) -> str | None:
     return ""
 
 
-def resolve_instructs(
-    lines: Sequence[str], instructs: Sequence[str] | None
-) -> list[str]:
-    """Broadcast one instruction to every line, or validate one per line."""
-    if not lines:
-        return []
-    if instructs is None:
-        return [""] * len(lines)
-    values = list(instructs)
-    if len(values) == 1 and len(lines) > 1:
-        return values * len(lines)
-    if len(values) != len(lines):
-        raise TTSError(
-            f"Got {len(lines)} line(s) but {len(values)} emotion(s); provide one "
-            "per line, or a single one to apply everywhere."
-        )
-    return values
-
-
 def _module_available(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None
@@ -122,7 +82,7 @@ def _module_available(name: str) -> bool:
 
 
 class CosyVoiceEngine:
-    """Synthesiser backed by a CosyVoice 2 or 3 checkpoint, run out of process."""
+    """Synthesiser backed by a CosyVoice 3 checkpoint, run out of process."""
 
     def __init__(
         self,
@@ -130,7 +90,6 @@ class CosyVoiceEngine:
         *,
         device: str = "auto",
         fp16: bool | None = None,
-        model_type: str | None = None,
         stretcher: Any | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
@@ -138,15 +97,11 @@ class CosyVoiceEngine:
         #: ``None`` means "follow the device": fp16 on CUDA, fp32 on CPU.
         self._fp16 = fp16
         self._sample_rate = SAMPLE_RATE
-        #: ``cosyvoice2`` or ``cosyvoice3``. Inferred from the checkpoint unless
-        #: the caller knows better (useful for a not-yet-downloaded model).
-        self.model_type = model_type or detect_cosyvoice_type(self.model_dir)
         #: Injected in tests; otherwise resolved lazily by ``_stretcher_for_pace``.
         self._stretcher = stretcher
         _LOGGER.debug(
-            "CosyVoice engine: model=%s type=%s device=%s fp16=%s",
+            "CosyVoice engine: model=%s device=%s fp16=%s",
             self.model_dir,
-            self.model_type,
             self.device,
             self._fp16,
         )
@@ -209,8 +164,7 @@ class CosyVoiceEngine:
             "cosyvoice is not installed. Clone the CosyVoice repository under "
             "third_party/CosyVoice (or install it so 'cosyvoice' is importable), "
             "and download the checkpoint with: "
-            f"python dub.py models --download "
-            f"{'tts_cosyvoice3' if self.model_type == COSYVOICE3 else 'tts_cosyvoice'}"
+            "python dub.py models --download tts_cosyvoice3"
         )
 
     def _run_worker(self, request_path: Path, out_dir: Path) -> dict[str, Any]:
@@ -255,7 +209,7 @@ class CosyVoiceEngine:
         if completed.stderr.strip():
             _LOGGER.debug(
                 "CosyVoice worker [%s] output:\n%s",
-                self.model_type,
+                self.model_dir,
                 completed.stderr.strip(),
             )
 
@@ -273,27 +227,18 @@ class CosyVoiceEngine:
 
         CosyVoice 3 reads text without a traditional frontend (its README says
         so), and the frontend's only non-Chinese path is the *English*
-        normaliser - which mangles French. Disabling it for CosyVoice 3 is what
-        keeps a French line from being normalised as English.
+        normaliser - which mangles French. Keeping it off is what stops a French
+        line from being normalised as English.
         """
-        return self.model_type != COSYVOICE3
+        return False
 
     def _zero_shot_prompt(self, ref_text: str | None) -> str:
-        """The prompt slot for ``inference_zero_shot``.
-
-        CosyVoice 3 expects the transcript to follow its system prefix;
-        CosyVoice 2 takes the transcript alone.
-        """
-        text = (ref_text or "").strip()
-        if self.model_type == COSYVOICE3:
-            return f"{COSYVOICE3_SYSTEM_PROMPT}{text}"
-        return text
+        """The prompt slot for ``inference_zero_shot``: system prefix, transcript."""
+        return f"{COSYVOICE3_SYSTEM_PROMPT}{(ref_text or '').strip()}"
 
     def _cross_lingual_text(self, text: str) -> str:
         """Prefix inline-token text with the system prompt CosyVoice 3 expects."""
-        if self.model_type == COSYVOICE3:
-            return f"{COSYVOICE3_SYSTEM_PROMPT}{text}"
-        return text
+        return f"{COSYVOICE3_SYSTEM_PROMPT}{text}"
 
     def _stretcher_for_pace(self) -> Any:
         """The stretcher used to apply pace, resolved on first use."""
@@ -329,16 +274,12 @@ class CosyVoiceEngine:
         self,
         lines: Sequence[str],
         *,
-        instructs: Sequence[str] | None,
         prosody: Sequence[ProsodySpec] | None,
         ref_text: str | None,
         language: str | None = None,
     ) -> tuple[list[str], list[str], list[str], list[str]]:
         """Per-line ``(text, instruct, prompt, mode)`` for the worker."""
-        specs = resolve_prosody(lines, prosody) if prosody is not None else None
-        raw_instructs = (
-            resolve_instructs(lines, instructs) if prosody is None else None
-        )
+        specs = resolve_prosody(lines, prosody)
         have_transcript = bool((ref_text or "").strip())
 
         texts: list[str] = []
@@ -346,59 +287,38 @@ class CosyVoiceEngine:
         prompts: list[str] = []
         modes: list[str] = []
         for index, line in enumerate(lines):
-            if specs is not None:
-                spec = specs[index]
-                mode = cosyvoice_mode(spec)
-                if mode == "zero_shot" and not have_transcript:
-                    # No transcript to condition on: the token path still clones
-                    # the speaker and keeps the language, where an empty prompt
-                    # would weaken the clone.
-                    mode = "cross_lingual"
-                if mode == "instruct2":
-                    text = apply_inline_tokens(line, spec)
-                    instruct = cosyvoice_instruct(
-                        spec, model_type=self.model_type, language=language
-                    )
-                    prompt = ""
-                    if (
-                        self.model_type == COSYVOICE3
-                        and language
-                        and str(language).strip().lower()
-                        not in {"english", "chinese"}
-                        and have_transcript
-                    ):
-                        # instruct2 drops the reference speech tokens, which is
-                        # what makes non-English prosody unstable. Pairing the
-                        # instruction with the reference transcript keeps them,
-                        # so the voice/accent stay grounded.
-                        mode = "zero_shot"
-                        prompt = f"{instruct}{(ref_text or '').strip()}"
-                        instruct = ""
-                elif mode == "cross_lingual":
-                    text = self._cross_lingual_text(apply_inline_tokens(line, spec))
-                    instruct = ""
-                    prompt = ""
-                else:  # zero_shot
-                    text = line
-                    instruct = ""
-                    prompt = self._zero_shot_prompt(ref_text)
-            else:
-                raw = (raw_instructs[index] if raw_instructs else "").strip()
-                if raw:
-                    mode = "instruct2"
-                    text = line
-                    instruct = raw
-                    prompt = ""
-                elif have_transcript:
+            spec = specs[index]
+            mode = cosyvoice_mode(spec)
+            if mode == "zero_shot" and not have_transcript:
+                # No transcript to condition on: the token path still clones
+                # the speaker and keeps the language, where an empty prompt
+                # would weaken the clone.
+                mode = "cross_lingual"
+            if mode == "instruct2":
+                text = apply_inline_tokens(line, spec)
+                instruct = cosyvoice_instruct(spec, language=language)
+                prompt = ""
+                if (
+                    language
+                    and str(language).strip().lower()
+                    not in {"english", "chinese"}
+                    and have_transcript
+                ):
+                    # instruct2 drops the reference speech tokens, which is
+                    # what makes non-English prosody unstable. Pairing the
+                    # instruction with the reference transcript keeps them,
+                    # so the voice and accent stay grounded.
                     mode = "zero_shot"
-                    text = line
+                    prompt = f"{instruct}{(ref_text or '').strip()}"
                     instruct = ""
-                    prompt = self._zero_shot_prompt(ref_text)
-                else:
-                    mode = "cross_lingual"
-                    text = self._cross_lingual_text(line)
-                    instruct = ""
-                    prompt = ""
+            elif mode == "cross_lingual":
+                text = self._cross_lingual_text(apply_inline_tokens(line, spec))
+                instruct = ""
+                prompt = ""
+            else:  # zero_shot
+                text = line
+                instruct = ""
+                prompt = self._zero_shot_prompt(ref_text)
             texts.append(text)
             values.append(instruct)
             prompts.append(prompt)
@@ -410,7 +330,6 @@ class CosyVoiceEngine:
         lines: Sequence[str],
         *,
         reference: Path | str,
-        instructs: Sequence[str] | None = None,
         prosody: Sequence[ProsodySpec] | None = None,
         ref_text: str | None = None,
         language: str | None = None,
@@ -426,14 +345,10 @@ class CosyVoiceEngine:
         * only inline tokens (breath/pause/laughter) -> ``inference_cross_lingual``;
         * emotion/pace/volume -> ``inference_instruct2``.
 
-        ``prosody`` wins when both it and ``instructs`` are given. ``instructs``
-        is the historical raw-instruction path, kept for compatibility.
-
         Args:
             lines: Target-language lines to speak, one utterance each.
             reference: Path to a clip of the voice to clone. CosyVoice loads it
                 itself at the rates it needs.
-            instructs: One raw instruction per line. A single entry broadcasts.
             prosody: One spec per line; a single value broadcasts.
             ref_text: Exact transcript of ``reference``. Used by the zero-shot
                 clone path to keep the reference's accent and pronunciation.
@@ -443,15 +358,13 @@ class CosyVoiceEngine:
 
         Raises:
             DependencyError: If CosyVoice is not installed.
-            TTSError: If a count does not match, the worker fails, or a line comes
-                back empty.
+            TTSError: If the worker fails or a line comes back empty.
         """
         if not lines:
             return []
 
         texts, values, prompts, modes = self._plan_lines(
             lines,
-            instructs=instructs,
             prosody=prosody,
             ref_text=ref_text,
             language=language,
@@ -459,9 +372,8 @@ class CosyVoiceEngine:
         self._ensure_available()
 
         _LOGGER.debug(
-            "CosyVoice request: type=%s lines=%d reference=%s language=%s "
-            "modes=%s text_frontend=%s",
-            self.model_type,
+            "CosyVoice request: lines=%d reference=%s language=%s modes=%s "
+            "text_frontend=%s",
             len(lines),
             reference,
             language or "auto",
@@ -490,7 +402,6 @@ class CosyVoiceEngine:
                 json.dumps(
                     {
                         "model_dir": str(self.model_dir),
-                        "model_type": self.model_type,
                         "reference": str(reference),
                         "ref_text": (ref_text or ""),
                         "lines": texts,
@@ -526,7 +437,6 @@ class CosyVoiceEngine:
             # where a pace clause in the instruct destabilises the speech.
             if (
                 prosody is not None
-                and self.model_type == COSYVOICE3
                 and language
                 and str(language).strip().lower() not in {"english", "chinese"}
             ):
@@ -540,7 +450,7 @@ class CosyVoiceEngine:
             _LOGGER.info(
                 "CosyVoice %s: %d line(s) in %.2fs "
                 "(worker load %.2fs, generate %.2fs)",
-                self.model_type,
+                "3",
                 len(lines),
                 elapsed,
                 float(timings.get("load_seconds", 0.0)),

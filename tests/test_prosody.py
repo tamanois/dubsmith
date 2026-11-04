@@ -26,10 +26,7 @@ from pipeline.prosody import (
     cosyvoice_instruct,
     cosyvoice_mode,
     customvoice_instruct,
-    fish_apply_emotion,
     fish_cue_tokens,
-    fish_emotion_tag,
-    fish_inline_tags,
     fish_structural_token,
     parse_fish_inline_response,
     parse_prosody_response,
@@ -291,11 +288,6 @@ def test_cosyvoice_calm_has_no_emotion_clause() -> None:
     assert cosyvoice_instruct(ProsodySpec(emotion="calm")) == (
         "You are a helpful assistant.<|endofprompt|>"
     )
-
-
-def test_cosyvoice2_instruct_has_no_system_prefix() -> None:
-    instruct = cosyvoice_instruct(ProsodySpec(emotion="happy"), model_type="cosyvoice2")
-    assert instruct == "请非常开心地说一句话。<|endofprompt|>"
 
 
 def test_cosyvoice_french_instruct_avoids_english_volume_and_adds_language() -> None:
@@ -564,40 +556,38 @@ def test_style_whole_messages_ask_for_a_single_instruction() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_fish_maps_emotions_to_documented_tags() -> None:
-    assert fish_emotion_tag("happy") == "excited"
-    assert fish_emotion_tag("excited") == "excited"
-    assert fish_emotion_tag("angry") == "angry"
-    assert fish_emotion_tag("sad") == "sad"
-    assert fish_emotion_tag("whispering") == "whisper"
-    assert fish_emotion_tag("calm") is None
-
-
-def test_fish_drops_an_unknown_emotion(caplog) -> None:
-    with caplog.at_level(logging.WARNING, logger="pipeline.prosody"):
-        assert fish_inline_tags("hi", ProsodySpec(emotion="smug")) == "hi"
-
-    assert any("no documented tag" in record.getMessage() for record in caplog.records)
-
-
-def test_fish_prefixes_the_emotion_tag() -> None:
-    assert fish_inline_tags("hi", ProsodySpec(emotion="excited")) == "[excited] hi"
-
-
-def test_fish_pause_lands_after_the_first_clause() -> None:
-    out = fish_inline_tags("First one. Second one.", ProsodySpec(pause=True))
-
-    assert out == "First one. [pause] Second one."
+def test_fish_tag_vocabulary_is_the_documented_set() -> None:
+    # models/fish-speech-s2-pro/README.md, "Common tags".
+    assert len(FISH_TAGS) == 34
+    assert {
+        "pause",
+        "sigh",
+        "chuckle",
+        "whisper",
+        "surprised",
+        "delight",
+        "shocked",
+        "laughing tone",
+    } <= set(FISH_TAGS)
+    assert all(tag == tag.lower() for tag in FISH_TAGS)
 
 
 def test_strip_fish_tags_removes_cues_and_spans() -> None:
     assert strip_fish_tags("[sad] Wait... [pause] here") == "Wait... here"
+    assert strip_fish_tags("[whisper in small voice] Hi") == "Hi"
     assert strip_fish_tags("<whisper>quiet</whisper> words") == "quiet words"
 
 
 def test_fish_cue_tokens_lists_cues_in_order() -> None:
-    assert fish_cue_tokens("[Whisper] a [pause] b [SAD]") == ["whisper", "pause", "sad"]
-    assert fish_cue_tokens("[door slams] hi") == []
+    assert fish_cue_tokens("[Whisper] a [pause] b [SAD]") == [
+        "whisper",
+        "pause",
+        "sad",
+    ]
+    assert fish_cue_tokens("[Door Slams] hi") == ["door slams"]
+    assert fish_cue_tokens("[whisper in  small voice] hi") == [
+        "whisper in small voice"
+    ]
 
 
 def test_fish_structural_token_is_detected() -> None:
@@ -605,10 +595,17 @@ def test_fish_structural_token_is_detected() -> None:
     assert fish_structural_token("plain text") is None
 
 
-def test_validate_flags_an_unknown_tag() -> None:
-    problems = validate_fish_inline_text("[sarcastic] hi")
+def test_validate_accepts_a_free_form_tag() -> None:
+    assert validate_fish_inline_text("[tender] hi") == []
+    assert validate_fish_inline_text("[whisper in small voice] hi") == []
 
-    assert any("[sarcastic]" in problem for problem in problems)
+
+def test_validate_flags_a_phrase_as_a_tag() -> None:
+    problems = validate_fish_inline_text(
+        "[please read this like a documentary narrator describing a storm] hi"
+    )
+
+    assert any("phrase" in problem for problem in problems)
 
 
 def test_validate_flags_a_leading_pause_and_stacked_tags() -> None:
@@ -622,38 +619,39 @@ def test_validate_is_quiet_for_a_well_formed_line() -> None:
     assert validate_fish_inline_text("[whisper] Wait... [pause] did you hear?") == []
 
 
-def test_sanitize_drops_an_unknown_tag_and_keeps_a_known_one() -> None:
-    assert sanitize_fish_inline_line("[sarcastic] hi", "hi") == "hi"
-    assert sanitize_fish_inline_line("[sad] hi", "hi") == "[sad] hi"
-
-
-def test_sanitize_keeps_a_cue_the_original_already_had() -> None:
-    assert (
-        sanitize_fish_inline_line("[sad] [laughs] fine", "[laughs] fine")
-        == "[sad] [laughs] fine"
+def test_sanitize_keeps_free_form_cues() -> None:
+    assert sanitize_fish_inline_line("[tender] hi") == "[tender] hi"
+    assert sanitize_fish_inline_line("[whisper in  small voice] hi") == (
+        "[whisper in small voice] hi"
     )
 
 
+def test_sanitize_drops_a_phrase_written_as_a_tag() -> None:
+    planned = sanitize_fish_inline_line(
+        "[this is a whole sentence pretending to be a tag] hi"
+    )
+
+    assert planned == "hi"
+
+
 def test_sanitize_converts_a_paired_span_to_a_cue() -> None:
-    assert sanitize_fish_inline_line("<whisper>secret</whisper>", "secret") == (
+    assert sanitize_fish_inline_line("<whisper>secret</whisper>") == (
         "[whisper] secret"
     )
 
 
 def test_sanitize_moves_a_leading_pause_inward() -> None:
     assert sanitize_fish_inline_line(
-        "[pause] First part. Second part.", "First part. Second part."
+        "[pause] First part. Second part."
     ) == ("First part. [pause] Second part.")
 
 
 def test_sanitize_removes_prompt_tokens() -> None:
-    assert sanitize_fish_inline_line("hi <|im_end|> there", "hi there") == "hi there"
+    assert sanitize_fish_inline_line("hi <|im_end|> there") == "hi there"
 
 
 def test_sanitize_caps_the_number_of_cues() -> None:
-    planned = sanitize_fish_inline_line(
-        "[excited] a [pause] b [angry] c [sad] d", "a b c d"
-    )
+    planned = sanitize_fish_inline_line("[excited] a [pause] b [angry] c [sad] d")
 
     assert planned.count("[") == FISH_MAX_CUES_PER_LINE
 
@@ -699,6 +697,43 @@ def test_parse_inline_falls_back_when_a_word_changes() -> None:
     ]
 
 
+def test_parse_inline_keeps_tags_when_only_spacing_is_fixed() -> None:
+    # Text pasted from a document loses the space after a full stop, and the
+    # planner re-inserts it. That is typography, not a change to the words, so
+    # the line keeps its tags instead of falling back to the untagged source.
+    source = (
+        "Le son est net, même sur des haut-parleurs modestes.Et pour finir… "
+        "une phrase plus douce."
+    )
+    tagged = (
+        "Le son est net, [short pause] même sur des haut-parleurs modestes. "
+        "[low volume] Et pour finir… une phrase plus douce."
+    )
+    reply = json.dumps({"lines": [{"id": 0, "text": tagged}]})
+
+    assert parse_fish_inline_response(reply, [source]) == [tagged]
+
+
+def test_parse_inline_still_rejects_a_real_word_change() -> None:
+    source = "Le son est net. Et pour finir, une phrase plus douce."
+    reply = json.dumps(
+        {
+            "lines": [
+                {
+                    "id": 0,
+                    "text": (
+                        "[low volume] Le son est clair. Et pour finir, une "
+                        "phrase plus douce."
+                    ),
+                }
+            ]
+        }
+    )
+
+    # "net" -> "clair" is a word change, not spacing: the tags are dropped.
+    assert parse_fish_inline_response(reply, [source]) == [source]
+
+
 def test_parse_inline_keeps_the_source_when_the_reply_is_empty() -> None:
     assert parse_fish_inline_response("no json here", ["one", "two"]) == [
         "one",
@@ -718,27 +753,14 @@ def test_parse_inline_defaults_a_missing_line_to_its_source() -> None:
     assert parse_fish_inline_response(reply, ["one", "two"]) == ["[sad] one", "two"]
 
 
-def test_apply_emotion_replaces_the_leading_tag() -> None:
-    assert fish_apply_emotion("[sad] Wait.", "angry") == "[angry] Wait."
-
-
-def test_apply_emotion_keeps_a_leading_pause_inward() -> None:
-    assert fish_apply_emotion("[pause] Wait. Then go.", "sad") == (
-        "[sad] Wait. [pause] Then go."
-    )
-
-
-def test_apply_emotion_is_a_noop_when_the_emotion_has_no_tag() -> None:
-    assert fish_apply_emotion("[sad] Wait.", "neutral") == "[sad] Wait."
-
-
-def test_fish_inline_prompt_is_explicit_and_closed() -> None:
+def test_fish_inline_prompt_explains_free_form_and_human_delivery() -> None:
     system = build_fish_inline_messages(["one"])[0]["content"]
 
+    assert "FREE-FORM" in system
+    assert "[whisper in small voice]" in system
+    assert "15,000+" in system
+    assert "sound like a person saying it" in system
     assert "Copy every word exactly" in system
-    assert "[whisper] Wait... [pause] did you hear that?" in system
-    assert "[sarcastic]" in system
-    assert "at most three tags per line" in system
     assert "or any <|...|> token" in system
 
 
@@ -833,29 +855,10 @@ def test_fish_inline_planner_degrades_to_the_source_text() -> None:
     assert planner.plan_lines(["keep these words"]) == ["keep these words"]
 
 
-def test_fish_pause_is_appended_without_a_boundary() -> None:
-    assert fish_inline_tags("just one clause", ProsodySpec(pause=True)) == (
-        "just one clause [pause]"
-    )
-
-
-def test_fish_laughter_trails_and_breath_is_dropped() -> None:
-    out = fish_inline_tags("funny", ProsodySpec(laughter=True, breath=True))
-
-    assert out == "funny [laughing]"
-
-
-def test_fish_tag_vocabulary_is_fixed() -> None:
-    assert set(FISH_TAGS) == {
-        "excited",
-        "angry",
-        "sad",
-        "whisper",
-        "laughing",
-        "pause",
+def test_backend_capabilities_cover_the_surviving_backends() -> None:
+    assert set(BACKEND_CAPABILITIES) == {
+        "qwen",
+        "cosyvoice3",
+        "chatterbox",
+        "customvoice",
     }
-
-
-def test_fish_capabilities_name_the_real_tags() -> None:
-    assert "[whisper]" in BACKEND_CAPABILITIES["fish"]
-    assert "emo_audio_prompt" in BACKEND_CAPABILITIES["indextts2"]

@@ -5,9 +5,11 @@ without losing the speaker's timbre.
 
 ## Voice library (saved voices)
 
-A **voice print** is a short reference clip plus its exact transcript, saved
-under a label. Create one once, then reuse it by name — in `say`, or in a
-dubbing run with `--voice`. Two ways to make one:
+A **voice** is a reference clip plus its transcript, saved under a label. A cloned
+voice also keeps the checkpoint's *encoding* of that clip — the speech codes and
+the speaker embedding — so using it later encodes nothing at all. Create one
+once, then reuse it by name in `say`, or in a dubbing run with `--voice`. Three
+ways to make one:
 
 ```bash
 # 1. design a voice from a description (VoiceDesign checkpoint)
@@ -15,14 +17,36 @@ python dub.py voices --design \
   --prompt "a warm female French voice, slow and clear" \
   --lang fr --label warm-fr
 
-# 2. clone a voice from a clip and its exact transcript (Base checkpoint)
+# 2. encode a donated clip once (Base checkpoint) — nothing is re-synthesised
 python dub.py voices --clone --audio input/Delphine-Charming.mp3 \
   --clone-text "Bonjour, je suis Delphine. Comment tu vas ?" \
   --lang fr --label delphine
 
+# 3. register a clip verbatim: no model, no GPU, no processing
+python dub.py voices --add input/me.wav \
+  --clone-text "Bonjour, je m'appelle Joël." --lang fr --label me
+python dub.py voices --add input/me.wav --transcribe --label me  # text from the audio
+
 python dub.py voices --list                 # the library
 python dub.py voices --remove warm-fr       # delete one
 ```
+
+| Mode | Stores | Reusing it costs |
+|---|---|---|
+| `--design` | a rendered passage in the described voice | one encode of that passage |
+| `--clone` | the donor clip, its transcript, **and the encoding** | nothing |
+| `--add` | the donor clip and an optional transcript | one encode, then cached |
+
+`--add` is the fast path: it decodes the file, downmixes it to mono and writes it
+into the library — no checkpoint is loaded. `--transcribe` derives the transcript
+with the local Whisper model and detects the language, so `--lang` becomes
+optional; without a transcript the voice clones from the speaker embedding alone
+(x-vector mode), which is less faithful but needs no text.
+
+`--verify` transcribes the clip even when `--clone-text` is given, and warns when
+the two disagree. That check exists because ICL cloning aligns the speech codes
+*against the transcript*: a mismatched transcript produces the wrong voice rather
+than an error.
 
 The design prompt is a natural-language instruction, so it can also describe
 tone and delivery — "an angry male French voice, speaking fast" works, because
@@ -30,13 +54,33 @@ Qwen VoiceDesign is conditioned on timbre, emotion and prosody together. This is
 the only backend where a voice is created from words; CosyVoice and Chatterbox
 clone from audio and cannot design.
 
-Prints live in `voices/` by default (override with `VOICES_DIR` or
+Voices live in `voices/` by default (override with `VOICES_DIR` or
 `--voices-dir`), one folder per voice:
 
 ```
-voices/warm-fr/voice.wav    # the reference clip (canonical passage, 20–30 s)
-voices/warm-fr/voice.json   # label, language, source, transcript, instruct, gender, pace
+voices/delphine/voice.wav                   # the reference clip (the donor, as given)
+voices/delphine/voice.json                  # label, language, source, transcript, gender, pace
+voices/delphine/prompts/qwen-<fingerprint>.npz   # Qwen's encoding: codes + embedding
 ```
+
+`voice.wav` is the voice, and it works with every backend. A **card** under
+`prompts/` is derived data: one checkpoint's encoding of that clip, which lets it
+skip the encode pass. Cards are named after the backend and the model
+configuration that wrote them, because they are not portable — Qwen's speech
+codes mean nothing to Fish, and a card from one checkpoint is not a card for
+another.
+
+That naming is also why a card is never thrown away. Upgrading or re-downloading
+the weights writes a new card beside the old one, and switching back reuses the
+first one without re-encoding anything. Everything you could want from a card is
+inside it: the backend, the model, a hash of the model's configuration, and a
+hash of the clip + transcript it was derived from. A card whose clip or text no
+longer matches is ignored (it would be a different voice), and an unreadable or
+deleted card costs one encode, not the voice.
+
+The first `say` on a voice without a card writes one, so a voice encodes at most
+once per model (`VOICES_PROMPT_CACHE=0` turns that off). `voices --list` shows it:
+`clone + qwen card`, or `×2` when the voice has cards for two models.
 
 Reference them:
 
@@ -54,12 +98,24 @@ python dub.py say --clone me.wav --clone-text "…" --lang en \
 python dub.py --video talk.mp4 --target en --voice warm-fr
 ```
 
-The saved voice supplies the **timbre**. If the print was recorded in the target
+With `--save-as`, a cloned voice is stored as the donor plus its encoding, so the
+next use of that label starts from the encoding rather than re-encoding the clip.
+
+`--clone-text` is optional everywhere. Without it the voice is cloned from the
+speaker embedding alone, which keeps the timbre but loses the closer ICL match;
+`say` logs a warning when it takes that path. Saved voices follow the same rule:
+a voice with a transcript clones in ICL mode, one without falls back to the
+embedding.
+
+The saved voice supplies the **timbre**. If it was recorded in the target
 language, it is cloned directly: its own speech codes already carry the native
 accent, so there is no blend to build. If it was recorded in another language,
 pronunciation comes from a generated native anchor for the target language
-(`--accent-mode native`) instead. Pass `--accent-mode` explicitly to override
-either choice — for example `preserve` to always keep the print's own accent.
+(`--accent-mode native`) instead; there the stored embedding saves the timbre
+half of the hybrid prompt. A voice with no transcript cannot do ICL at all, so a
+dub uses `--accent-mode speaker-only` for it unless you ask for something else.
+Pass `--accent-mode` explicitly to override any of these choices — for example
+`preserve` to always keep the voice's own accent.
 
 Defaults: `dub.py say` writes `output/say/<name>.wav`; a label is derived from
 the description or audio filename unless `--label`/`--save-as` names it; an
@@ -67,46 +123,19 @@ existing label is never overwritten without `--force`. Overwriting a voice keeps
 its path, so re-run a dub with `--force` to rebuild stages that used the old
 clip.
 
-## Emotion with CosyVoice2
+A donor that carries music, noise or a second speaker keeps all of it: the
+encoding is faithfully the donor's. Trim or separate the clip before registering
+it if you want a cleaner voice — `--clone` no longer renders a canonical passage
+first, which is what used to hide that.
 
-The Qwen Base checkpoint copies its prosody from the reference clip, so a flat
-reference reads as a flat voice. `dub say --backend cosyvoice` swaps in
-CosyVoice2, which accepts a **per-line emotion/style instruction** on top of the
-cloned voice:
+Measured on one line from the same donor, with the checkpoint's own speaker
+encoder: 0.977 similarity for a voice cloned from a stored encoding, against
+0.975 for the older approach that re-rendered the voice into a passage and then
+encoded that. A single line is not a benchmark; the structural difference is that
+the stored encoding *is* the donor's embedding, so no generation sits between the
+donor and the prompt.
 
-```bash
-# one line, one emotion: --prosody maps the word onto a trained instruction
-python dub.py say --voice warm-fr --backend cosyvoice \
-  --text "Nous avons gagné !" --prosody "emotion=happy"
-
-# several lines, an emotion each (a single value broadcasts to every line)
-python dub.py say --voice warm-fr --backend cosyvoice \
-  --text $'Bonjour.\nAttends, quoi ?' --prosody "emotion=calm" --prosody "emotion=happy"
-```
-
-Prefer `--prosody` on this backend. `--prosody emotion=<word>` is translated into
-the checkpoint's own trained instruction (for example `请非常开心地说一句话。`),
-with aliases such as `excited` mapped onto `happy`. A bare `--emotion` is instead
-passed through **verbatim** as the instruction text, which is only useful if you
-write the instruction yourself — a single English adjective is not something this
-checkpoint was trained on.
-
-`--text` is split on newlines; each line is spoken as its own utterance with its
-own emotion (one value broadcasts to every line, and a neutral or `calm` line
-clones plainly). `--clone` works the same, and `--clone-text` is optional with
-CosyVoice. Output: per-line WAVs plus a combined `speech.wav` under
-`output/say/<name>/`.
-
-The same `voices` prints serve both backends — a print is just a reference clip.
-Requires the CosyVoice2 package, its transformers overlay and the checkpoint (see
-[Setup](setup.md#cosyvoice2-optional-expressive-speech)); the engine runs it in a
-child process because its `transformers` pin differs from Qwen's.
-
-**Languages.** CosyVoice2 covers Chinese, English, Japanese, Korean and Cantonese
-well. French, German, Spanish, Italian, Portuguese and Russian are not officially
-supported and sound poor; use the default Qwen backend for those.
-
-## Expressive backends: CosyVoice3, Chatterbox, Fish and IndexTTS2
+## Expressive backends: CosyVoice3, Chatterbox and Fish
 
 These backends target the same problem — speech that sounds *alive* rather than
 read — and all clone the voice from a reference clip.
@@ -115,8 +144,7 @@ read — and all clone the voice from a reference clip.
 |---|---|---|---|
 | `--backend cosyvoice3` | 9, including **French** | emotion, pace, volume, `[breath]`, `[laughter]` | `python dub.py models --download tts_cosyvoice3` |
 | `--backend chatterbox` | 23, including **French** | emotion exaggeration (one intensity) | `python dub.py models --download tts_chatterbox` + the isolated env below |
-| `--backend fish` | ~100 | emotion + paralinguistics as **inline tags** (`[excited]`, `[whisper]`, `[sad]`, `[angry]`, `[laughing]`, `[pause]`) | `python dub.py models --download tts_fish` + the isolated env below |
-| `--backend indextts2` | zh, en, ja (2.0); + es, ar in 2.5 | **separate emotion reference** (`--emotion-audio`, `--emotion-alpha`) + `--duration` seconds | `python dub.py models --download tts_index_tts2` + the isolated env below |
+| `--backend fish` | ~100 | delivery as **inline tags** in `--text` (34 documented tags + free-form) | `python dub.py models --download tts_fish` + the isolated env below |
 
 ```bash
 # CosyVoice3, with real per-line direction
@@ -129,14 +157,9 @@ python dub.py say --voice warm-fr --backend cosyvoice3 \
 python dub.py say --voice warm-fr --backend chatterbox \
   --text "Nous avons gagné !" --emotion happy
 
-# Fish Speech: the emotion becomes an inline tag
-python dub.py say --voice warm-fr --backend fish \
-  --text "Je n'arrive pas à y croire !" --emotion excited
-
-# IndexTTS2: the voice comes from --voice, the emotion from a second clip
-python dub.py say --voice warm-fr --backend indextts2 \
-  --text "Pourquoi tu ne me l'as pas dit ?" \
-  --emotion-audio colere.wav --emotion-alpha 0.8 --duration 3.2
+# Fish Speech: the direction is a tag in the text
+python dub.py say --voice warm-fr --backend fish --fish-tag-mode keep \
+  --text "[excited] Je n'arrive pas à y croire !"
 ```
 
 ### `--prosody`
@@ -154,7 +177,7 @@ breath   pause   laughter
 
 `--prosody` takes one spec per line (a single value broadcasts):
 
-| Field | Accepted values | CosyVoice 2/3 | Chatterbox | CustomVoice |
+| Field | Accepted values | CosyVoice 3 | Chatterbox | CustomVoice |
 |---|---|---|---|---|
 | `emotion` | free-form | trained set only: `happy`, `sad`, `angry`; aliases such as `excited`→happy, `calm`→none | intensity only: neutral 0.5, calm 0.4, sad 0.3, happy 0.8, excited 0.9, angry 0.85 | free-form tone, e.g. "Speak in an angry tone." |
 | `pace` | `normal`, `slow`, `fast` | trained speed instructs | no pace control; ±0.05 intensity | phrased as "Speak slowly/quickly." |
@@ -164,15 +187,11 @@ breath   pause   laughter
 | `pause` | flag | a comma inserted in a long, unpunctuated line | ignored | ignored |
 | `laughter` | flag | `[laughter]` appended to the line | ignored | ignored |
 
-**Fish Speech** reads `emotion` as a prefix tag (`happy`/`excited` → `[excited]`,
-`angry` → `[angry]`, `sad` → `[sad]`, `whisper` → `[whisper]`), `pause` as
-`[pause]` at the first clause boundary, and `laughter` as a trailing
-`[laughing]`. `pace`, `volume` and `breath` have no documented tag and are
-dropped; an unknown emotion is dropped with a warning.
-
-**IndexTTS2** ignores `--prosody`/`--emotion`/`--prosody-plan` entirely: its
-emotion comes from `--emotion-audio` (see below). A warning is logged when both
-are given.
+**Fish Speech** has no prosody channel at all: its delivery lives in the text as
+`[tag]` cues, so `--prosody`, `--emotion` and `--prosody-plan` are rejected for
+this backend. Write the tags yourself (`--fish-tag-mode keep`, the default) or
+let the model write them (`--fish-tag-mode llm`). See
+[Fish Speech inline tags](#fish-speech-inline-tags) for the vocabulary.
 
 Aliases: `rate`/`speed` for `pace`, `loudness` for `volume`, `mood`/`tone` for
 `emotion`, `expression`/`expressiveness` for `exaggeration`. A bare word is taken
@@ -204,9 +223,6 @@ instruct clause, which likewise destabilises non-English speech. Give the voice 
 transcript (a saved voice has one; `--clone-text` sets one) and pass `--lang` so
 the target language is known; without a transcript it falls back to
 `inference_instruct2`.
-
-**CosyVoice2** — languages: Chinese, English, Japanese, Korean, Cantonese.
-Accepts the instruct sentence plus `[breath]` / `[laughter]`.
 
 **CosyVoice3** — languages: Chinese, English, Japanese, Korean, German, Spanish,
 **French**, Italian, Russian. Accepts the instruct sentence plus these inline
@@ -344,66 +360,47 @@ delivery.
 
 ### Fish Speech inline tags
 
-Fish Speech has no side-channel instruction: emotion and paralinguistics are
-**tags in the text**, and Fish documents them as controlling "prosody and
-emotion anywhere in the text". One line can therefore turn from sad to angry
-mid-sentence, which a single per-clip style cannot express.
+Fish Speech has no side-channel instruction: delivery is written as **tags inside
+the text**. That is the checkpoint's native interface, so this backend exposes
+only tags - `--prosody`, `--emotion` and `--prosody-plan` are rejected.
 
-`--fish-tag-mode` chooses how those tags reach the model:
+`--fish-tag-mode` chooses where the tags come from:
 
 | Mode | What it does |
 |---|---|
-| `render` (default) | Renders the neutral spec as a leading tag, so `--prosody`, `--emotion` and `--prosody-plan llm` work unchanged. |
-| `keep` | Sends the tags you typed in `--text` as written. `--emotion`/`--prosody`/`--prosody-plan` are rejected: the text already carries its own direction. |
-| `llm` | The configured model rewrites each line with tags, keeping every word. A guard rejects any line whose words changed and falls back to the original. |
+| `keep` (default) | Sends `--text` exactly as written, tags included. |
+| `llm` | The configured model inserts the tags, keeping every word; a line whose words changed falls back to the original. |
 
 ```bash
-# render: per-line tags from the spec
+# keep: you write the tags
 python dub.py say --voice warm-fr --backend fish \
-  --text $'Je n\'arrive pas à y croire !\nAttends… tu as entendu ?' \
-  --prosody "emotion=excited" \
-  --prosody "emotion=whisper, pause"
-
-# render: the LLM writes the per-line emotion, which becomes the tags
-python dub.py say --voice warm-fr --backend fish \
-  --text $'Première ligne.\nDeuxième ligne.' --prosody-plan llm
-
-# keep: the tags are already in the text, exactly as Fish documents them
-python dub.py say --voice warm-fr --backend fish --fish-tag-mode keep \
   --text $'[sad] Je pensais que ça serait différent… [angry] mais on est là.'
 
-# llm: the model places the tags, including a mid-line turn
+# keep with a free-form description
+python dub.py say --voice warm-fr --backend fish \
+  --text $'[whisper in small voice] Tu n\'es pas censé savoir ça.'
+
+# llm: the model places the tags
 python dub.py say --voice warm-fr --backend fish --fish-tag-mode llm \
   --text $'Je pensais que ça serait différent… mais on est là.'
 ```
 
-Documented tags: `[excited]`, `[angry]`, `[sad]`, `[whisper]`, `[laughing]`,
-`[pause]`. In `keep` mode an unknown tag such as `[sarcastic]` is reported in the
-log because Fish may speak it aloud, and a `<|...|>` token is rejected outright
-since Fish reserves those for its own prompt.
+The model card documents **free-form descriptions** ("15,000+ unique tags") plus
+this common set: `[pause]` `[emphasis]` `[laughing]` `[inhale]` `[chuckle]`
+`[tsk]` `[singing]` `[excited]` `[laughing tone]` `[interrupting]` `[chuckling]`
+`[excited tone]` `[volume up]` `[echo]` `[angry]` `[low volume]` `[sigh]`
+`[low voice]` `[whisper]` `[screaming]` `[shouting]` `[loud]` `[surprised]`
+`[short pause]` `[exhale]` `[delight]` `[panting]` `[audience laughter]`
+`[with strong accent]` `[volume down]` `[clearing throat]` `[sad]` `[moaning]`
+`[shocked]`. Anything else short is passed through as its own tag (`[tender]`,
+`[nervous]`), which is why an emotion without a documented tag still changes the
+delivery.
 
-Always quote a `--text` that contains a tag: `[excited]` is a shell glob.
-A paragraph pasted without line breaks is split into sentences for planning and
-still produces one clip. `--fish-temperature` and `--fish-top-p` expose the
-sampler (model defaults 0.7 / 0.7).
-
-### IndexTTS2: emotion reference and duration
-
-IndexTTS2 separates **who** speaks (the `--voice`/`--clone` reference) from
-**how** (`--emotion-audio`, a second clip whose delivery is blended in).
-`--emotion-alpha` (0–1, default 1.0) sets how strongly it applies.
-
-```bash
-python dub.py say --voice warm-fr --backend indextts2 \
-  --text "Pourquoi tu ne me l'as pas dit ?" \
-  --emotion-audio colere.wav --emotion-alpha 0.8
-```
-
-`--duration SECONDS` fits the line to a slot. The released IndexTTS2.0 does
-**not** implement native duration control (the project marks it "not yet enabled
-in this release"), so the backend time-stretches the generated line with the
-pipeline's own stretcher — the same mechanism the dubbing pipeline already uses.
-Repeat `--duration` once per line, or pass one value to apply everywhere.
+Always quote a `--text` that contains a tag: `[excited]` is a shell glob. A
+`<|...|>` token is rejected outright, since Fish reserves those for its own
+prompt. A paragraph pasted without line breaks is split into sentences for
+planning and still produces one clip. `--fish-temperature` and `--fish-top-p`
+expose the sampler (model defaults 0.7 / 0.7).
 
 ### Isolated Chatterbox environment
 
@@ -429,6 +426,7 @@ environment at `.venv-fish` (or wherever `FISH_PYTHON` points):
 python3 -m venv .venv-fish
 git clone --depth 1 https://github.com/fishaudio/fish-speech.git third_party/fish-speech
 .venv-fish/bin/pip install -e third_party/fish-speech
+.venv-fish/bin/pip install torchao==0.13.0   # int8 loading (default)
 python dub.py models --download tts_fish   # fishaudio/s2-pro, ~11 GB
 ```
 
@@ -437,29 +435,21 @@ portaudio19-dev`). Without them, install the runtime dependencies from its
 `pyproject.toml` and then `.venv-fish/bin/pip install --no-deps -e
 third_party/fish-speech`; the worker never uses audio input.
 
-S2-Pro needs ~24 GB of VRAM. On a 12 GB card it fails with a clear
-out-of-memory error; pass `--device cpu` instead (confirmed to work, though a
-2 s line takes about 90 s on a 12-core CPU). The worker caps the checkpoint's
-32k context at 4096 tokens for line-level work (override with
+S2-Pro is published only in bf16, which needs ~24 GB of VRAM. The backend
+therefore loads it **int8 weight-only by default**: the worker quantizes the 201
+linear layers while the model is still on the CPU and only then moves it to the
+card, keeping ~6 GB resident and peaking around 11 GB for a short line. It was
+verified end to end on a 12 GB RTX 3060 (3 s of audio in ~16 s once loaded);
+`--fish-quantize off` restores the bf16 path for a 24 GB card, and CPU runs
+always use bf16 (a 2 s line takes about 90 s on a 12-core CPU). The worker caps
+the checkpoint's 32k context at 4096 tokens for line-level work (override with
 `FISH_MAX_SEQ_LEN`). The model runs in `pipeline.fish_worker`, so the Qwen stack
 is untouched.
 
-### IndexTTS2 environment
+Peak int8 memory grows with prompt and generated length, so on a card that also
+drives a display prefer short lines, or use `--device cuda:1` on a multi-GPU box.
 
-IndexTTS pins `torch==2.8` and `transformers==4.52`, so it also lives in its own
-environment at `.venv-indextts` (or `INDEXTTS_PYTHON`):
-
-```bash
-python3 -m venv .venv-indextts
-git clone --depth 1 https://github.com/index-tts/index-tts.git third_party/index-tts
-.venv-indextts/bin/pip install -e third_party/index-tts
-python dub.py models --download tts_index_tts2   # IndexTeam/IndexTTS-2
-```
-
-The download lands the `checkpoints_2` layout, so `config.yaml` is at the root of
-`models/IndexTTS2/`.
-
-CosyVoice, Chatterbox, Fish and IndexTTS2 all run in child processes for the same
+CosyVoice, Chatterbox and Fish all run in child processes for the same
 version-conflict reason. `--save-as` and `--design` are not supported on the
 expressive backends or on `customvoice`; pass `--voice`/`--clone`, or `--speaker`
 for `customvoice`.

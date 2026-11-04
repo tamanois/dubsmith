@@ -8,8 +8,9 @@ Choose a command, copy a worked example, and iterate quickly.
 |---|---|---|
 | a first working dub, zero setup | `--video talk.mp4 --target fr` | detects the source language, picks the donor voice from the video, borrows a generated native accent, preserves the original music/ambience |
 | a voice that isn't the video's speaker | `--ref-audio ref.wav --ref-text "…"` | clones `ref.wav` for both timbre and accent |
-| a reusable voice from a text description | `python dub.py voices --design --prompt "…" --lang fr` | saves a labeled voice print you can reuse by name — see [Voice library](voices.md#voice-library-saved-voices) |
-| to use a saved voice for a dub | `--voice warm-fr` | timbre from the saved print; accent still follows `--accent-mode` |
+| a reusable voice from a text description | `python dub.py voices --design --prompt "…" --lang fr` | saves a labeled voice you can reuse by name — see [Voice library](voices.md#voice-library-saved-voices) |
+| a reusable voice from a clip you already have | `python dub.py voices --add me.wav --transcribe` | registers the clip as-is, no model or GPU involved; `--clone` encodes it once instead |
+| to use a saved voice for a dub | `--voice warm-fr` | timbre from the saved voice, including its stored encoding; accent still follows `--accent-mode` |
 | to speak text with a saved or inline voice | `python dub.py say --voice warm-fr --text "…"` | standalone speech synthesis — no video, no translation |
 | an anchor fitted to the source voice | `--accent-match rate` (or `gender`) | generates a per-speaker anchor matching the speaker's rate (and gender) |
 | to keep the source accent | `--accent-mode preserve` | clones the speaker's accent along with their voice |

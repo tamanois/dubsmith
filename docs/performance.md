@@ -136,6 +136,29 @@ model calls: on the measured 12 GB card the 11-minute job's synthesis went from 
 (with 66 failed allocations) to 616 s (with none), roughly +55 %. On a card with room
 the ceiling never fires and batches stay as large as `--tts-batch` allows.
 
+## Saved voices cost one encode, once
+
+Encoding a reference clip - the speech tokenizer plus the speaker encoder - is
+paid per process, not per line: a dub encodes each voice once, and every
+`--devices` worker encodes it again in its own process. A saved voice avoids all
+of that.
+
+- `python dub.py voices --clone …` encodes the donor **once**, at save time, and
+  stores the result. It no longer renders a passage first, so saving went from a
+  full 20–30 s synthesis plus an encode to a single encode.
+- `say --voice <label>` loads that encoding instead of running the encoders.
+- `voices --add …` stores only the clip; the first use encodes it once and writes
+  a card into `prompts/` (`VOICES_PROMPT_CACHE=0` disables that), so every later
+  use is free.
+- In `--accent-mode native`, a stored encoding also removes the *timbre* half of
+  the hybrid prompt; only the accent anchor is still encoded.
+
+A card belongs to one backend and one model configuration, and cards are never
+overwritten by a different model: upgrading the weights adds a card, and
+switching back is instant. Cards also carry a hash of the clip and transcript they
+were built from, so re-registering a voice invalidates them at lookup rather than
+by deleting anything.
+
 ---
 
 Next: [Outputs and caching](outputs-and-caching.md), or the

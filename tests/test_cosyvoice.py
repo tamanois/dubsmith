@@ -1,4 +1,4 @@
-"""Tests for the CosyVoice2 subprocess bridge.
+"""Tests for the CosyVoice 3 subprocess bridge.
 
 No model or GPU: the engine's worker is faked for the request/read path, and the
 worker itself is run against a tiny fake ``cosyvoice`` package on ``PYTHONPATH``.
@@ -16,13 +16,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from pipeline.cosyvoice import (
-    COSYVOICE2,
-    COSYVOICE3,
-    CosyVoiceEngine,
-    detect_cosyvoice_type,
-    resolve_instructs,
-)
+from pipeline.cosyvoice import CosyVoiceEngine
 from pipeline.cosyvoice_worker import _normalize_instruct, NEUTRAL_INSTRUCT
 from pipeline.errors import DependencyError, TTSError
 from pipeline.prosody import ProsodySpec
@@ -30,37 +24,10 @@ from pipeline.prosody import ProsodySpec
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_resolve_instructs_none_is_blank_per_line() -> None:
-    assert resolve_instructs(["a", "b"], None) == ["", ""]
-
-
-def test_resolve_instructs_broadcasts_one_value() -> None:
-    assert resolve_instructs(["a", "b"], ["calm"]) == ["calm", "calm"]
-
-
-def test_resolve_instructs_keeps_one_per_line() -> None:
-    assert resolve_instructs(["a", "b"], ["calm", "excited"]) == ["calm", "excited"]
-
-
-def test_resolve_instructs_rejects_a_mismatch() -> None:
-    with pytest.raises(TTSError, match="emotion"):
-        resolve_instructs(["a", "b"], ["x", "y", "z"])
-
-
 def test_normalize_instruct_adds_the_delimiter_once() -> None:
     assert _normalize_instruct("calm") == "calm<|endofprompt|>"
     assert _normalize_instruct("calm<|endofprompt|>") == "calm<|endofprompt|>"
     assert _normalize_instruct("") == ""
-
-
-def test_detect_cosyvoice_type_from_directory_name(tmp_path: Path) -> None:
-    assert detect_cosyvoice_type(tmp_path / "Fun-CosyVoice3-0.5B") == COSYVOICE3
-    assert detect_cosyvoice_type(tmp_path / "CosyVoice2-0.5B") == COSYVOICE2
-
-
-def test_detect_cosyvoice_type_from_config_file(tmp_path: Path) -> None:
-    (tmp_path / "cosyvoice3.yaml").write_text("", encoding="utf-8")
-    assert detect_cosyvoice_type(tmp_path) == COSYVOICE3
 
 
 def test_pythonpath_puts_an_override_first(
@@ -91,20 +58,22 @@ def test_synthesize_builds_the_request_and_reads_wavs(
     monkeypatch.setattr(CosyVoiceEngine, "_ensure_available", lambda self: None)
     monkeypatch.setattr(CosyVoiceEngine, "_run_worker", fake_run)
 
-    engine = CosyVoiceEngine("models/CosyVoice2-0.5B", device="cpu")
+    engine = CosyVoiceEngine("models/Fun-CosyVoice3-0.5B", device="cpu")
     out = engine.synthesize(
         ["bonjour", "au revoir"],
         reference=tmp_path / "voice.wav",
-        instructs=["calm", "excited"],
+        prosody=[ProsodySpec(emotion="happy"), ProsodySpec(emotion="sad")],
     )
 
     assert len(out) == 2
     assert all(wav.dtype == np.float32 and wav.ndim == 1 for wav in out)
     assert engine.sample_rate == 24000
     assert captured[0]["lines"] == ["bonjour", "au revoir"]
-    assert captured[0]["instructs"] == ["calm", "excited"]
     assert captured[0]["reference"].endswith("voice.wav")
-    assert captured[0]["model_type"] == COSYVOICE2
+    assert all(
+        instruct.startswith("You are a helpful assistant.")
+        for instruct in captured[0]["instructs"]
+    )
 
 
 def test_synthesize_renders_structured_prosody(
@@ -125,7 +94,7 @@ def test_synthesize_renders_structured_prosody(
     monkeypatch.setattr(CosyVoiceEngine, "_ensure_available", lambda self: None)
     monkeypatch.setattr(CosyVoiceEngine, "_run_worker", fake_run)
 
-    engine = CosyVoiceEngine("m", device="cpu", model_type=COSYVOICE3)
+    engine = CosyVoiceEngine("m", device="cpu")
     engine.synthesize(
         ["Hello there. How are you?"],
         reference=tmp_path / "voice.wav",
@@ -133,7 +102,6 @@ def test_synthesize_renders_structured_prosody(
     )
 
     payload = captured[0]
-    assert payload["model_type"] == COSYVOICE3
     assert "[breath]" in payload["lines"][0]
     assert payload["instructs"][0].startswith("You are a helpful assistant.")
     assert payload["instructs"][0].endswith("<|endofprompt|>")
@@ -141,7 +109,7 @@ def test_synthesize_renders_structured_prosody(
 
 
 def _capturing_engine(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_type: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[CosyVoiceEngine, list[dict]]:
     captured: list[dict] = []
 
@@ -157,13 +125,13 @@ def _capturing_engine(
 
     monkeypatch.setattr(CosyVoiceEngine, "_ensure_available", lambda self: None)
     monkeypatch.setattr(CosyVoiceEngine, "_run_worker", fake_run)
-    return CosyVoiceEngine("m", device="cpu", model_type=model_type), captured
+    return CosyVoiceEngine("m", device="cpu"), captured
 
 
 def test_neutral_prosody_uses_zero_shot_with_the_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine.synthesize(
         ["Bonjour."],
         reference=tmp_path / "voice.wav",
@@ -183,7 +151,7 @@ def test_neutral_prosody_uses_zero_shot_with_the_transcript(
 def test_inline_tokens_use_cross_lingual(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine.synthesize(
         ["Bonjour."],
         reference=tmp_path / "voice.wav",
@@ -198,27 +166,10 @@ def test_inline_tokens_use_cross_lingual(
     )
 
 
-def test_cosyvoice2_neutral_uses_zero_shot_without_a_prefix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE2)
-    engine.synthesize(
-        ["bonjour"],
-        reference=tmp_path / "voice.wav",
-        prosody=[ProsodySpec()],
-        ref_text="bonjour",
-    )
-
-    payload = captured[0]
-    assert payload["modes"] == ["zero_shot"]
-    assert payload["prompts"] == ["bonjour"]
-    assert payload["text_frontend"] is True
-
-
 def test_synthesize_french_instruct_uses_zero_shot_with_the_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine.synthesize(
         ["Félicitations!"],
         reference=tmp_path / "voice.wav",
@@ -237,7 +188,7 @@ def test_synthesize_french_instruct_uses_zero_shot_with_the_transcript(
 def test_synthesize_french_instruct_without_transcript_keeps_instruct2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine.synthesize(
         ["Félicitations!"],
         reference=tmp_path / "voice.wav",
@@ -260,7 +211,7 @@ def test_synthesize_applies_fast_pace_by_stretching(
             calls.append(ratio)
             return np.zeros(1200, dtype=np.float32)
 
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine._stretcher = FakeStretcher()
     out = engine.synthesize(
         ["Bonjour."],
@@ -286,7 +237,7 @@ def test_synthesize_does_not_stretch_english(
             calls.append(ratio)
             return samples
 
-    engine, captured = _capturing_engine(tmp_path, monkeypatch, COSYVOICE3)
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
     engine._stretcher = FakeStretcher()
     engine.synthesize(
         ["Hello."],
@@ -337,7 +288,7 @@ def test_missing_package_is_reported_by_the_engine(
     monkeypatch.setattr("pipeline.cosyvoice._module_available", lambda name: False)
     engine = CosyVoiceEngine("m", device="cpu")
 
-    with pytest.raises(DependencyError, match="models --download tts_cosyvoice"):
+    with pytest.raises(DependencyError, match="models --download tts_cosyvoice3"):
         engine.synthesize(["a"], reference=tmp_path / "x.wav")
 
 
@@ -351,7 +302,7 @@ def _fake_cosyvoice_package(tmp_path: Path) -> Path:
         """
 import numpy as np
 
-class CosyVoice2:
+class CosyVoice3:
     sample_rate = 24000
     def __init__(self, model_dir, fp16=False):
         self.model_dir = model_dir
@@ -366,7 +317,7 @@ class CosyVoice2:
         yield {"tts_speech": np.zeros(1200, dtype=np.float32)}
 
 def AutoModel(model_dir, fp16=False):
-    return CosyVoice2(model_dir, fp16=fp16)
+    return CosyVoice3(model_dir, fp16=fp16)
 """,
         encoding="utf-8",
     )
@@ -400,7 +351,6 @@ def test_worker_end_to_end_with_a_fake_package(tmp_path: Path) -> None:
         tmp_path,
         {
             "model_dir": "fake-model",
-            "model_type": "cosyvoice2",
             "reference": str(tmp_path / "ref.wav"),
             "lines": ["bonjour"],
             "instructs": ["calm"],
@@ -414,17 +364,19 @@ def test_worker_end_to_end_with_a_fake_package(tmp_path: Path) -> None:
     assert Path(payload["files"][0]).is_file()
 
 
-def test_worker_gives_cosyvoice3_a_neutral_instruct(tmp_path: Path) -> None:
-    """An empty instruct still takes the instruct path, so the marker is present."""
+def test_worker_fills_a_neutral_instruct_on_the_instruct_path(
+    tmp_path: Path,
+) -> None:
+    """An empty instruct still needs the marker, so the worker supplies it."""
     package = _fake_cosyvoice_package(tmp_path)
     payload = _run_fake_worker(
         package,
         tmp_path,
         {
             "model_dir": "fake-model",
-            "model_type": "cosyvoice3",
             "reference": str(tmp_path / "ref.wav"),
             "lines": ["bonjour"],
+            "modes": ["instruct2"],
             "instructs": [""],
             "fp16": False,
             "output_dir": str(tmp_path / "out"),

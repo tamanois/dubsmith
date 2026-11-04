@@ -21,6 +21,7 @@ Run ``python dub.py --help`` for the full option list.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from importlib.util import find_spec
 from pathlib import Path
@@ -39,12 +40,18 @@ from pipeline.config import (
     Settings,
     SubtitleJobConfig,
     available_accelerators,
+    language_code_for_name,
     normalize_language,
     pick_dtype,
     probe_device,
     release_gpu_memory,
 )
-from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError, TTSError
+from pipeline.errors import (
+    ConfigError,
+    DubbingError,
+    ModelNotFoundError,
+    TTSError,
+)
 from pipeline.logging_utils import (
     DEFAULT_MAX_LOG_BYTES,
     job_logger,
@@ -60,6 +67,7 @@ from pipeline.models import (
     MVP_REQUIRED,
     REGISTRY,
     download_many,
+    model_fingerprint,
     registry_status,
     resolve_model,
 )
@@ -68,6 +76,11 @@ from pipeline.subtitle_pipeline import SubtitlesPipeline
 
 _PROG = "dub.py"
 _STOP = 0
+
+#: Warnings raised while building the voice library. ``voices`` does not set up
+#: the job logger (there is no job), so this relies on Python's last-resort
+#: handler to reach stderr, and joins the run log whenever one exists.
+_LOGGER = logging.getLogger("dub.voices")
 
 #: Name of the run log kept inside a job folder when no path is given.
 _LOG_NAME = "run.log"
@@ -162,10 +175,13 @@ def build_voices_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=f"{_PROG} voices",
         description=(
-            "Create, list and remove saved voice prints. A voice print is a short "
-            "reference clip plus its transcript, so the same voice can be reused by "
-            "name in 'python dub.py say' or in a dubbing run with --voice. Without a "
-            "mode, the library is listed."
+            "Create, list and remove saved voices. A voice is a reference clip plus "
+            "its transcript, and optionally the checkpoint's encoding of it, so the "
+            "same voice can be reused by name in 'python dub.py say' or in a "
+            "dubbing run with --voice. Three ways to create one: --design (from a "
+            "description), --clone (encode a donated clip once) and --add (register "
+            "a clip verbatim, no model loaded). Without a mode, the library is "
+            "listed."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -178,7 +194,21 @@ def build_voices_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--clone",
         action="store_true",
-        help="Create a voice cloned from --audio and --clone-text (Base checkpoint).",
+        help=(
+            "Create a voice by encoding --audio and --clone-text once (Base "
+            "checkpoint). The encoding is stored, so 'say' never encodes the "
+            "clip again."
+        ),
+    )
+    mode.add_argument(
+        "--add",
+        metavar="AUDIO",
+        type=Path,
+        help=(
+            "Register an existing clip as a voice without processing it. The clip "
+            "is copied and --clone-text is stored as given; no model is loaded. "
+            "Add --transcribe to derive the transcript (and the language)."
+        ),
     )
     mode.add_argument(
         "--list", action="store_true", help="List saved voices (the default)."
@@ -210,15 +240,37 @@ def build_voices_parser() -> argparse.ArgumentParser:
         dest="clone_text",
         metavar="TEXT",
         default=None,
-        help="Exact transcript of --audio. Required with --clone.",
+        help=(
+            "Exact transcript of the reference clip. Required with --clone unless "
+            "--transcribe is given; optional with --add."
+        ),
+    )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        help=(
+            "Derive the transcript with the local ASR instead of typing it, and "
+            "use the detected language when --lang is omitted. Costs one Whisper "
+            "pass over the reference clip."
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Transcribe the reference and warn when --clone-text does not match "
+            "what was heard. ICL cloning aligns the codes against the transcript, "
+            "so a mismatch changes the voice rather than failing."
+        ),
     )
     parser.add_argument(
         "--lang",
-        default="fr",
+        default=None,
         metavar="LANG",
         help=(
-            "Language the voice print is recorded in. It is also the accent the "
-            "design model aims for, so pick the language you will speak most."
+            "Language the voice is recorded in; it is also the accent the design "
+            "model aims for. Defaults to the language detected by --transcribe, "
+            "else to fr for --design/--clone; required for --add otherwise."
         ),
     )
     parser.add_argument(
@@ -234,7 +286,11 @@ def build_voices_parser() -> argparse.ArgumentParser:
         "--speak",
         default=None,
         metavar="TEXT",
-        help="Optionally render this text with the new voice and write it to --output.",
+        help=(
+            "Optionally render this text with the new voice and write it to "
+            "--output. Available for --design and --clone (which load a model), "
+            "not for --add."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -312,8 +368,9 @@ def build_say_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         default=None,
         help=(
-            "Exact transcript of --clone. Required for 'qwen'; used by the "
-            "CosyVoice backends to keep the reference's accent (optional there)."
+            "Exact transcript of --clone. Optional: without it 'qwen' clones from "
+            "the speaker embedding alone (lower similarity), and the CosyVoice "
+            "backends lose the reference's accent."
         ),
     )
     parser.add_argument(
@@ -322,23 +379,19 @@ def build_say_parser() -> argparse.ArgumentParser:
         choices=[
             "qwen",
             "customvoice",
-            "cosyvoice",
             "cosyvoice3",
             "chatterbox",
             "fish",
-            "indextts2",
         ],
         help=(
             "Synthesiser: 'qwen' (default) clones with the Qwen Base checkpoint; "
             "'customvoice' uses a preset Qwen CustomVoice speaker with a tone/"
             "emotion instruction (needs --speaker, no --voice/--clone/--design); "
-            "'cosyvoice' uses CosyVoice2; 'cosyvoice3' uses CosyVoice3, which adds "
-            "instruct control (emotion, speed, volume) plus paralinguistic tokens "
-            "such as [breath] and [laughter]; 'chatterbox' uses Chatterbox "
-            "Multilingual, whose style control is an emotion exaggeration; 'fish' "
-            "uses Fish Speech S2-Pro, which reads inline [excited]/[whisper] tags "
-            "in the text; 'indextts2' uses IndexTTS2, which takes a separate "
-            "emotion reference and can fit a line to --duration seconds."
+            "'cosyvoice3' uses CosyVoice3, which adds instruct control (emotion, "
+            "speed, volume) plus paralinguistic tokens such as [breath] and "
+            "[laughter]; 'chatterbox' uses Chatterbox Multilingual, whose style "
+            "control is an emotion exaggeration; 'fish' uses Fish Speech S2-Pro, "
+            "which reads inline [sad]/[sigh]/[whisper] tags written in --text."
         ),
     )
     parser.add_argument(
@@ -351,9 +404,10 @@ def build_say_parser() -> argparse.ArgumentParser:
         help=(
             "Per-line emotion/style, e.g. 'calm' or 'excited'. Repeat it or pass a "
             "comma-separated list; a single value applies to every line. "
-            "CosyVoice2 sends it verbatim as the instruct string; CosyVoice3, "
-            "Chatterbox and CustomVoice map it onto their own control (prefer "
-            "--prosody). Ignored by 'qwen'. Alias: --instruct, not --style-instruct."
+            "CosyVoice3, Chatterbox and CustomVoice map it onto their own control "
+            "(prefer --prosody). Rejected by 'qwen' and 'fish' (Fish takes its "
+            "direction from tags in --text). Alias: --instruct, not "
+            "--style-instruct."
         ),
     )
     parser.add_argument(
@@ -427,9 +481,9 @@ def build_say_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help=(
-            "Lines per LLM planning request before --style-plan llm and "
-            "--prosody-plan llm switch to the overview + chunked strategy "
-            "(default: LLM_PLAN_CHUNK_SIZE, 10)."
+            "Lines per LLM planning request before --style-plan llm, "
+            "--prosody-plan llm and --fish-tag-mode llm switch to the overview + "
+            "chunked strategy (default: LLM_PLAN_CHUNK_SIZE, 10)."
         ),
     )
     parser.add_argument(
@@ -473,47 +527,25 @@ def build_say_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fish-tag-mode",
         dest="fish_tag_mode",
-        default="render",
-        choices=["render", "keep", "llm"],
+        default="keep",
+        choices=["keep", "llm"],
         help=(
-            "Fish Speech: how delivery tags reach the model. 'render' (default) "
-            "maps --prosody/--emotion onto [excited]/[whisper]/... tags; 'keep' "
-            "sends --text as written, for hand-written tags; 'llm' has the "
-            "configured model write the tags into the text, guarded so the words "
-            "cannot change."
+            "Fish Speech: tags are the checkpoint's only style channel. 'keep' "
+            "(default) speaks --text exactly as written, tags included; 'llm' has "
+            "the configured model insert the tags, guarded so the words cannot "
+            "change."
         ),
     )
     parser.add_argument(
-        "--emotion-audio",
-        type=Path,
+        "--fish-quantize",
+        dest="fish_quantize",
         default=None,
-        metavar="AUDIO",
+        choices=["int8", "off"],
         help=(
-            "IndexTTS2 only: a second clip whose emotion colours the delivery, "
-            "while --voice/--clone still fixes the timbre."
-        ),
-    )
-    parser.add_argument(
-        "--emotion-alpha",
-        type=float,
-        default=None,
-        metavar="0..1",
-        help=(
-            "IndexTTS2: how strongly --emotion-audio is applied (default 1.0). "
-            "Requires --emotion-audio."
-        ),
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        action="append",
-        default=None,
-        metavar="SECONDS",
-        help=(
-            "IndexTTS2 only: fit each line to this many seconds. Repeat once per "
-            "line, or pass one value to apply everywhere. The released IndexTTS2 "
-            "has no native duration control, so the line is time-stretched after "
-            "synthesis."
+            "Fish Speech weight format. 'int8' (default) loads 8-bit weight-only "
+            "(~6 GB resident, ~11 GB peak) so the model fits a 12 GB card; "
+            "'off' loads the bf16 weights Fish documents as needing ~24 GB. "
+            "CPU runs always use bf16."
         ),
     )
     parser.add_argument(
@@ -539,7 +571,11 @@ def build_say_parser() -> argparse.ArgumentParser:
         dest="save_as",
         metavar="LABEL",
         default=None,
-        help="Save an inline --design or --clone as a reusable voice under this label.",
+        help=(
+            "Save an inline --design or --clone as a reusable voice under this "
+            "label. A saved clone stores the clip and its encoding, so using the "
+            "voice later costs no encode."
+        ),
     )
     parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
     parser.add_argument(
@@ -1357,6 +1393,12 @@ def cmd_models(argv: Sequence[str]) -> int:
             print(f"→ {name} ({spec.repo_id})", flush=True)
             path = download_many([name], models_dir, force=args.force)[name]
             print(f"  saved to {path}")
+            if name == "tts_fish":
+                print(
+                    "  loads int8 weight-only by default (needs torchao in "
+                    ".venv-fish); --fish-quantize off uses the bf16 weights, "
+                    "which need ~24 GB of VRAM"
+                )
         print("\nAll requested models are ready.")
         return _STOP
 
@@ -1477,7 +1519,7 @@ def cmd_voices(argv: Sequence[str]) -> int:
         print(f"Removed {args.remove!r} from {removed}")
         return _STOP
 
-    if args.list or not (args.design or args.clone):
+    if args.list or not (args.design or args.clone or args.add is not None):
         saved = list_voices(root)
         print(f"Saved voices: {root.resolve()}\n")
         if not saved:
@@ -1490,14 +1532,14 @@ def cmd_voices(argv: Sequence[str]) -> int:
             print(f"  {item.summary()}")
         return _STOP
 
-    language = normalize_language(args.lang)
-    if language == "Auto":
-        raise ConfigError("--lang must be an explicit language, not 'auto'.")
-    anchor_text = _anchor_text(language)
+    if args.add is not None:
+        return _cmd_voices_add(args, root, models_dir)
 
     if args.design:
         if not args.prompt or not args.prompt.strip():
             raise ConfigError("--design requires --prompt (a description of the voice).")
+        language = _resolve_language(args, None, fallback="fr")
+        anchor_text = _anchor_text(language)
         engine = VoiceDesignEngine(
             resolve_model("tts_voice_design", models_dir),
             device=args.device,
@@ -1524,45 +1566,256 @@ def cmd_voices(argv: Sequence[str]) -> int:
     else:
         if args.audio is None:
             raise ConfigError("--clone requires --audio (a clip of the voice to clone).")
-        if not args.clone_text or not args.clone_text.strip():
+        # Checked before the clip is read so a missing transcript is reported as
+        # such, not as a decode error on a path that was fine all along.
+        if not args.transcribe and not (args.clone_text or "").strip():
             raise ConfigError(
-                "--clone requires --clone-text (the exact transcript of --audio)."
+                "--clone needs the donated clip's transcript: pass --clone-text, or "
+                "--transcribe to derive it from the audio."
             )
+        from pipeline.media import load_audio
+
+        try:
+            samples, sample_rate = load_audio(args.audio)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a user error
+            raise ConfigError(f"--clone: could not read {args.audio}: {exc}") from exc
+        ref_text, detected = _reference_text(
+            args, samples, sample_rate, models_dir, required=True
+        )
+        language = _resolve_language(args, detected, fallback="fr")
         engine = TTSEngine(
             resolve_model("tts_base", models_dir),
             device=args.device,
             dtype=pick_dtype(args.device, args.dtype),
         )
-        engine.prepare_prompt_from_file(args.audio, args.clone_text)
-        texts = [anchor_text] + ([args.speak] if args.speak else [])
-        rendered = engine.synthesize(texts, language=language)
-        anchor = rendered[0] if rendered else None
-        if anchor is None:
-            raise TTSError("The cloning model returned no audio for the voice print.")
+        # The encoding *is* the saved artifact. Rendering the canonical passage to
+        # store that instead would put the voice through the codec twice: once to
+        # synthesise it, once to encode it again on the next use.
+        engine.prepare_prompt_from_file(args.audio, ref_text)
+        prompt = engine.prompt_to_data(
+            fingerprint=model_fingerprint("tts_base", models_dir)
+        )
         label = args.label or unique_label(default_label(audio=args.audio), root)
         saved = save_voice(
             root,
             label,
-            anchor,
-            engine.sample_rate,
+            samples,
+            sample_rate,
             language=language,
             source="clone",
-            ref_text=anchor_text,
+            ref_text=ref_text,
+            prompt=prompt,
             force=args.force,
         )
-        if args.speak and len(rendered) > 1 and rendered[1] is not None:
+        if args.speak:
+            rendered = engine.synthesize([args.speak], language=language)
+            speech = rendered[0] if rendered else None
+            if speech is None:
+                raise TTSError("The cloning model returned no audio.")
             out = _write_say_output(
-                args.output, saved.label, rendered[1], engine.sample_rate
+                args.output, saved.label, speech, engine.sample_rate
             )
             print(f"Wrote {out}")
         release_gpu_memory()
 
+    encoded = f" + {len(saved.cards)} card(s)" if saved.cards else ""
     print(
-        f"Saved voice {saved.label!r} ({saved.language}, {saved.seconds:.1f}s) "
-        f"to {saved.directory}"
+        f"Saved voice {saved.label!r} "
+        f"({saved.language}, {saved.seconds:.1f}s{encoded}) to {saved.directory}"
     )
     print(f'Use it with: python dub.py say --voice {saved.label} --text "..."')
     return _STOP
+
+
+def _cmd_voices_add(args: argparse.Namespace, root: Path, models_dir: Path) -> int:
+    """Handle ``voices --add``: register a clip without loading a model."""
+    from pipeline.media import load_audio
+    from pipeline.voices import default_label, import_voice, unique_label
+
+    audio = Path(args.add)
+    if not audio.is_file():
+        raise ConfigError(f"--add: no such audio file: {audio}")
+    if args.speak:
+        raise ConfigError(
+            "--speak needs a synthesiser, which --add does not load. Register the "
+            "voice first, then speak it with 'python dub.py say --voice ...'."
+        )
+    try:
+        samples, sample_rate = load_audio(audio)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a user error
+        raise ConfigError(f"--add: could not read {audio}: {exc}") from exc
+    if samples.size == 0:
+        raise ConfigError(f"--add: {audio} contains no audio.")
+
+    ref_text, detected = _reference_text(
+        args, samples, sample_rate, models_dir, required=False
+    )
+    language = _resolve_language(args, detected, fallback=None)
+    seconds = float(samples.size) / float(sample_rate or 1)
+    if seconds < 3.0:
+        _LOGGER.warning(
+            "The clip is only %.1fs long; a speaker embedding needs a few seconds "
+            "of clean speech to be stable.",
+            seconds,
+        )
+    elif seconds > 30.0:
+        _LOGGER.warning(
+            "The clip is %.0fs long. All of it conditions the prompt, so a trimmed "
+            "8-15 s excerpt usually clones better and faster.",
+            seconds,
+        )
+
+    label = args.label or unique_label(default_label(audio=audio), root)
+    saved = import_voice(
+        root,
+        label,
+        (samples, sample_rate),
+        language=language,
+        ref_text=ref_text,
+        force=args.force,
+    )
+    print(
+        f"Registered voice {saved.label!r} ({saved.language}, {saved.seconds:.1f}s) "
+        f"from {audio} -> {saved.directory}"
+    )
+    if not ref_text.strip():
+        print(
+            "No transcript stored, so this voice clones from the speaker embedding "
+            "alone. Add --clone-text or --transcribe for a closer match."
+        )
+    print(f'Use it with: python dub.py say --voice {saved.label} --text "..."')
+    return _STOP
+
+
+def _resolve_language(
+    args: argparse.Namespace, detected: str | None, *, fallback: str | None
+) -> str:
+    """The language a voice is recorded in: explicit, else detected, else default.
+
+    ``--add`` has nothing to infer from, so it passes no fallback: a clip
+    registered without ``--transcribe`` must say which language it is in.
+    """
+    if args.lang:
+        language = normalize_language(args.lang)
+        if language == "Auto":
+            raise ConfigError("--lang must be an explicit language, not 'auto'.")
+        if detected:
+            heard = normalize_language(detected)
+            if heard != language:
+                _LOGGER.warning(
+                    "--lang is %s but the reference clip sounds like %s. The "
+                    "language is what 'say --voice' defaults to later.",
+                    language,
+                    heard,
+                )
+        return language
+    if detected:
+        return normalize_language(detected)
+    if fallback is not None:
+        return normalize_language(fallback)
+    raise ConfigError(
+        "--add needs --lang (the language spoken in the clip), or --transcribe to "
+        "detect it from the audio."
+    )
+
+
+def _reference_text(
+    args: argparse.Namespace,
+    samples: np.ndarray,
+    sample_rate: int,
+    models_dir: Path,
+    *,
+    required: bool,
+) -> tuple[str, str | None]:
+    """Resolve a reference clip's transcript for ``--clone``/``--add``.
+
+    ``--clone-text`` is used exactly as given. ``--transcribe`` derives the text
+    instead, and is what makes ``--lang`` optional. ``--verify`` asks the ASR even
+    when the text was typed, because ICL cloning aligns the speech codes against
+    that text: a transcript that does not match the audio yields a wrong voice
+    rather than an error, so a warning is the only useful signal.
+
+    Returns:
+        ``(transcript, detected_language)``; the language is ``None`` unless the
+        ASR ran.
+    """
+    given = (args.clone_text or "").strip()
+    if args.transcribe and given:
+        raise ConfigError(
+            "--transcribe and --clone-text are alternatives: pass one, not both."
+        )
+    heard, detected = "", None
+    if args.transcribe or args.verify:
+        heard, detected = _transcribe_clip(samples, sample_rate, models_dir, args)
+        if not heard:
+            raise ConfigError(
+                f"No speech was recognised in {args.add or args.audio}; pass "
+                "--clone-text instead of --transcribe."
+            )
+    if args.verify and given and heard:
+        overlap = _word_overlap(given, heard)
+        if overlap < 0.6:
+            _LOGGER.warning(
+                "The transcript shares only %d%% of its words with what was heard "
+                "in %s. ICL cloning aligns the codes against this text, so this is "
+                "likely to produce the wrong voice. Heard: %r",
+                round(overlap * 100),
+                args.add or args.audio,
+                heard,
+            )
+    text = heard if args.transcribe else given
+    if not text and required:
+        raise ConfigError(
+            "--clone needs the donated clip's transcript: pass --clone-text, or "
+            "--transcribe to derive it from the audio."
+        )
+    return text, detected
+
+
+def _transcribe_clip(
+    samples: np.ndarray,
+    sample_rate: int,
+    models_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[str, str | None]:
+    """Transcribe a reference clip with the local ASR.
+
+    The samples are written to a temporary mono WAV first, so the transcript
+    describes exactly the audio that gets stored rather than the original file's
+    channel layout or rate.
+    """
+    import tempfile
+
+    from pipeline.asr import transcribe
+    from pipeline.media import write_audio
+
+    model_dir = resolve_model("whisper_large_v3", models_dir)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_audio(Path(tmp) / "reference.wav", samples, int(sample_rate))
+        result = transcribe(
+            path,
+            model_dir,
+            device=args.device,
+            language=language_code_for_name(args.lang),
+        )
+    text = " ".join(segment.text.strip() for segment in result.segments).strip()
+    return text, result.language
+
+
+def _word_overlap(left: str, right: str) -> float:
+    """Jaccard overlap of two transcripts' words, ``0.0``-``1.0``.
+
+    Set-based, so a re-segmented but identical transcript scores ``1.0`` no
+    matter how the ASR punctuated or ordered it.
+    """
+    import re
+
+    def words(value: str) -> set[str]:
+        return set(re.findall(r"\w+", value.lower()))
+
+    first, second = words(left), words(right)
+    union = first | second
+    return len(first & second) / len(union) if union else 1.0
 
 
 def _say_lines(text: str) -> list[str]:
@@ -1667,26 +1920,15 @@ def _neural_engine(
     temperature: float | None = None,
     fish_temperature: float | None = None,
     fish_top_p: float | None = None,
-    emotion_audio: Path | None = None,
-    emotion_alpha: float | None = None,
-    stretcher: str = "auto",
+    fish_quantize: str | None = None,
 ) -> Any:
     """Build the engine for one expressive backend."""
-    if backend == "cosyvoice":
-        from pipeline.cosyvoice import COSYVOICE2, CosyVoiceEngine
-
-        return CosyVoiceEngine(
-            resolve_model("tts_cosyvoice", models_dir),
-            device=device,
-            model_type=COSYVOICE2,
-        )
     if backend == "cosyvoice3":
-        from pipeline.cosyvoice import COSYVOICE3, CosyVoiceEngine
+        from pipeline.cosyvoice import CosyVoiceEngine
 
         return CosyVoiceEngine(
             resolve_model("tts_cosyvoice3", models_dir),
             device=device,
-            model_type=COSYVOICE3,
         )
     if backend == "chatterbox":
         from pipeline.chatterbox import ChatterboxEngine
@@ -1712,20 +1954,11 @@ def _neural_engine(
             device=device,
             temperature=fish_temperature,
             top_p=fish_top_p,
-        )
-    if backend == "indextts2":
-        from pipeline.index_tts import IndexTTSEngine
-
-        return IndexTTSEngine(
-            resolve_model("tts_index_tts2", models_dir),
-            device=device,
-            emotion_audio=emotion_audio,
-            emotion_alpha=emotion_alpha if emotion_alpha is not None else 1.0,
-            stretcher=stretcher,
+            quantize=fish_quantize,
         )
     raise ConfigError(
-        f"Unknown backend {backend!r}. Use: qwen, customvoice, cosyvoice, "
-        "cosyvoice3, chatterbox, fish, indextts2"
+        f"Unknown backend {backend!r}. Use: qwen, customvoice, cosyvoice3, "
+        "chatterbox, fish"
     )
 
 
@@ -1796,7 +2029,13 @@ def _cmd_say_neural(
         reference = saved.wav
         name = saved.label
         language = normalize_language(args.lang) if args.lang else saved.language
-        ref_text = saved.ref_text
+        ref_text = saved.ref_text or None
+        if saved.cards:
+            # Cards hold one checkpoint's encoding; this backend cannot read it.
+            log.info(
+                "%s: using voice.wav directly (stored cards are Qwen-only)",
+                backend,
+            )
     elif args.clone is not None:
         reference = args.clone
         name = slugify_label(args.clone.stem)
@@ -1833,50 +2072,17 @@ def _cmd_say_neural(
             temperature=getattr(args, "chatterbox_temperature", None),
             fish_temperature=getattr(args, "fish_temperature", None),
             fish_top_p=getattr(args, "fish_top_p", None),
-            emotion_audio=getattr(args, "emotion_audio", None),
-            emotion_alpha=getattr(args, "emotion_alpha", None),
-            stretcher=getattr(args, "stretcher", "auto"),
+            fish_quantize=getattr(args, "fish_quantize", None) or "int8",
         )
 
-    # Chatterbox has no instruct string, so any expressed emotion has to go
-    # through the structured path even when the user only passed --emotion.
-    # CosyVoice 3 is included because it renders a full instruct sentence, which
-    # is what that checkpoint was trained on. Fish reads tags inline in the text,
-    # so it renders the same spec into tags - unless the caller already wrote or
-    # planned them, in which case a prefix of ours would contradict the line.
-    fish_tag_mode = getattr(args, "fish_tag_mode", "render")
-    structured = (
-        bool(args.prosody)
-        or args.prosody_plan == "llm"
-        or backend in {"cosyvoice3", "chatterbox", "fish"}
-    )
-    if backend == "fish" and fish_tag_mode != "render":
-        structured = False
-    if backend == "indextts2":
-        # IndexTTS2 has no structured/verbatim channel: emotion comes from a
-        # separate reference clip, so prosody values cannot be rendered here.
-        if args.prosody or emotions or args.prosody_plan != "off":
-            log.warning(
-                "IndexTTS2 takes its emotion from --emotion-audio, so --prosody/"
-                "--emotion/--prosody-plan are ignored for this run."
-            )
-        durations = _one_per_line(args.duration, lines, "--duration")
-        with timed(
-            log,
-            f"Synthesised {len(lines)} line(s)",
-            lines=len(lines),
-            backend=backend,
-        ):
-            rendered = engine.synthesize(
-                lines,
-                reference=reference,
-                language=language,
-                durations=durations,
-            )
-    elif backend == "fish" and fish_tag_mode == "llm":
+    # Fish has no spec: its delivery lives in the text, as tags. The planner can
+    # write them ('llm'), or the caller already did ('keep', the default). Every
+    # other backend renders one spec per line.
+    fish_tag_mode = getattr(args, "fish_tag_mode", "keep")
+    if backend == "fish" and fish_tag_mode == "llm":
         # Fish has no side channel, so the plan *is* the text: the model writes
         # the tags into each line and a guard rejects any change to the words.
-        from pipeline.prosody import FishInlinePlanner, fish_apply_emotion
+        from pipeline.prosody import FishInlinePlanner
 
         planner = FishInlinePlanner(
             base_url=settings.llm_base_url,
@@ -1886,14 +2092,6 @@ def _cmd_say_neural(
             chunk_size=args.plan_chunk or settings.llm_plan_chunk_size,
         )
         tagged = planner.plan_lines(lines, language=language)
-        if emotions:
-            chosen = _one_per_line(emotions, lines, "--emotion")
-            assert chosen is not None
-            tagged = [
-                fish_apply_emotion(text, emotion)
-                for text, emotion in zip(tagged, chosen)
-            ]
-            log.info("Fish: explicit --emotion overrides the planned tag")
         for index, text in enumerate(tagged, start=1):
             log.debug("fish inline %d/%d: %r", index, len(tagged), text)
         with timed(
@@ -1907,9 +2105,8 @@ def _cmd_say_neural(
                 reference=reference,
                 ref_text=ref_text,
                 language=language,
-                tag_mode="keep",
             )
-    elif backend == "fish" and fish_tag_mode == "keep":
+    elif backend == "fish":
         # The caller wrote the tags. Reserved <|...|> tokens were rejected in
         # validation, so this only reports the advisory problems and folds a
         # tag-only line into its neighbour, which would otherwise be an empty
@@ -1948,9 +2145,9 @@ def _cmd_say_neural(
                 reference=reference,
                 ref_text=ref_text,
                 language=language,
-                tag_mode="keep",
             )
-    elif structured:
+    else:
+        # CosyVoice 3 and Chatterbox: one spec per line, rendered by the engine.
         specs = _resolve_prosody_specs(
             lines,
             emotions=emotions,
@@ -1988,22 +2185,6 @@ def _cmd_say_neural(
                     ref_text=ref_text,
                     language=language,
                 )
-    else:
-        log.info("Prosody: raw instruct strings (%d)", len(emotions or []))
-        with timed(
-            log,
-            f"Synthesised {len(lines)} line(s)",
-            lines=len(lines),
-            backend=backend,
-        ):
-            # Historical path: raw instruct strings, unchanged.
-            rendered = engine.synthesize(
-                lines,
-                reference=reference,
-                instructs=emotions,
-                ref_text=ref_text,
-                language=language,
-            )
 
     out_dir = Path("output") / "say" / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2044,31 +2225,20 @@ def _validate_say_source(args: argparse.Namespace) -> None:
         )
     if args.style_plan_scope != "per-line" and args.style_plan != "llm":
         raise ConfigError("--style-plan-scope only applies with --style-plan llm.")
-    if args.emotion_audio is not None and args.backend != "indextts2":
-        raise ConfigError("--emotion-audio is only valid with --backend indextts2.")
-    if args.emotion_alpha is not None and args.backend != "indextts2":
-        raise ConfigError("--emotion-alpha is only valid with --backend indextts2.")
-    if args.emotion_alpha is not None and args.emotion_audio is None:
-        raise ConfigError("--emotion-alpha requires --emotion-audio.")
-    if args.emotion_audio is not None and not args.emotion_audio.is_file():
-        raise ConfigError(f"--emotion-audio not found: {args.emotion_audio}")
-    tag_mode = getattr(args, "fish_tag_mode", "render")
-    if tag_mode != "render" and args.backend != "fish":
+    tag_mode = getattr(args, "fish_tag_mode", "keep")
+    if tag_mode != "keep" and args.backend != "fish":
         raise ConfigError("--fish-tag-mode is only valid with --backend fish.")
-    if tag_mode == "keep" and (
+    if getattr(args, "fish_quantize", None) is not None and args.backend != "fish":
+        raise ConfigError("--fish-quantize is only valid with --backend fish.")
+    if args.backend == "fish" and (
         args.prosody or args.emotions or args.prosody_plan != "off"
     ):
         raise ConfigError(
-            "--fish-tag-mode keep sends --text as written, so --emotion/"
-            "--prosody/--prosody-plan cannot also apply; drop them, or use "
-            "--fish-tag-mode render."
+            "--backend fish takes its direction from [tags] inside --text (or "
+            "--fish-tag-mode llm); it has no --prosody/--emotion/--prosody-plan "
+            "channel."
         )
-    if tag_mode == "llm" and args.prosody_plan != "off":
-        raise ConfigError(
-            "--fish-tag-mode llm already has the model write the tags; drop "
-            "--prosody-plan (or use --fish-tag-mode render with that plan)."
-        )
-    if tag_mode == "keep":
+    if args.backend == "fish" and tag_mode == "keep":
         from pipeline.prosody import fish_structural_token
 
         for index, line in enumerate(_say_lines(args.text), start=1):
@@ -2078,11 +2248,6 @@ def _validate_say_source(args: argparse.Namespace) -> None:
                     f"line {index} of --text contains {token!r}, which Fish "
                     "reserves for its own prompt; remove it."
                 )
-    if args.duration is not None:
-        if args.backend != "indextts2":
-            raise ConfigError("--duration is only valid with --backend indextts2.")
-        if any(value <= 0 for value in args.duration):
-            raise ConfigError("--duration must be a positive number of seconds.")
     if args.fish_temperature is not None and args.backend != "fish":
         raise ConfigError("--fish-temperature is only valid with --backend fish.")
     if args.fish_top_p is not None and args.backend != "fish":
@@ -2268,6 +2433,52 @@ def _cmd_say_customvoice(
     return _STOP
 
 
+def _install_saved_prompt(
+    engine: Any,
+    saved: Any,
+    models_dir: Path,
+    settings: Settings,
+    log: Any,
+) -> None:
+    """Prepare ``engine`` from a saved voice, reusing its stored card.
+
+    Encoding the reference is the cost this path exists to avoid, so the order is:
+    a card for this exact backend, model and clip, else encode once, else cache
+    the result. Cards for other models are left alone: switching checkpoints must
+    not cost the first one its card.
+    """
+    from pipeline.voices import find_prompt, save_prompt
+
+    fingerprint = model_fingerprint("tts_base", models_dir)
+    path = find_prompt(
+        saved.directory, "qwen", fingerprint, ref_text=saved.ref_text
+    )
+    if path is not None:
+        from pipeline.voices import load_prompt
+
+        log.info("Loaded the stored prompt for %s", saved.label)
+        engine.prepare_prompt_from_data(load_prompt(path), seconds=saved.seconds)
+        return
+
+    others = len(saved.cards)
+    if others:
+        log.info(
+            "No usable qwen card for this model; %d existing card(s) are kept.",
+            others,
+        )
+    engine.prepare_prompt_from_file(saved.wav, saved.ref_text)
+    if not settings.voices_prompt_cache:
+        return
+    try:
+        cached = save_prompt(
+            saved.directory, engine.prompt_to_data(fingerprint=fingerprint)
+        )
+    except (OSError, TTSError) as exc:
+        log.warning("Could not cache the prompt for %s: %s", saved.label, exc)
+        return
+    log.info("Cached the prompt for %s at %s", saved.label, cached)
+
+
 def cmd_say(argv: Sequence[str]) -> int:
     """Handle ``dub.py say``: speak a text with a saved, designed or cloned voice."""
     from pipeline.tts import TTSEngine, VoiceDesignEngine
@@ -2289,7 +2500,7 @@ def cmd_say(argv: Sequence[str]) -> int:
     ):
         raise ConfigError(
             "--emotion/--prosody/--prosody-plan only applies to --backend "
-            "customvoice, cosyvoice, cosyvoice3 or chatterbox."
+            "customvoice, cosyvoice3 or chatterbox; fish takes tags in --text."
         )
 
     say_name = _say_name(args)
@@ -2301,7 +2512,7 @@ def cmd_say(argv: Sequence[str]) -> int:
     )
     log = job_logger("dub.say", f"say-{say_name}")
     lines = _say_lines(args.text)
-    fish_tag_mode = getattr(args, "fish_tag_mode", "render")
+    fish_tag_mode = getattr(args, "fish_tag_mode", "keep")
     if args.style_instructs:
         prosody_state = "verbatim"
     elif args.style_plan == "llm":
@@ -2347,14 +2558,16 @@ def cmd_say(argv: Sequence[str]) -> int:
     if args.voice:
         saved = load_voice(root, args.voice)
         language = normalize_language(args.lang) if args.lang else saved.language
+        has_text = bool(saved.ref_text.strip())
         log.info("Qwen: cloning from saved voice %s (%s)", saved.label, language)
         engine = TTSEngine(
             resolve_model("tts_base", models_dir),
             device=args.device,
             dtype=pick_dtype(args.device, args.dtype),
+            x_vector_only=not has_text,
         )
         with timed(log, "Prepared the clone prompt"):
-            engine.prepare_prompt_from_file(saved.wav, saved.ref_text)
+            _install_saved_prompt(engine, saved, models_dir, settings, log)
         with timed(log, "Synthesised the line", lines=1, backend="qwen"):
             rendered = engine.synthesize([args.text], language=language)
         speech = rendered[0] if rendered else None
@@ -2408,19 +2621,26 @@ def cmd_say(argv: Sequence[str]) -> int:
         print(f"Wrote {out}")
         return _STOP
 
-    if not args.clone_text or not args.clone_text.strip():
-        raise ConfigError(
-            "--clone requires --clone-text (the exact transcript of the clip)."
-        )
+    # ICL needs the clip's transcript; without one the voice still clones, from
+    # the speaker embedding alone. That is the same rule a saved voice follows,
+    # so a voice behaves identically whether it came from the library or from
+    # --clone.
+    clone_text = (args.clone_text or "").strip()
     engine = TTSEngine(
         resolve_model("tts_base", models_dir),
         device=args.device,
         dtype=pick_dtype(args.device, args.dtype),
+        x_vector_only=not clone_text,
     )
     log.info("Qwen: cloning from %s (%s)", args.clone, language)
+    if not clone_text:
+        log.warning(
+            "No --clone-text: cloning in speaker-only (x-vector) mode. Similarity "
+            "is lower than ICL; pass the clip's transcript for a closer match."
+        )
     with timed(log, "Prepared the clone prompt"):
-        engine.prepare_prompt_from_file(args.clone, args.clone_text)
-    texts = [args.text] + ([anchor_text] if args.save_as else [])
+        engine.prepare_prompt_from_file(args.clone, clone_text)
+    texts = [args.text]
     with timed(
         log, f"Synthesised {len(texts)} line(s)", lines=len(texts), backend="qwen"
     ):
@@ -2429,17 +2649,23 @@ def cmd_say(argv: Sequence[str]) -> int:
     if speech is None:
         raise TTSError("The model returned no audio.")
     if args.save_as:
-        anchor = rendered[1] if len(rendered) > 1 else None
-        if anchor is None:
-            raise TTSError("The model returned no audio for the saved voice print.")
+        from pipeline.media import load_audio
+
+        # The saved voice is the donor plus its encoding. Rendering a passage and
+        # storing that instead would send the voice through the codec twice: once
+        # here, once when the saved voice is encoded on its next use.
+        samples, sample_rate = load_audio(args.clone)
         save_voice(
             root,
             args.save_as,
-            anchor,
-            engine.sample_rate,
+            samples,
+            sample_rate,
             language=language,
             source="clone",
-            ref_text=anchor_text,
+            ref_text=clone_text,
+            prompt=engine.prompt_to_data(
+                fingerprint=model_fingerprint("tts_base", models_dir)
+            ),
             force=args.force,
         )
     out = _write_say_output(
@@ -2461,14 +2687,17 @@ def job_config_from_args(
     explicitly, including its defaults, so a validator that keys off
     ``model_fields_set`` instead of the value will reject an ordinary run.
 
-    ``--voice`` is resolved here into ``ref_audio``/``ref_text``, which is the
-    representation the pipeline already understands. Doing it at this boundary
-    keeps every downstream stage (fingerprinting, donor selection, prompt
-    building, fan-out workers) unchanged: a saved voice is simply a reference
-    clip whose transcript is known.
+    ``--voice`` is resolved here into ``ref_audio``/``ref_text`` (plus the voice's
+    stored ``ref_prompt`` when it has one), which is the representation the
+    pipeline already understands. Doing it at this boundary keeps every
+    downstream stage (fingerprinting, donor selection, prompt building, fan-out
+    workers) unchanged: a saved voice is simply a reference clip whose transcript
+    and encoding are known.
     """
     ref_audio = args.ref_audio
     ref_text = args.ref_text
+    ref_prompt: Path | None = None
+    ref_prompt_seconds = 0.0
     # ``None`` means "not asked for", which lets a saved voice pick the mode that
     # fits it without overriding an explicit choice. The pipeline's own default
     # is still ``native``.
@@ -2481,7 +2710,7 @@ def job_config_from_args(
                 "--voice cannot be combined with --ref-audio: a saved voice already "
                 "is a reference clip. Pick one."
             )
-        from pipeline.voices import load_voice
+        from pipeline.voices import find_prompt, load_voice
 
         voices_root = getattr(args, "voices_dir", None)
         if voices_root is None:
@@ -2493,15 +2722,32 @@ def job_config_from_args(
         saved = load_voice(voices_root, voice_label)
         ref_audio = saved.wav
         ref_text = saved.ref_text
-        # The print's own language is already the target language, so its speech
+        has_text = bool((saved.ref_text or "").strip())
+        models_root = getattr(args, "models_dir", None) or (
+            settings.models_dir
+            if settings is not None
+            else Settings.from_env().models_dir
+        )
+        card = find_prompt(
+            saved.directory,
+            "qwen",
+            model_fingerprint("tts_base", models_root),
+            ref_text=saved.ref_text,
+        )
+        if card is not None:
+            ref_prompt = card
+            ref_prompt_seconds = saved.seconds
+        # The voice's own language is already the target language, so its speech
         # codes carry the right accent: cloning it directly is both the most
-        # faithful and the cheapest path (no blend, no donor anchor). A print in
+        # faithful and the cheapest path (no blend, no donor anchor). A voice in
         # another language keeps the default ``native`` mode, which borrows the
-        # target accent from a generated anchor.
-        if not accent_requested and saved.language == normalize_language(
-            args.target_language
-        ):
-            accent_mode = "preserve"
+        # target accent from a generated anchor. Without a transcript there is no
+        # ICL alignment at all, so only the speaker embedding is usable.
+        if not accent_requested:
+            if not has_text:
+                accent_mode = "speaker-only"
+            elif saved.language == normalize_language(args.target_language):
+                accent_mode = "preserve"
 
     return JobConfig(
         video=args.video,
@@ -2510,6 +2756,8 @@ def job_config_from_args(
         source_language=args.source_language,
         ref_audio=ref_audio,
         ref_text=ref_text,
+        ref_prompt=ref_prompt,
+        ref_prompt_seconds=ref_prompt_seconds,
         output_dir=args.output_dir,
         device=args.device,
         devices=args.devices,

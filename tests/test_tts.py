@@ -23,6 +23,7 @@ from pipeline.tts import (
     score_candidate,
     select_donor,
 )
+from pipeline.voices import PromptData
 
 SR = 24_000
 
@@ -413,6 +414,111 @@ class TestHybridPrompt:
             DonorClip(samples=audio(3.0), sample_rate=SR, text='hi', start=0, end=3, segment_id=0)
         )
         assert from_donor._prompt == 'prompt-token'
+
+
+class TestStoredPrompt:
+    '''A saved encoding is installed as-is: nothing is read and nothing encoded.'''
+
+    def item(self) -> FakePromptItem:
+        return FakePromptItem(
+            ref_code=np.arange(6, dtype=np.int64).reshape(3, 2),
+            ref_spk_embedding=np.linspace(0.0, 1.0, 4, dtype=np.float32),
+            x_vector_only_mode=False,
+            icl_mode=True,
+            ref_text='bonjour',
+        )
+
+    def test_roundtrip_through_numpy(self) -> None:
+        engine = engine_with(HybridQwenModel())
+        engine._prompt = [self.item()]
+
+        data = engine.prompt_to_data(fingerprint='deadbeef')
+
+        assert data.ref_code is not None
+        assert data.ref_code.shape == (3, 2)
+        assert data.ref_code.dtype == np.int64
+        assert data.ref_spk_embedding.shape == (4,)
+        assert data.ref_spk_embedding.dtype == np.float32
+        assert data.x_vector_only is False
+        assert data.ref_text == 'bonjour'
+        assert data.fingerprint == 'deadbeef'
+        # The card declares who may read it.
+        assert data.backend == 'qwen'
+        assert data.model == 'tts_base'
+
+    def test_installing_a_prompt_encodes_nothing(self) -> None:
+        model = HybridQwenModel()
+        engine = engine_with(model)
+        engine._prompt = [self.item()]
+        data = engine.prompt_to_data()
+
+        engine.prepare_prompt_from_data(data, seconds=7.5)
+
+        assert model.prompts == []
+        assert engine.reference_seconds == pytest.approx(7.5)
+        assert isinstance(engine._prompt, list)
+        assert engine._prompt[0].icl_mode is True
+
+    def test_a_speaker_only_engine_drops_the_codes(self) -> None:
+        '''The engine's mode wins, exactly as when a prompt is built from a file.'''
+        engine = engine_with(HybridQwenModel())
+        engine.x_vector_only = True
+        engine._prompt = [self.item()]
+
+        engine.prepare_prompt_from_data(engine.prompt_to_data(), seconds=7.5)
+
+        assert engine._prompt[0].ref_code is None
+        assert engine._prompt[0].x_vector_only_mode is True
+        # Nothing is decoded on each line's behalf in this mode.
+        assert engine.reference_seconds == 0.0
+
+    def test_a_prompt_without_codes_cannot_claim_icl(self) -> None:
+        engine = engine_with(HybridQwenModel())
+        data = PromptData(
+            ref_code=None,
+            ref_spk_embedding=np.zeros(4, dtype=np.float32),
+            x_vector_only=False,
+        )
+
+        with pytest.raises(TTSError, match='no speech codes'):
+            engine.prepare_prompt_from_data(data, seconds=1.0)
+
+    def test_a_card_from_another_backend_is_refused(self) -> None:
+        '''A card is only meaningful to the synthesiser that wrote it.'''
+        engine = engine_with(HybridQwenModel())
+        data = PromptData(
+            ref_code=np.zeros((2, 2), dtype=np.int64),
+            ref_spk_embedding=np.zeros(4, dtype=np.float32),
+            backend='fish',
+        )
+
+        with pytest.raises(TTSError, match='fish'):
+            engine.prepare_prompt_from_data(data, seconds=1.0)
+
+    def test_saving_needs_a_prompt(self) -> None:
+        with pytest.raises(TTSError, match='No clone prompt'):
+            engine_with(HybridQwenModel()).prompt_to_data()
+
+    def test_hybrid_reuses_a_stored_embedding(self) -> None:
+        '''The timbre side costs no encode when a prompt already holds it.'''
+        model = HybridQwenModel()
+        engine = engine_with(model)
+        data = PromptData(
+            ref_code=None,
+            ref_spk_embedding=np.linspace(0.0, 1.0, 4, dtype=np.float32),
+            x_vector_only=True,
+        )
+
+        engine.prepare_hybrid_prompt(
+            accent_audio='accent.wav',
+            accent_text='bonjour',
+            timbre_item=data,
+        )
+
+        assert len(model.prompts) == 1
+        assert model.prompts[0]['ref_audio'] == 'accent.wav'
+        assert engine._prompt[0].ref_code == 'code:accent.wav'
+        assert engine._timbre_spk_embedding is not None
 
 
 class ScoringQwenModel(FakeQwenModel):

@@ -188,9 +188,8 @@ Optional models (registered but not needed for the MVP):
 |---|---|---|
 | `tts_custom_voice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 premium named voices + emotion instructions |
 | `tts_tokenizer` | `Qwen/Qwen3-TTS-Tokenizer-12Hz` | standalone tokenizer (already bundled in `tts_base`) |
-| `tts_cosyvoice` | `FunAudioLLM/CosyVoice2-0.5B` | cloned voice + per-line emotion instruction (`dub say --backend cosyvoice`) |
-| `tts_fish` | `fishaudio/s2-pro` | Fish Speech S2-Pro: cloned voice + inline emotion tags (`dub say --backend fish`) |
-| `tts_index_tts2` | `IndexTeam/IndexTTS-2` | IndexTTS2: separate emotion reference + duration fit (`dub say --backend indextts2`) |
+| `tts_cosyvoice3` | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | cloned voice + per-line emotion/pace/volume (`dub say --backend cosyvoice3`) |
+| `tts_fish` | `fishaudio/s2-pro` | Fish Speech S2-Pro: cloned voice + inline tags (`dub say --backend fish`) |
 
 You can also copy a model directory in by hand — anything present under `MODELS_DIR`
 is detected automatically. Override the location with `MODELS_DIR` in `.env`, which
@@ -212,12 +211,13 @@ if a required model is missing, so you can also just try a dub and see.
 
 ---
 
-## CosyVoice2 (optional, expressive speech)
+## CosyVoice 3 (optional, expressive speech)
 
-`dub say --backend cosyvoice` adds per-line emotion/style instructions to a
-cloned voice. It is optional; everything else works without it.
+`dub say --backend cosyvoice3` adds per-line emotion/pace/volume instructions and
+paralinguistic tokens to a cloned voice. It is optional; everything else works
+without it.
 
-CosyVoice2 pins `transformers==4.51.3`, while Qwen TTS pins `4.57.3`. Loading
+CosyVoice 3 pins `transformers==4.51.3`, while Qwen TTS pins `4.57.3`. Loading
 CosyVoice with the newer version produces garbled audio, so the engine runs
 CosyVoice in a **child process** whose `PYTHONPATH` starts with a small
 transformers-4.51.3 overlay. The main environment keeps Qwen's version.
@@ -251,7 +251,7 @@ pip install --target third_party/cosyvoice-overlay --no-deps \
 **3. Download the checkpoint**
 
 ```bash
-python dub.py models --download tts_cosyvoice
+python dub.py models --download tts_cosyvoice3
 ```
 
 The engine adds `third_party/cosyvoice-overlay`, `third_party/CosyVoice`,
@@ -259,18 +259,19 @@ The engine adds `third_party/cosyvoice-overlay`, `third_party/CosyVoice`,
 `PYTHONPATH` automatically; no `.pth` file or shell export is needed. Set
 `COSYVOICE_PYTHONPATH` to prepend your own paths (for example another checkout).
 
-CosyVoice2 runs on CUDA or CPU and reads `CUDA_VISIBLE_DEVICES` at import, so the
-engine maps `--device cuda:N` to it.
+CosyVoice 3 runs on CUDA or CPU and reads `CUDA_VISIBLE_DEVICES` at import, so
+the engine maps `--device cuda:N` to it.
 
-**Language coverage.** CosyVoice2 is strongest in Chinese, English, Japanese,
-Korean and Cantonese; French, German, Spanish, Italian, Portuguese and Russian
-are not officially supported and sound poor. Use the default Qwen backend for
-those languages. See [Voices](voices.md#emotion-with-cosyvoice2).
+**Language coverage.** CosyVoice 3 is strongest in Chinese, English and Japanese,
+and unlike the previous generation it covers French and a handful of other
+European languages. See
+[Voices](voices.md#expressive-backends-cosyvoice3-chatterbox-and-fish).
 
 ## Fish Speech S2-Pro (optional, expressive speech)
 
 `dub say --backend fish` clones a voice and reads emotion/paralinguistic tags
-inline in the text. It is optional and needs ~24 GB of VRAM.
+inline in the text. It is optional, and loads its weights **int8 by default**, so
+it runs on a 12 GB card (~6 GB resident, ~11 GB peak).
 
 Fish pins `torch==2.8` and `transformers==5.19`, which conflict with the Qwen
 checkpoint. Install it in its own environment:
@@ -279,8 +280,14 @@ checkpoint. Install it in its own environment:
 python3 -m venv .venv-fish
 git clone --depth 1 https://github.com/fishaudio/fish-speech.git third_party/fish-speech
 .venv-fish/bin/pip install -e third_party/fish-speech
+.venv-fish/bin/pip install torchao==0.13.0   # int8 loading
 python dub.py models --download tts_fish   # fishaudio/s2-pro
 ```
+
+There is no int8 checkpoint to download: Fish publishes the model in bf16 only,
+so the worker quantizes the 201 linear layers on the CPU after loading and only
+then moves the model to the GPU. `--fish-quantize off` skips that and loads the
+bf16 weights, which is what Fish documents as needing ~24 GB.
 
 Fish's `pyaudio` dependency needs PortAudio headers (`apt install
 portaudio19-dev`). Without them, install the runtime dependencies from its
@@ -289,24 +296,6 @@ third_party/fish-speech`; the worker never uses audio input.
 
 The backend runs `pipeline.fish_worker` with `.venv-fish/bin/python`; set
 `FISH_PYTHON` to point at another environment.
-
-## IndexTTS2 (optional, expressive speech)
-
-`dub say --backend indextts2` clones a voice, takes emotion from a second
-reference clip, and can fit a line to `--duration` seconds. It is optional.
-
-IndexTTS pins `torch==2.8` and `transformers==4.52`, so it also gets its own
-environment:
-
-```bash
-python3 -m venv .venv-indextts
-git clone --depth 1 https://github.com/index-tts/index-tts.git third_party/index-tts
-.venv-indextts/bin/pip install -e third_party/index-tts
-python dub.py models --download tts_index_tts2   # IndexTeam/IndexTTS-2
-```
-
-The backend runs `pipeline.index_tts_worker` with `.venv-indextts/bin/python`;
-set `INDEXTTS_PYTHON` to point at another environment.
 
 ---
 

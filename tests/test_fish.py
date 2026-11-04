@@ -14,7 +14,7 @@ import soundfile as sf
 
 from pipeline.errors import DependencyError, TTSError
 from pipeline.fish import FishEngine, resolve_fish_device
-from pipeline.prosody import ProsodySpec
+from pipeline.fish_worker import _quantize_mode
 
 
 def _fake_worker(rate: int = 44_100, seconds: float = 0.25):
@@ -41,7 +41,7 @@ def test_device_maps_to_cuda_or_cpu() -> None:
     assert resolve_fish_device("mps") == "cpu"
 
 
-def test_synthesize_tags_lines_and_reads_wavs(
+def test_synthesize_sends_the_lines_as_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured, run = _fake_worker()
@@ -50,12 +50,8 @@ def test_synthesize_tags_lines_and_reads_wavs(
 
     engine = FishEngine("models/fish", device="cpu")
     out = engine.synthesize(
-        ["First one.", "Second one"],
+        ["[excited] First one.", "[whisper] Second one [pause]"],
         reference=tmp_path / "voice.wav",
-        prosody=[
-            ProsodySpec(emotion="excited"),
-            ProsodySpec(emotion="whisper", pause=True),
-        ],
         ref_text="reference words",
     )
 
@@ -86,21 +82,33 @@ def test_sampling_is_forwarded(
     assert payload["top_p"] == 0.8
 
 
-def test_keep_mode_sends_the_lines_untouched(
+def test_quantize_defaults_to_int8_on_cuda_and_bf16_on_cpu() -> None:
+    assert _quantize_mode({}, "cuda:0") == "int8"
+    assert _quantize_mode({}, "cpu") == "bf16"
+
+
+def test_quantize_off_loads_the_bf16_weights() -> None:
+    assert _quantize_mode({"quantize": "off"}, "cuda:0") == "bf16"
+    assert _quantize_mode({"quantize": "int8"}, "cuda:0") == "int8"
+
+
+def test_quantize_rejects_an_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="unknown quantize mode"):
+        _quantize_mode({"quantize": "int4"}, "cuda:0")
+
+
+def test_quantize_mode_is_forwarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured, run = _fake_worker()
     monkeypatch.setattr(FishEngine, "_ensure_available", lambda self: None)
     monkeypatch.setattr(FishEngine, "_run_worker", run)
 
-    engine = FishEngine("m", device="cpu")
-    engine.synthesize(
-        ["[whisper] Wait.", "[sad] Then go."],
-        reference=tmp_path / "v.wav",
-        tag_mode="keep",
+    FishEngine("m", device="cpu", quantize="off").synthesize(
+        ["hi"], reference=tmp_path / "v.wav"
     )
 
-    assert captured[0]["lines"] == ["[whisper] Wait.", "[sad] Then go."]
+    assert captured[0]["quantize"] == "off"
 
 
 def test_missing_package_is_reported(

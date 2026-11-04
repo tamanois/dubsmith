@@ -1,4 +1,4 @@
-"""Standalone CosyVoice 2/3 worker, run in a child process.
+"""Standalone CosyVoice 3 worker, run in a child process.
 
 CosyVoice and Qwen TTS pin different ``transformers`` versions (4.51.3 vs
 4.57.3), and loading CosyVoice with the newer one silently produces garbled
@@ -6,15 +6,14 @@ audio. This worker is therefore launched by ``pipeline.cosyvoice`` with a
 ``PYTHONPATH`` whose first entry is a small transformers-4.51.3 overlay, so the
 main environment keeps the version Qwen needs.
 
-The checkpoint is loaded through ``AutoModel``, which picks CosyVoice 2 or 3 from
-the config file in the model directory. CosyVoice 3 needs an instruct that ends
-with ``<|endofprompt|>`` in *every* request - including a plain clone - because
-its LLM asserts on that token before decoding.
+The checkpoint is loaded through ``AutoModel``. CosyVoice 3 needs an instruct
+that ends with ``<|endofprompt|>`` in *every* request - including a plain clone -
+because its LLM asserts on that token before decoding.
 
 Protocol: one argument, a JSON request path. The request names the checkpoint,
-its generation, the reference clip, the lines, their instructions, ``fp16`` and
-an output directory. The worker writes ``line_000.wav``, ... plus ``result.json``
-with ``sample_rate`` and ``files``.
+the reference clip, the lines, their instructions, ``fp16`` and an output
+directory. The worker writes ``line_000.wav``, ... plus ``result.json`` with
+``sample_rate`` and ``files``.
 """
 
 from __future__ import annotations
@@ -82,15 +81,13 @@ def main(argv: list[str]) -> int:
     )
     load_seconds = time.perf_counter() - load_started
     sample_rate = int(getattr(model, "sample_rate", SAMPLE_RATE))
-    model_type = str(request.get("model_type", "cosyvoice2")).lower()
     logger.info(
-        "Loaded %s from %s in %.2fs (sample_rate=%d, fp16=%s, type=%s)",
+        "Loaded %s from %s in %.2fs (sample_rate=%d, fp16=%s)",
         type(model).__name__,
         request["model_dir"],
         load_seconds,
         sample_rate,
         bool(request.get("fp16", False)),
-        model_type,
     )
 
     modes = list(request.get("modes") or [])
@@ -114,16 +111,11 @@ def main(argv: list[str]) -> int:
         prompt = prompts[index] if index < len(prompts) else ""
         instruct = _normalize_instruct(instruct)
         if not mode:
-            # Backward compatibility with a request that predates `modes`.
-            if instruct:
-                mode = "instruct2"
-            elif model_type == "cosyvoice3":
-                mode = "instruct2"  # neutral instruct; the marker is required
-            else:
-                mode = "cross_lingual"
+            # A request that predates `modes` still carries its instructions.
+            mode = "instruct2" if instruct else "cross_lingual"
         # CosyVoice 3 asserts on <|endofprompt|> before decoding, so a neutral
         # instruct path still needs the placeholder sentence.
-        if mode == "instruct2" and not instruct and model_type == "cosyvoice3":
+        if mode == "instruct2" and not instruct:
             instruct = NEUTRAL_INSTRUCT
         started = time.perf_counter()
         if mode == "instruct2":

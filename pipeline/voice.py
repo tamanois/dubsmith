@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import TTSError
+from .voices import load_prompt
 
 if TYPE_CHECKING:  # pragma: no cover - annotation only, avoids an import cycle
     from .tts import TTSEngine
@@ -48,6 +49,11 @@ class VoiceSpec:
     #: Pinned reference voice, when the user supplied one.
     ref_audio: Path | None = None
     ref_text: str = ""
+    #: The library's stored encoding of :attr:`ref_audio`, when it has one. A
+    #: worker that installs it skips the encode pass entirely.
+    prompt: Path | None = None
+    #: Length of the clip :attr:`prompt` encodes, used only to size a batch.
+    prompt_seconds: float = 0.0
     #: Auto-selected donor for this speaker (a :class:`pipeline.tts.DonorClip`).
     #: Untyped to keep this module free of the heavier import.
     donor: Any | None = None
@@ -77,6 +83,7 @@ class VoiceSpec:
                 self.speaker,
                 self.accent_mode,
                 str(self.ref_audio or ""),
+                str(self.prompt or ""),
                 str(self.blend or ""),
                 str(self.accent_audio or ""),
                 donor_id,
@@ -93,14 +100,22 @@ def build_prompt(engine: TTSEngine, spec: VoiceSpec) -> None:
     * in an accent mode, a blended clip *is* the voice - its codes and its
       embedding cannot disagree, which is the whole point of stage 1;
     * failing that, pronunciation comes from the accent clip and timbre from the
-      donor, combined by the engine's hybrid prompt;
-    * a pinned reference voice replaces both;
+      donor (or from a stored prompt's embedding), combined by the engine's
+      hybrid prompt;
+    * a pinned reference voice with a stored prompt is installed as-is: nothing
+      is encoded, because the library already holds the encoding;
+    * a pinned reference without one is cloned from its file;
     * otherwise the donor is cloned directly.
 
     Raises:
         TTSError: When a spec cannot produce a prompt at all (no donor, no pinned
             voice), which is a bug in the caller rather than a bad recording.
     """
+    data = (
+        load_prompt(spec.prompt)
+        if spec.prompt is not None and spec.blend is None
+        else None
+    )
     if spec.accent_mode in ("native", "reference-accent"):
         if spec.blend is not None:
             engine.prepare_prompt_from_file(spec.blend, spec.accent_text)
@@ -116,7 +131,11 @@ def build_prompt(engine: TTSEngine, spec: VoiceSpec) -> None:
             accent_text=spec.accent_text,
             timbre=spec.donor,
             timbre_audio=spec.ref_audio,
+            timbre_item=data,
         )
+        return
+    if data is not None:
+        engine.prepare_prompt_from_data(data, seconds=spec.prompt_seconds)
         return
     if spec.ref_audio is not None:
         engine.prepare_prompt_from_file(spec.ref_audio, spec.ref_text)

@@ -274,6 +274,10 @@ class Settings(BaseModel):
     #: than a model artifact, so it defaults outside ``models/``: it survives a
     #: weights re-download and can be shared or versioned on its own.
     voices_dir: Path = Path("voices")
+    #: Write a voice's encoding back into its own folder the first time it is
+    #: used, so a voice added from a clip costs one encode ever instead of one per
+    #: run. Derived data: deleting it only costs that encode again.
+    voices_prompt_cache: bool = True
     log_level: str = "INFO"
     log_json: bool = False
     #: Also keep the run log in a file. ``None`` means the job's own folder, which
@@ -331,6 +335,10 @@ class Settings(BaseModel):
             "duck_db": pick("DUCK_DB", cls.model_fields["duck_db"].default),
             "models_dir": pick("MODELS_DIR", cls.model_fields["models_dir"].default),
             "voices_dir": pick("VOICES_DIR", cls.model_fields["voices_dir"].default),
+            "voices_prompt_cache": pick(
+                "VOICES_PROMPT_CACHE",
+                cls.model_fields["voices_prompt_cache"].default,
+            ),
             "log_level": pick("LOG_LEVEL", cls.model_fields["log_level"].default),
             "log_json": pick("LOG_JSON", cls.model_fields["log_json"].default),
             "log_file": pick("LOG_FILE", cls.model_fields["log_file"].default),
@@ -360,6 +368,12 @@ class JobConfig(BaseModel):
     # Voice donor: if omitted, the longest clean speech segment is used.
     ref_audio: Path | None = None
     ref_text: str | None = None
+    #: A saved voice's stored encoding of :attr:`ref_audio`. When set, prompt
+    #: building installs it instead of encoding the clip again; it is dropped by
+    #: the caller when it was produced by a different checkpoint.
+    ref_prompt: Path | None = None
+    #: Length of the clip :attr:`ref_prompt` encodes, for batch sizing.
+    ref_prompt_seconds: float = 0.0
 
     output_dir: Path = Path("output")
     device: str = "auto"
@@ -798,7 +812,14 @@ class JobConfig(BaseModel):
             raise ConfigError("source_language must be an explicit language, not 'auto'")
         return normalized
 
-    @field_validator("video", "audio", "ref_audio", "accent_audio", "output_dir")
+    @field_validator(
+        "video",
+        "audio",
+        "ref_audio",
+        "ref_prompt",
+        "accent_audio",
+        "output_dir",
+    )
     @classmethod
     def _expand(cls, value: Path | None) -> Path | None:
         return value.expanduser() if value is not None else None

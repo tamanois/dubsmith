@@ -22,7 +22,7 @@ See [Accent modes](voices.md#accent-modes) for how these interact.
 |---|---|---|
 | `--ref-audio PATH` | auto | Clones this recording instead of the speaker found in the video. |
 | `--ref-text TEXT` | – | Exact transcript of `--ref-audio`. Required with it in `preserve` mode; ignored by the other modes. |
-| `--voice LABEL` | – | Reuse a saved voice print as the timbre source. Cannot be combined with `--ref-audio`; see [Voice library](voices.md#voice-library-saved-voices). |
+| `--voice LABEL` | – | Reuse a saved voice as the timbre source, including its stored encoding when it has one. Cannot be combined with `--ref-audio`; see [Voice library](voices.md#voice-library-saved-voices). |
 | `--accent-mode MODE` | `native` | Where pronunciation comes from: `native` (a generated accent anchor — the default), `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip). |
 | `--accent-match MODE` | `off` | With `--accent-mode native`, shape the generated anchor to the source voice: `rate` matches its speaking rate, `gender` also matches its gender. |
 | `--accent-audio PATH` | – | Native target-language clip to borrow pronunciation from. Requires `--accent-mode reference-accent`. |
@@ -32,9 +32,30 @@ See [Accent modes](voices.md#accent-modes) for how these interact.
 | `--blend-iters N` | `5` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](voices.md#choosing-the-blend-strength). |
 | `--blend-ratio T` | `0.85` | How far toward the speaker's own voice the blend should reach, from `0` (the accent voice) to `1` (a target-language utterance in the speaker's voice). Iteration stops there. `0` disables the search. See [Choosing the blend strength](voices.md#choosing-the-blend-strength). |
 
-With `--voice`, a saved print already in the target language clones directly
-(`preserve`), while a print in another language uses the `native` anchor. An
-explicit `--accent-mode` always wins.
+With `--voice`, a saved voice already in the target language clones directly
+(`preserve`), while one in another language uses the `native` anchor. A voice
+with no transcript cannot do ICL at all, so it uses `speaker-only`. An explicit
+`--accent-mode` always wins.
+
+## Saved voices (`dub.py voices`)
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--design` | mode | Create a voice from `--prompt` (VoiceDesign checkpoint). |
+| `--clone` | mode | Encode `--audio` once and store the encoding (Base checkpoint). |
+| `--add AUDIO` | mode | Register an existing clip verbatim: no model, no GPU, no processing. |
+| `--list` | mode | List the library (the default). |
+| `--remove LABEL` | mode | Delete a saved voice. |
+| `--clone-text TEXT` | – | Exact transcript of the reference clip. Required with `--clone` unless `--transcribe` is given; optional with `--add`. |
+| `--transcribe` | off | Derive the transcript with the local ASR, and use the language it detects when `--lang` is omitted. |
+| `--verify` | off | Transcribe anyway and warn when `--clone-text` does not match what was heard. |
+| `--lang LANG` | see note | Language the voice is recorded in. `--design`/`--clone` default to `fr`; `--add` needs it, or `--transcribe`. |
+| `--label NAME` | derived | Name to save under; a slug of the description, or the audio's filename. |
+| `--force` | off | Overwrite an existing voice with the same label. Cards already written are kept, and one that no longer matches the new clip is ignored rather than used. |
+
+Encodings are stored per backend and per model, as
+`voices/<label>/prompts/<backend>-<fingerprint>.npz`. A card is only used by the
+backend and checkpoint that wrote it, and switching models keeps both cards.
 
 ## Speakers
 
@@ -124,13 +145,13 @@ model, the prosody plan, per-line render times and a total.
 
 | Option | Default | What it achieves |
 |---|---|---|
-| `--backend NAME` | `qwen` | `qwen` (clone), `customvoice` (preset speaker + instruction), `cosyvoice`/`cosyvoice3` (clone + per-line prosody), `chatterbox` (clone + expression intensity), `fish` (clone + inline emotion tags), `indextts2` (clone + separate emotion reference, `--duration`). |
+| `--backend NAME` | `qwen` | `qwen` (clone), `customvoice` (preset speaker + instruction), `cosyvoice3` (clone + per-line prosody), `chatterbox` (clone + expression intensity), `fish` (clone + inline tags). |
 | `--prosody SPEC` | — | Per-line `emotion`/`pace`/`volume`/`exaggeration` and bare `breath`/`pause`/`laughter` flags; repeat per line or broadcast one. |
-| `--emotion TEXT` | — | Shorthand for `emotion=` (alias `--instruct`); repeatable/comma-separated. On `cosyvoice` (CosyVoice2) it is passed to the model verbatim, so prefer `--prosody` there. |
+| `--emotion TEXT` | — | Shorthand for `emotion=` (alias `--instruct`); repeatable/comma-separated. Rejected by `qwen` and `fish` (Fish takes its direction from tags in `--text`). |
 | `--style-instruct TEXT` | — | `customvoice` only: the delivery instruction, sent **verbatim** to the checkpoint. Repeatable (one per line, or one value broadcast). Wins over `--style-plan`/`--prosody`/`--emotion`/`--prosody-plan`. |
 | `--style-plan {off,llm}` | `off` | `customvoice` only: `llm` writes those verbatim instructions for you, which is the form the checkpoint expects. An explicit `--style-instruct` still wins. Requires the LLM settings. `-v` logs every request and reply. |
 | `--style-plan-scope {per-line,whole}` | `per-line` | With `--style-plan llm`: one instruction per line (chunked, with a whole-passage overview when long), or a single instruction for the entire text. |
-| `--plan-chunk N` | `LLM_PLAN_CHUNK_SIZE` (10) | Lines per planning request before `--style-plan llm` and `--prosody-plan llm` switch to the overview + chunked strategy. |
+| `--plan-chunk N` | `LLM_PLAN_CHUNK_SIZE` (10) | Lines per planning request before `--style-plan llm`, `--prosody-plan llm` and `--fish-tag-mode llm` switch to the overview + chunked strategy. |
 | `--prosody-plan {off,llm}` | `off` | `llm` asks the configured OpenAI-compatible model to plan per-line prosody; explicit values still win. Skipped when `--style-instruct` or `--style-plan llm` is given. Long passages get a whole-passage overview first. `-v` logs the raw request and reply. |
 | `--speaker NAME` | — | Preset voice for `--backend customvoice` (e.g. `Vivian`, `Ryan`). |
 | `--chatterbox-exaggeration 0..1` | derive | Fixes Chatterbox's expression intensity for every line. |
@@ -138,11 +159,9 @@ model, the prosody plan, per-line render times and a total.
 | `--chatterbox-temperature FLOAT` | `0.8` | Chatterbox sampling temperature. |
 | `--fish-temperature FLOAT` | `0.7` | Fish Speech sampling temperature. |
 | `--fish-top-p FLOAT` | `0.7` | Fish Speech nucleus sampling probability. |
-| `--fish-tag-mode {render,keep,llm}` | `render` | `fish` only. `render` maps `--prosody`/`--emotion` onto the inline tags; `keep` sends `--text` as written for hand-written tags (rejects `--emotion`/`--prosody`/`--prosody-plan`); `llm` has the model write the tags into the text, guarded so the words cannot change. |
-| `--emotion-audio AUDIO` | — | `indextts2` only: a second clip whose emotion colours the delivery, while `--voice`/`--clone` fixes the timbre. |
-| `--emotion-alpha 0..1` | `1.0` | `indextts2`: how strongly `--emotion-audio` applies. Requires `--emotion-audio`. |
-| `--duration SECONDS` | — | `indextts2` only: fit each line to this many seconds. Repeat once per line, or pass one value to apply everywhere. The released IndexTTS2.0 has no native duration control, so the line is time-stretched after synthesis. |
-| `--clone-text TEXT` | — | Transcript of `--clone`; required for `qwen`, optional for CosyVoice (improves accent fidelity). |
+| `--fish-tag-mode {keep,llm}` | `keep` | `fish` only. `keep` speaks `--text` exactly as written, tags included; `llm` has the model insert the tags, guarded so the words cannot change. Fish has no `--prosody`/`--emotion`/`--prosody-plan` channel. |
+| `--fish-quantize {int8,off}` | `int8` | `fish` only. `int8` loads 8-bit weight-only (~6 GB resident, ~11 GB peak) so the model fits a 12 GB card; `off` loads the bf16 weights Fish documents as needing ~24 GB. CPU runs always use bf16. |
+| `--clone-text TEXT` | — | Transcript of `--clone`. Optional: without it `qwen` clones from the speaker embedding alone (lower similarity), and CosyVoice loses the reference's accent. |
 
 `--text` is split into one utterance per line. Both a real newline and a literal
 `\n` are treated as breaks, so `--text "one\ntwo"` works even though a shell does

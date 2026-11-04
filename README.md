@@ -136,10 +136,10 @@ python dub.py --video talk.mp4 --target fr --accent-mode preserve
 ```bash
 python dub.py voices --design --prompt "a warm female French voice" --lang fr --label warm-fr
 python dub.py voices --clone --audio me.wav --clone-text "…" --lang fr --label me
+python dub.py voices --add me.wav --transcribe --label me                     # no model, no GPU
 python dub.py voices --list
 
 python dub.py say --voice warm-fr --text "Bonjour, ceci est un test."
-python dub.py say --voice warm-fr --backend cosyvoice --text "…" --prosody "emotion=excited"
 python dub.py say --voice warm-fr --backend cosyvoice3 --text "…" --prosody "emotion=happy, pace=fast, breath"
 python dub.py say --voice warm-fr --backend chatterbox --text "…" --prosody "emotion=happy, exaggeration=0.8" --lang fr
 python dub.py say --backend customvoice --speaker Vivian --lang en --text "…" --prosody "emotion=excited, pace=fast"
@@ -147,24 +147,20 @@ python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
   --style-instruct "Speak with restrained anger, then fade to exhaustion."
 python dub.py say --backend customvoice --speaker Ryan --lang en --text "…" \
   --style-plan llm
-python dub.py say --voice warm-fr --backend fish --text "…" --emotion excited
-python dub.py say --voice warm-fr --backend indextts2 --text "…" \
-  --emotion-audio colere.wav --emotion-alpha 0.8 --duration 3.2
+python dub.py say --voice warm-fr --backend fish --text "[excited] Je n'arrive pas à y croire !"
 python dub.py --video talk.mp4 --target en --voice warm-fr
 ```
 
-Expressive backends (`cosyvoice`, `cosyvoice3`, `chatterbox`, `fish` and
-`indextts2` clone the voice from the same reference clip; `customvoice` pairs a
-preset speaker with an instruction):
+Expressive backends (`cosyvoice3`, `chatterbox` and `fish` clone the voice from
+the same reference clip; `customvoice` pairs a preset speaker with an
+instruction):
 
 | Backend | Languages | What it adds |
 |---|---|---|
 | `customvoice` | 10 | preset Qwen speaker + tone/emotion instruction (no clone) |
-| `cosyvoice` (CosyVoice2) | zh, en, ja, ko, yue | per-line emotion/style instruct |
 | `cosyvoice3` | 9, **incl. French** | emotion, pace, volume, `[breath]`, `[laughter]` |
 | `chatterbox` | 23, **incl. French** | configurable expression intensity (+ natural prosody) |
-| `fish` (Fish Speech S2-Pro) | ~100 | cloned voice + inline `[excited]`/`[whisper]`/`[sad]` tags |
-| `indextts2` | zh, en, ja | cloned voice + a separate emotion reference + `--duration` fit |
+| `fish` (Fish Speech S2-Pro) | ~100 | cloned voice + inline tags in the text (34 documented tags, free-form allowed) |
 
 CustomVoice speakers: `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`, `Eric` (Chinese),
 `Ryan`, `Aiden` (English), `Ono_Anna` (Japanese), `Sohee` (Korean) — descriptions
@@ -192,8 +188,9 @@ the most expressive option; it wins over `--prosody`. `--style-plan llm`
 `LLM_PLAN_CHUNK_SIZE` lines (default 10, or `--plan-chunk`) it first reads the
 whole text for an overview, then plans each chunk against it. Note that
 `--instruct` is an alias of `--emotion`, not of `--style-instruct`.
-Per-backend limitations (Chatterbox has no breath/laughter tokens; CosyVoice2
-languages) and the full value lists are in [docs/voices.md](docs/voices.md).
+Per-backend limitations (Chatterbox has no breath/laughter tokens; Fish has no
+prosody channel, only tags in the text) and the full value lists are in
+[docs/voices.md](docs/voices.md).
 
 **Multi-speaker videos**
 

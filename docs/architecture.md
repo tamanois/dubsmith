@@ -69,14 +69,14 @@ pipeline/
 ├── translate.py           OpenAI-compatible translation
 ├── tts.py                 per-speaker donor selection + voice cloning
 ├── voice.py               one voice: the facts that build its clone prompt
-├── voices.py              saved, labeled voice prints (design + clone library)
+├── voices.py              saved voices: clip + manifest + stored encoding
 ├── parallel.py            fan-out: tasks, the worker pool, per-device counters
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
 tests/                     pytest suite (1105 tests, no GPU or models needed)
 models/                    downloaded weights (gitignored)
-voices/                    saved voice prints (gitignored)
+voices/                    saved voices: clip, manifest and encoding (gitignored)
 output/                    job artifacts (gitignored)
 docs/                      user documentation (this folder)
 clone.py, main.py          standalone TTS demos kept for reference

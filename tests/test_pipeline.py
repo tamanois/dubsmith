@@ -207,6 +207,8 @@ class FakeTTSEngine:
         self.file_prompt: tuple[Any, str] | None = None
         #: Every file prompt built, in order, so per-speaker voices are assertable.
         self.file_prompts: list[tuple[Any, str]] = []
+        #: The stored prompt installed by ``prepare_prompt_from_data``, if any.
+        self.stored_prompt: tuple[Any, float] | None = None
         self.blend_calls = 0
         self.blend_takes: int | None = None
         self.blend_iters: int | None = None
@@ -235,6 +237,7 @@ class FakeTTSEngine:
         accent_text: str,
         timbre: Any = None,
         timbre_audio: Path | str | None = None,
+        timbre_item: Any = None,
     ) -> None:
         self.prompt_kind = "hybrid"
         self.prompt_calls += 1
@@ -244,7 +247,15 @@ class FakeTTSEngine:
             "accent_text": accent_text,
             "timbre": timbre,
             "timbre_audio": timbre_audio,
+            "timbre_item": timbre_item,
         }
+
+    def prepare_prompt_from_data(self, data: Any, *, seconds: float = 0.0) -> None:
+        """Install a stored encoding: the encode-free path a saved voice takes."""
+        self.prompt_kind = "stored"
+        self.prompt_calls += 1
+        self.prompt_history.append("stored")
+        self.stored_prompt = (data, seconds)
 
     def build_blended_reference(
         self,

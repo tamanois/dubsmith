@@ -44,7 +44,6 @@ __all__ = [
     "COSYVOICE3_SYSTEM_PROMPT",
     "STYLE_SYSTEM_PROMPT",
     "STYLE_WHOLE_SYSTEM_PROMPT",
-    "FISH_EMOTION_TAGS",
     "FISH_TAGS",
     "FISH_INLINE_SYSTEM_PROMPT",
     "FISH_INLINE_OVERVIEW_SYSTEM_PROMPT",
@@ -65,10 +64,7 @@ __all__ = [
     "cosyvoice_instruct",
     "cosyvoice_mode",
     "customvoice_instruct",
-    "fish_apply_emotion",
     "fish_cue_tokens",
-    "fish_emotion_tag",
-    "fish_inline_tags",
     "fish_structural_token",
     "parse_fish_inline_response",
     "parse_prosody_response",
@@ -467,15 +463,12 @@ def trained_emotion(emotion: str) -> str:
 def cosyvoice_instruct(
     spec: ProsodySpec,
     *,
-    model_type: str = "cosyvoice3",
     language: str | None = None,
 ) -> str:
-    """Render a spec as the instruct text CosyVoice conditions on.
+    """Render a spec as the instruct text CosyVoice 3 conditions on.
 
-    CosyVoice 3 prefixes every instruction with ``You are a helpful assistant.``;
-    CosyVoice 2 does not (its documented example is just ``<instruction>
-    <|endofprompt|>``). The result always ends with ``<|endofprompt|>`` because
-    both checkpoints expect it.
+    The checkpoint prefixes every instruction with ``You are a helpful
+    assistant.`` and expects the result to end with ``<|endofprompt|>``.
 
     ``language`` is the canonical target language. The instruct path carries no
     reference speech tokens, so a non-English line needs a language hint to avoid
@@ -483,7 +476,6 @@ def cosyvoice_instruct(
     non-English lines, where it pulls the output toward English.
     """
     lang = str(language or "").strip()
-    is_v3 = str(model_type).lower() == "cosyvoice3"
     non_english = bool(lang) and lang.lower() not in {"english", "chinese"}
     volume_clauses = _VOLUME_CLAUSES_ZH if non_english else _VOLUME_CLAUSES
 
@@ -497,22 +489,19 @@ def cosyvoice_instruct(
             "(supported: happy, sad, angry).",
             spec.emotion,
         )
-    # On CosyVoice 3, a pace clause inside an instruct destabilises non-English
-    # speech (dropped or garbled words), so pace is applied by time-stretching in
-    # the engine instead. English and Chinese keep the trained pace instruct.
-    if not (is_v3 and non_english) and spec.pace in _PACE_CLAUSES:
+    # A pace clause inside an instruct destabilises non-English speech (dropped
+    # or garbled words), so pace is applied by time-stretching in the engine
+    # instead. English and Chinese keep the trained pace instruct.
+    if not non_english and spec.pace in _PACE_CLAUSES:
         clauses.append(_PACE_CLAUSES[spec.pace])
     if spec.volume in volume_clauses:
         clauses.append(volume_clauses[spec.volume])
     # Last, so it is the most recent instruction the LM sees.
-    if is_v3 and lang in _LANGUAGE_CLAUSES:
+    if lang in _LANGUAGE_CLAUSES:
         clauses.append(_LANGUAGE_CLAUSES[lang])
 
-    if is_v3:
-        body = f"{_PROMPT_PREFIX} {' '.join(clauses)}".strip()
-        instruct = f"{body}{_ENDOFPROMPT}"
-    else:
-        instruct = f"{' '.join(clauses)}{_ENDOFPROMPT}" if clauses else ""
+    body = f"{_PROMPT_PREFIX} {' '.join(clauses)}".strip()
+    instruct = f"{body}{_ENDOFPROMPT}"
     _LOGGER.debug("CosyVoice instruct for %s: %s", spec.model_dump(), instruct)
     return instruct
 
@@ -661,45 +650,47 @@ def customvoice_instruct(spec: ProsodySpec) -> str:
 # Fish Speech: natural-language tags inline in the text
 # --------------------------------------------------------------------------- #
 
-#: Documented S2-Pro / Drama 3 inline tags. Emotion words map onto this set;
-#: anything else is dropped, because a tag the checkpoint does not know can leak
-#: into the audio as spoken text.
-FISH_EMOTION_TAGS: dict[str, str] = {
-    "happy": "excited",
-    "excited": "excited",
-    "angry": "angry",
-    "sad": "sad",
-    "whisper": "whisper",
-    "whispering": "whisper",
-    "laugh": "laughing",
-    "laughing": "laughing",
-    "laughter": "laughing",
-}
-
-#: Every tag this backend emits. Pinned so the planner and the docs cannot drift
-#: from what the checkpoint documents.
+#: Documented common tags of the S2-Pro checkpoint
+#: (``models/fish-speech-s2-pro/README.md``: "Common tags (15,000+ unique tags
+#: supported)"). The card also states that the model accepts **free-form
+#: descriptions** such as ``[whisper in small voice]``, so this tuple is the
+#: reliable core the planner and the docs point at, not a closed vocabulary.
 FISH_TAGS: tuple[str, ...] = (
-    "excited",
-    "angry",
-    "sad",
-    "whisper",
-    "laughing",
     "pause",
+    "emphasis",
+    "laughing",
+    "inhale",
+    "chuckle",
+    "tsk",
+    "singing",
+    "excited",
+    "laughing tone",
+    "interrupting",
+    "chuckling",
+    "excited tone",
+    "volume up",
+    "echo",
+    "angry",
+    "low volume",
+    "sigh",
+    "low voice",
+    "whisper",
+    "screaming",
+    "shouting",
+    "loud",
+    "surprised",
+    "short pause",
+    "exhale",
+    "delight",
+    "panting",
+    "audience laughter",
+    "with strong accent",
+    "volume down",
+    "clearing throat",
+    "sad",
+    "moaning",
+    "shocked",
 )
-
-
-def fish_emotion_tag(emotion: str) -> str | None:
-    """The documented tag for ``emotion``, or ``None`` when there is none."""
-    key = str(emotion or "").strip().lower()
-    if not key or key in {"neutral", "none", "calm"}:
-        return None
-    tag = FISH_EMOTION_TAGS.get(key)
-    if tag is None:
-        _LOGGER.warning(
-            "Fish Speech has no documented tag for emotion %r; dropping it.",
-            emotion,
-        )
-    return tag
 
 
 def _fish_pause(text: str) -> str:
@@ -711,27 +702,6 @@ def _fish_pause(text: str) -> str:
     return f"{text} [pause]"
 
 
-def fish_inline_tags(text: str, spec: ProsodySpec) -> str:
-    """Render a spec as Fish Speech inline tags around ``text``.
-
-    Fish reads emotion and paralinguistics from the text itself, so there is no
-    side-channel instruction. Only documented tags are emitted: an unknown tag
-    can be spoken aloud by the model. ``breath`` has no tag and is dropped.
-    """
-    tag = fish_emotion_tag(spec.emotion)
-    body = str(text)
-    if spec.pause:
-        body = _fish_pause(body)
-    if spec.laughter:
-        body = f"{body} [laughing]"
-    if tag:
-        body = f"[{tag}] {body}"
-    if spec.breath:
-        _LOGGER.debug("Fish Speech has no breath tag; dropping it for %r", text)
-    _LOGGER.debug("Fish inline tags for %s: %r", spec.model_dump(), body)
-    return body
-
-
 #: Lines longer than this are split into sentences before inline planning, so a
 #: paragraph pasted without line breaks is not planned as one giant unit.
 FISH_PLAN_SPLIT_CHARS = 240
@@ -739,14 +709,18 @@ FISH_PLAN_SPLIT_CHARS = 240
 #: Cues per line. Beyond this the delivery reads as clipped rather than acted.
 FISH_MAX_CUES_PER_LINE = 3
 
-#: A bracketed cue, e.g. ``[whisper]``.
-_FISH_CUE_RE = re.compile(r"\[\s*([A-Za-z][\w-]*)\s*\]")
+#: A bracketed cue: ``[whisper]`` or the free-form ``[whisper in small voice]``.
+_FISH_CUE_RE = re.compile(r"\[\s*([^\[\]\n]{1,80}?)\s*\]")
 #: A paired span, e.g. ``<whisper>...</whisper>``. Legal content for the
 #: checkpoint, but only ``[cue]`` is documented, so spans are converted.
 _FISH_SPAN_RE = re.compile(r"<([A-Za-z][\w-]*)\b[^>]*>(.*?)</\1>", re.S)
 #: Tokens Fish writes into its own prompt; ``validate_drama3_text`` raises when
 #: caller text contains them, so they must be caught before the worker runs.
 _FISH_STRUCTURAL_RE = re.compile(r"<\|[^|>]*\|>")
+#: Punctuation with no space after it (``modestes.Et``). Text pasted from a
+#: document often loses those spaces, and the planner re-inserts them; that is
+#: typography, not a change to the words.
+_PUNCT_BOUNDARY = re.compile(r"(?<=[.,;:!?\u2026])(?=\S)")
 
 
 def fish_structural_token(text: str) -> str | None:
@@ -756,8 +730,11 @@ def fish_structural_token(text: str) -> str | None:
 
 
 def fish_cue_tokens(text: str) -> list[str]:
-    """The bracketed cues in ``text``, lowercased, in order."""
-    return [match.group(1).lower() for match in _FISH_CUE_RE.finditer(str(text or ""))]
+    """The bracketed cues in ``text``, normalised, in order."""
+    return [
+        " ".join(match.group(1).split()).lower()
+        for match in _FISH_CUE_RE.finditer(str(text or ""))
+    ]
 
 
 def strip_fish_tags(text: str) -> str:
@@ -769,25 +746,32 @@ def strip_fish_tags(text: str) -> str:
 
 
 def _fish_words(text: str) -> list[str]:
-    """``text`` as comparable words: tags stripped, case folded."""
-    return strip_fish_tags(text).casefold().split()
+    """``text`` as comparable words: tags stripped, case folded.
+
+    A missing space after punctuation is a typographic glitch, not a word change:
+    text pasted from a document often loses the space in "modestes. Et", and the
+    planner re-inserts it. Rejecting the line for that would throw away every tag
+    on it, so punctuation boundaries are split on both sides before comparing -
+    while any actual difference in the words themselves is still rejected.
+    """
+    body = _PUNCT_BOUNDARY.sub(" ", strip_fish_tags(text))
+    return body.casefold().split()
 
 
 def validate_fish_inline_text(text: str) -> list[str]:
     """Advisory problems with hand-written inline tags.
 
-    The caller logs these and keeps going: a user probing an undocumented cue
-    should not be stopped, but should be told it may be spoken aloud. The one
-    fatal case, a ``<|...|>`` prompt token, is reported by
-    :func:`fish_structural_token` instead.
+    Unknown cues are not a problem: the checkpoint accepts free-form
+    descriptions. The caller logs these and keeps going; the one fatal case, a
+    ``<|...|>`` prompt token, is reported by :func:`fish_structural_token`.
     """
     body = str(text or "")
     problems: list[str] = []
     for cue in fish_cue_tokens(body):
-        if cue not in FISH_TAGS:
+        if len(cue.split()) > 8:
             problems.append(
-                f"unknown tag [{cue}]; Fish may speak it aloud (known tags: "
-                f"{', '.join(FISH_TAGS)})"
+                f"tag [{cue}] is a phrase, not a short direction; Fish may read "
+                "it as text"
             )
     if not strip_fish_tags(body):
         problems.append("the line is only tags, so there is nothing to speak")
@@ -808,33 +792,38 @@ def validate_fish_inline_text(text: str) -> list[str]:
 
 def _normalise_fish_cues(text: str) -> str:
     """Tidy cue spacing: one space after a cue, none before punctuation."""
-    body = _FISH_CUE_RE.sub(lambda match: f"[{match.group(1).lower()}]", text)
+    body = _FISH_CUE_RE.sub(
+        lambda match: f"[{' '.join(match.group(1).split()).lower()}]", text
+    )
     body = re.sub(r"\]\s+(?=[.,;:!?\u2026])", "]", body)
     body = re.sub(r"\]\s*(?=\S)", "] ", body)
-    body = re.sub(r"(\[[a-z]+\])\s*\1", r"\1", body)
+    body = re.sub(r"(\[[^\[\]]+\])(?:\s*\1)+", r"\1", body)
     return " ".join(body.split())
 
 
-def sanitize_fish_inline_line(candidate: str, original: str) -> str:
+def sanitize_fish_inline_line(candidate: str) -> str:
     """Make a planner-written line safe for the checkpoint.
 
     The words are the planner's responsibility (:func:`parse_fish_inline_response`
-    rejects any change to them), so this only fixes tag mechanics: unknown cues
-    are dropped, spans become cues, prompt tokens are removed, a leading pause
-    moves inward, duplicates collapse and the cue count is capped.
+    rejects any change to them), so this only fixes tag mechanics. Cues are kept
+    as written - the checkpoint accepts free-form descriptions - except one long
+    enough to be a sentence, which the model would read out. Spans become cues,
+    prompt tokens are removed, a leading pause moves inward, duplicates collapse
+    and the cue count is capped.
     """
-    from_original = set(fish_cue_tokens(original))
     body = _FISH_SPAN_RE.sub(
-        lambda match: f"[{match.group(1).lower()}] {match.group(2)}",
+        lambda match: (
+            f"[{' '.join(match.group(1).split()).lower()}] {match.group(2)}"
+        ),
         str(candidate or ""),
     )
     body = _FISH_STRUCTURAL_RE.sub(" ", body)
 
     def cue(match: re.Match[str]) -> str:
-        name = match.group(1).lower()
-        if name not in FISH_TAGS and name not in from_original:
+        name = " ".join(match.group(1).split()).lower()
+        if len(name.split()) > 8:
             _LOGGER.warning(
-                "Fish inline plan wrote unknown tag [%s]; dropping it.", name
+                "Fish inline plan wrote a phrase as a tag [%s]; dropping it.", name
             )
             return " "
         return f"[{name}]"
@@ -916,28 +905,6 @@ def _split_fish_clauses(text: str, limit: int) -> list[str]:
     return [part for part in parts if part]
 
 
-def fish_apply_emotion(text: str, emotion: str) -> str:
-    """Force ``emotion`` onto the front of an inline-tagged line.
-
-    An explicit ``--emotion`` wins over a plan, so the leading emotion cue is
-    replaced rather than stacked. A leading ``[pause]`` is not an emotion, so it
-    moves back to the first clause boundary.
-    """
-    tag = fish_emotion_tag(emotion)
-    body = str(text or "").strip()
-    if tag is None:
-        return body
-    lead = _FISH_CUE_RE.match(body)
-    if lead:
-        name = lead.group(1).lower()
-        rest = body[lead.end() :].lstrip()
-        if name in FISH_TAGS and name != "pause":
-            body = rest
-        elif name == "pause":
-            body = _fish_pause(rest)
-    return f"[{tag}] {body}".strip()
-
-
 # --------------------------------------------------------------------------- #
 # LLM planner
 # --------------------------------------------------------------------------- #
@@ -974,10 +941,6 @@ Rules:
 #: in sync with ``_EMOTION_CLAUSES`` / ``_PACE_CLAUSES`` / ``_VOLUME_CLAUSES``.
 BACKEND_CAPABILITIES = {
     "qwen": "No prosody controls; a plan is ignored.",
-    "cosyvoice": (
-        "emotion: happy, sad or angry only; pace: slow or fast; volume: loud or "
-        "soft; breath, pause and laughter as inline tokens."
-    ),
     "cosyvoice3": (
         "emotion: happy, sad or angry only; pace: slow or fast; volume: loud or "
         "soft; breath, pause and laughter as inline tokens."
@@ -990,16 +953,6 @@ BACKEND_CAPABILITIES = {
     "customvoice": (
         "a free-form tone/emotion instruction; pace and volume can be phrased in "
         "words; breath, pause and laughter are ignored."
-    ),
-    "fish": (
-        "emotion and paralinguistics as inline tags in the text: [excited], "
-        "[angry], [sad], [whisper], [laughing], [pause]. Pace, volume and breath "
-        "have no tag and are ignored."
-    ),
-    "indextts2": (
-        "no structured prosody: emotion comes from a separate reference clip "
-        "(emo_audio_prompt) blended by emo_alpha. Pace is applied by "
-        "time-stretching the result, not by the model."
     ),
 }
 
@@ -1580,48 +1533,60 @@ class StylePlanner(_LLMPlanner):
 FISH_INLINE_SYSTEM_PROMPT = """You are a dubbing director preparing lines for \
 Fish Speech, a model that reads delivery from tags placed inline in the text.
 
-Fish documents these tags as controls for "prosody and emotion anywhere in the \
-text": [excited], [angry], [sad], [whisper], [laughing] and [pause]. There is no \
-other channel, so a tag is the only way to direct the performance.
+Fish has no separate style channel: everything is a bracketed tag inside the \
+line, and the model accepts FREE-FORM descriptions, not just a fixed list. \
+[whisper in small voice], [professional broadcast tone], [pitch up] and \
+[laughing tone] are all valid; the model was trained on 15,000+ tags.
+
+Your job is to make each line sound like a person saying it, not a model reading \
+it. Use tags to shape how the words come out and how the speaker reacts to what \
+is being said: relief after a confession, disbelief at a betrayal, a joke that \
+lands badly, a warning that is trying not to frighten anyone.
 
 For each numbered line, return the SAME line with tags inserted where the acting \
 belongs. Copy every word exactly: do not translate, paraphrase, reorder, split, \
 merge, shorten or extend the text, and keep its punctuation. Change only tag \
 placement.
 
-What the tags do:
-- [excited]: bright, high-energy delivery.
-- [angry]: hard, forceful delivery.
-- [sad]: low, heavy delivery.
-- [whisper]: quiet and breathy, close to the microphone.
-- [laughing]: actual laughter, not a smile.
-- [pause]: a short silence, between clauses only.
+Common tags (a reliable core; any other short description also works):
+[pause] [emphasis] [laughing] [inhale] [chuckle] [tsk] [singing] [excited] \
+[laughing tone] [interrupting] [chuckling] [excited tone] [volume up] [echo] \
+[angry] [low volume] [sigh] [low voice] [whisper] [screaming] [shouting] [loud] \
+[surprised] [short pause] [exhale] [delight] [panting] [audience laughter] \
+[with strong accent] [volume down] [clearing throat] [sad] [moaning] [shocked]
 
-How to place them:
-1. An emotion tag applies to the words after it, so put it before the words it \
-describes. A tag at the very start covers the whole line.
-2. A line may turn mid-way. Put a second emotion tag where the turn happens; that \
-turn is the advantage of this format over one style for the whole clip.
-3. Use [pause] only where a speaker would draw breath or let a beat land, never \
-at the start or the end of a line.
-4. Use [laughing] only when the line is a laugh.
-5. Never nest tags, never place two tags side by side, and use at most three tags \
-per line.
-6. Write tags in English even when the line is in another language. Never \
+How to use them:
+1. A tag applies to the words after it, so put it before the words it describes. \
+A tag at the very start covers the whole line.
+2. A line may turn mid-way. Put a second tag where the turn happens; that turn is \
+why this format beats one style for a whole clip.
+3. Reach for the tag that fits the moment: [sigh] for resignation, [chuckle] for \
+nervous amusement, [whisper] for secrecy or fear, [delight] for good news, \
+[surprised] for a reversal, [pause] for a beat.
+4. If none of the common tags fits, describe the delivery in a few words: \
+[impatiently], [reading aloud], [trying not to cry], [whisper in small voice].
+5. Use [pause] and [short pause] between clauses, never at the start or the end \
+of a line, and at most one beat per short line.
+6. At most three tags per line, never nested, never two side by side.
+7. Write tags in English even when the line is in another language. Never \
 translate the line itself.
-7. A line that needs nothing stays exactly as it is.
+8. A line that needs nothing stays exactly as it is.
 
 Examples: they show the level of detail expected, and must not be copied.
 - "I can't believe we actually did it!" -> \
 "[excited] I can't believe we actually did it!"
 - "Wait... did you hear that?" -> "[whisper] Wait... [pause] did you hear that?"
 - "I really thought things would be different." -> \
-"[sad] I really thought things would be different."
+"[sigh] I really thought things would be different."
 - "I thought things would be different... but here we are." -> \
 "[sad] I thought things would be different... [angry] but here we are."
+- "You're not supposed to know that." -> \
+"[whisper in small voice] You're not supposed to know that."
+- "Fine. Have it your way." -> "[sigh] Fine. [pause] Have it your way."
+- "We won. We actually won." -> "[delight] We won. [chuckle] We actually won."
 
 Never do this:
-- Inventing tags such as [sarcastic], [loud] or [slow]: Fish may speak them aloud.
+- Writing a whole sentence as a tag: it is read out as text.
 - Dropping, adding or translating words to make a line more emotional.
 - Starting or ending a line with [pause].
 - Stacking tags: "[excited] [angry] ...".
@@ -1633,16 +1598,16 @@ Reply with ONLY a JSON object of the form:
 Rules:
 1. Include every requested id exactly once, in the same order. Never invent ids.
 2. Every word of the original line must appear, in order and unchanged.
-3. Never write a tag outside the six listed above, and never write <|...|> tokens.
+3. Tags are short bracketed directions; never write <|...|> tokens.
 """
 
 FISH_INLINE_OVERVIEW_SYSTEM_PROMPT = """You are a dubbing director.
 
 Read the whole passage below and describe, in two or three sentences, how it should \
-be delivered overall: the dominant emotion, the arc, and any changes of energy, \
-pauses or laughter from beginning to end. This note guides the per-line tagging \
-written next, so keep it about the passage as a whole and do not tag individual \
-lines.
+be performed overall: the dominant emotion, the arc, and how the speaker's \
+reaction changes from beginning to end (energy, pauses, laughter, hesitation). \
+This note guides the per-line tagging written next, so keep it about the passage \
+as a whole and do not tag individual lines.
 
 Reply with ONLY the note, as plain text. No JSON, no bullet points, no headings.
 """
@@ -1763,7 +1728,7 @@ def parse_fish_inline_response(
             result.append(source)
             fallbacks += 1
             continue
-        cleaned = sanitize_fish_inline_line(candidate, source)
+        cleaned = sanitize_fish_inline_line(candidate)
         if _fish_words(cleaned) != _fish_words(source):
             _LOGGER.warning(
                 "Fish inline plan changed the words of a line; keeping the "

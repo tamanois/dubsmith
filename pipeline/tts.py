@@ -38,6 +38,7 @@ from .config import (
 )
 from .errors import DependencyError, TTSError
 from .logging_utils import timed
+from .voices import PromptData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -350,6 +351,26 @@ def _audio_seconds(value: ReferenceAudio) -> float:
         return 0.0
 
 
+def _as_numpy(value: Any) -> np.ndarray:
+    """A tensor or array as numpy, surviving dtypes numpy does not have.
+
+    The checkpoint keeps the speaker embedding in the talker's dtype, which is
+    bfloat16 on most modern cards; ``.numpy()`` refuses that, so it is widened to
+    float32 first. Integer codes pass through untouched.
+    """
+    for step in ("detach", "cpu"):
+        method = getattr(value, step, None)
+        if callable(method):
+            value = method()
+    numpy = getattr(value, "numpy", None)
+    if not callable(numpy):
+        return np.asarray(value)
+    try:
+        return np.asarray(numpy())
+    except TypeError:
+        return np.asarray(value.float().numpy())
+
+
 def _donor_ratio(
     candidate: np.ndarray,
     accent_embedding: np.ndarray | None,
@@ -579,6 +600,110 @@ class TTSEngine:
             )
         self.reference_seconds = 0.0 if self.x_vector_only else _audio_seconds(ref_audio)
 
+    def prepare_prompt_from_data(
+        self, data: PromptData, *, seconds: float = 0.0
+    ) -> None:
+        """Install an already-encoded prompt, replacing any current one.
+
+        No audio is read and no model call is made: this is the whole point of
+        storing an encoding in the voice library. The checkpoint moves the arrays
+        to its own device - and casts the embedding to the talker dtype - when it
+        consumes them, so a prompt saved on one card is usable on another.
+
+        Args:
+            data: The stored prompt.
+            seconds: Length of the clip it encodes, used only to size a batch.
+
+        Raises:
+            TTSError: When the card belongs to a different backend, or when the
+                engine needs speech codes and the card has none.
+            DependencyError: When torch is not installed.
+        """
+        if data.backend != "qwen":
+            raise TTSError(
+                f"This voice card was encoded by {data.backend!r}, not by Qwen; "
+                "delete it or rebuild the voice's card for this backend."
+            )
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - config dependent
+            raise DependencyError(
+                "torch is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+        from qwen_tts import VoiceClonePromptItem
+
+        # The engine's own mode wins, exactly as when a prompt is built from
+        # audio: ``speaker-only`` must not start conditioning on codes.
+        x_vector_only = bool(data.x_vector_only) or self.x_vector_only
+        if x_vector_only:
+            codes = None
+        elif data.ref_code is None:
+            raise TTSError(
+                "This stored prompt has no speech codes, so it cannot be used in "
+                "ICL mode; use --accent-mode speaker-only or rebuild the voice."
+            )
+        else:
+            codes = torch.from_numpy(np.ascontiguousarray(data.ref_code))
+        embedding = torch.from_numpy(
+            np.ascontiguousarray(
+                np.asarray(data.ref_spk_embedding, dtype=np.float32)
+            )
+        )
+        self._prompt = [
+            VoiceClonePromptItem(
+                ref_code=codes,
+                ref_spk_embedding=embedding,
+                x_vector_only_mode=x_vector_only,
+                icl_mode=not x_vector_only,
+                ref_text=data.ref_text or None,
+            )
+        ]
+        self.reference_seconds = 0.0 if x_vector_only else float(seconds)
+        _LOGGER.debug(
+            "Installed a stored clone prompt (%s)",
+            "x-vector" if x_vector_only else f"icl, {self.reference_seconds:.1f}s",
+        )
+
+    def prompt_to_data(
+        self,
+        *,
+        backend: str = "qwen",
+        model: str = "tts_base",
+        fingerprint: str = "",
+    ) -> PromptData:
+        """The current prompt as plain data, ready to be stored.
+
+        The tensors are moved to the CPU and the embedding is widened to float32,
+        which is what makes the result reusable on a different device and dtype.
+
+        Args:
+            backend: Which synthesiser this card belongs to; the file is stored
+                per backend, and another one will refuse to install it.
+            model: Registry name of the checkpoint that produced it.
+            fingerprint: Hash of that checkpoint's configuration.
+
+        Raises:
+            TTSError: When no prompt has been built, or it has no embedding.
+        """
+        if not isinstance(self._prompt, list) or not self._prompt:
+            raise TTSError("No clone prompt has been built yet; nothing to save.")
+        item = self._prompt[0]
+        embedding = getattr(item, "ref_spk_embedding", None)
+        if embedding is None:
+            raise TTSError("The current prompt has no speaker embedding to save.")
+        code = getattr(item, "ref_code", None)
+        return PromptData(
+            ref_code=None if code is None else _as_numpy(code),
+            ref_spk_embedding=np.asarray(
+                _as_numpy(embedding), dtype=np.float32
+            ).reshape(-1),
+            x_vector_only=bool(getattr(item, "x_vector_only_mode", False)),
+            ref_text=str(getattr(item, "ref_text", "") or ""),
+            backend=backend,
+            model=model,
+            fingerprint=fingerprint,
+        )
+
     def prepare_hybrid_prompt(
         self,
         *,
@@ -586,6 +711,7 @@ class TTSEngine:
         accent_text: str,
         timbre: DonorClip | None = None,
         timbre_audio: Path | str | None = None,
+        timbre_item: PromptData | None = None,
     ) -> None:
         """Take the accent from one clip and the timbre from another.
 
@@ -604,6 +730,8 @@ class TTSEngine:
                 the speech codes against the reference text.
             timbre: Speaker to keep, taken from the source video.
             timbre_audio: Speaker to keep, taken from a file.
+            timbre_item: Speaker to keep, taken from a stored prompt's embedding.
+                When given, no timbre audio is encoded at all.
 
         Raises:
             TTSError: If the accent transcript is missing, neither timbre source is
@@ -614,7 +742,7 @@ class TTSEngine:
                 "accent_text is required: the accent clip's transcript is what "
                 "aligns its speech codes so they can condition pronunciation."
             )
-        if timbre is None and timbre_audio is None:
+        if timbre is None and timbre_audio is None and timbre_item is None:
             raise TTSError("prepare_hybrid_prompt needs a timbre source.")
 
         with timed(
@@ -628,7 +756,17 @@ class TTSEngine:
 
             # x-vector mode returns the speaker embedding without needing a
             # transcript (its speech codes are discarded anyway).
-            if timbre is not None:
+            if timbre_item is not None:
+                # A stored prompt already holds the embedding, so the encode this
+                # branch exists to avoid is skipped entirely.
+                import torch
+
+                timbre_embedding = torch.from_numpy(
+                    np.ascontiguousarray(
+                        np.asarray(timbre_item.ref_spk_embedding, dtype=np.float32)
+                    )
+                )
+            elif timbre is not None:
                 timbre_items = self.model.create_voice_clone_prompt(
                     ref_audio=(
                         np.asarray(timbre.samples, dtype=np.float32),
@@ -647,9 +785,9 @@ class TTSEngine:
         # Keep the accent item's ref_code/ref_text/flags so `ref_ids` stay aligned
         # with the codes, and swap in the other clip's speaker embedding.
         try:
-            combined = replace(
-                accent_items[0], ref_spk_embedding=timbre_items[0].ref_spk_embedding
-            )
+            if timbre_item is None:
+                timbre_embedding = timbre_items[0].ref_spk_embedding
+            combined = replace(accent_items[0], ref_spk_embedding=timbre_embedding)
         except (AttributeError, TypeError) as exc:  # pragma: no cover - library change
             raise TTSError(
                 "Could not combine accent and timbre prompts; the installed qwen-tts "
@@ -665,7 +803,7 @@ class TTSEngine:
         # read after ``replace`` only because the two live in different items -
         # ``replace`` returns a copy and leaves the original untouched.
         self._accent_spk_embedding = getattr(accent_items[0], "ref_spk_embedding", None)
-        self._timbre_spk_embedding = getattr(timbre_items[0], "ref_spk_embedding", None)
+        self._timbre_spk_embedding = timbre_embedding
 
     # -- blended reference (two-stage) ------------------------------------- #
 

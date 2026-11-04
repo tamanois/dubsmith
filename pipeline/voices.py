@@ -1,17 +1,25 @@
-"""Saved, labeled voice prints: the design/clone voice library.
+"""Saved, labeled voices: the design/clone/import voice library.
 
-A *voice print* is one short WAV plus a sidecar manifest. It is the reusable form
-of a voice: the Base checkpoint clones from the WAV (with its exact transcript),
-so the print can be used for as many lines, languages and jobs as the user wants
-without regenerating it.
+A *voice* is a directory holding one short WAV, a sidecar manifest and, for each
+synthesiser that has encoded it, one *card* under ``prompts/``. The WAV is the
+voice itself and works with every backend; a card is derived data that lets one
+specific backend skip encoding the clip again.
 
-Two sources, one representation:
+Cards are named after the backend and the model configuration that produced them
+(``prompts/qwen-d77fb851b8be.npz``), so a card is not portable between backends -
+Qwen's speech codes mean nothing to Fish - and switching checkpoints keeps both
+cards instead of rebuilding the first one later.
+
+Three sources, one representation:
 
 * ``design`` -- the VoiceDesign checkpoint renders a neutral, phonetically varied
   passage in the voice a text description asks for.
-* ``clone`` -- the Base checkpoint renders that same passage in a voice cloned
-  from a donated clip (and its transcript). Storing the *rendered passage* rather
-  than the donor keeps every print a consistent length and format.
+* ``clone`` -- a checkpoint encodes a donated clip (and its exact transcript)
+  once, and the donor audio is kept beside the card, so the voice can still be
+  heard, re-encoded by another model, or rebuilt from scratch.
+* ``import`` -- an existing clip is registered verbatim, with no model involved.
+  Its transcript is optional: without one the voice clones from the speaker
+  embedding alone (x-vector mode), which is less faithful but needs no text.
 
 The module holds only pure data handling and the cache. It never imports a model:
 the synthesiser is supplied by the caller, so every function here is testable
@@ -21,11 +29,12 @@ caches the per-language accent clips the same way.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,28 +47,43 @@ from .errors import TTSError, VoiceNotFoundError
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "PromptData",
     "VoicePrint",
+    "cards_in",
     "default_label",
     "delete_voice",
+    "find_prompt",
+    "import_voice",
     "list_voices",
+    "load_prompt",
     "load_voice",
+    "prompt_path",
+    "save_prompt",
     "save_voice",
     "slugify_label",
     "unique_label",
+    "voice_content",
     "voice_paths",
 ]
 
 #: Names inside a voice's own directory. One directory per voice keeps the audio,
-#: the manifest and any future artifact (an embedding, a preview) together, so a
+#: the manifest, the encodings and any future artifact (a preview) together, so a
 #: voice can be copied or deleted as a unit.
 WAV_NAME = "voice.wav"
 MANIFEST_NAME = "voice.json"
+#: Encodings live in their own folder, one file per backend and model. They are
+#: derived data, and several may coexist: switching checkpoints keeps both cards.
+PROMPT_DIR = "prompts"
+#: Where an encoding written before cards were namespaced may still live. Read as
+#: a Qwen card; never written to again.
+LEGACY_PROMPT_NAME = "prompt.npz"
 
 #: Manifest schema version, so a future change can migrate rather than guess.
-MANIFEST_VERSION = 1
+#: v2 never listed the encodings; a v1 manifest loads unchanged.
+MANIFEST_VERSION = 2
 
-#: Where a voice print came from. Anything else is a programming error.
-_SOURCES = ("design", "clone")
+#: Where a voice came from. Anything else is a programming error.
+_SOURCES = ("design", "clone", "import")
 
 #: Characters a label may keep. Everything else becomes a separator, which keeps
 #: labels safe as directory names and immune to path traversal.
@@ -144,6 +168,247 @@ def voice_paths(root: Path | str, label: str) -> tuple[Path, Path, Path]:
     return directory, directory / WAV_NAME, directory / MANIFEST_NAME
 
 
+#: Version of the card payload, independent of the manifest version: the encoding
+#: is produced by a different piece of code (the checkpoint wrapper) and may need
+#: to change on its own schedule.
+PROMPT_VERSION = 2
+
+
+def _card_slug(value: str) -> str:
+    """A path-safe fragment of a card's name.
+
+    Backends and fingerprints are internal values, but a card is a file in a
+    folder the user can edit, so both are reduced before they reach a path.
+    """
+    slug = _SLUG_SEPARATOR.sub("-", str(value).strip().lower()).strip("-")
+    return slug[:32] or "unknown"
+
+
+def voice_content(wav: Path | str, ref_text: str = "") -> str:
+    """Short hash of what a card was derived from: the clip and its transcript.
+
+    A card is only valid for the exact audio and text it was encoded from, so
+    re-registering a voice with a different clip or transcript must not reuse it.
+    The wav is read once (a megabyte or so) against an encode pass that costs
+    seconds, and whitespace is folded so cosmetic edits do not invalidate a card.
+    """
+    digest = hashlib.sha256()
+    try:
+        digest.update(Path(wav).read_bytes())
+    except OSError:
+        digest.update(b"<missing>")
+    digest.update(b"\x00")
+    digest.update(" ".join(str(ref_text or "").split()).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def prompt_path(
+    directory: Path | str, backend: str, fingerprint: str
+) -> Path:
+    """Where the card for this backend and model configuration lives.
+
+    The name is derived, so a card is found without opening anything:
+    ``prompts/qwen-d77fb851b8be.npz``. One file per (backend, model), which is
+    what lets two checkpoints keep their own card side by side.
+    """
+    return (
+        Path(directory)
+        / PROMPT_DIR
+        / f"{_card_slug(backend)}-{_card_slug(fingerprint)}.npz"
+    )
+
+
+@dataclass(frozen=True)
+class PromptData:
+    """A clone prompt as plain data: what one checkpoint encodes a voice into.
+
+    ``ref_code`` is the reference's speech codes (ICL mode only) and
+    ``ref_spk_embedding`` is the speaker embedding. Both are numpy arrays, so
+    this module stays torch-free and the file stays portable; the checkpoint
+    moves them to its own device - and casts the embedding to the talker dtype -
+    when it consumes them, which is what lets one stored card serve any card.
+
+    The four provenance fields say *when the card may be used*: a card belongs to
+    one backend (Qwen's codes mean nothing to Fish), one model configuration, and
+    one specific clip + transcript. Anything else is a wrong voice, not a slow
+    run.
+    """
+
+    #: Speech codes, shape ``(frames, quantizers)`` or ``(frames,)``. ``None`` in
+    #: x-vector mode, where the codes are deliberately unused.
+    ref_code: np.ndarray | None
+    #: The speaker embedding, shape ``(dim,)``.
+    ref_spk_embedding: np.ndarray
+    #: True when only the embedding is used, so no transcript is needed.
+    x_vector_only: bool = False
+    #: Exact transcript the codes were aligned against; empty in x-vector mode.
+    ref_text: str = ""
+    #: Which synthesiser produced the encoding. Not portable between backends.
+    backend: str = "qwen"
+    #: Registry name of the checkpoint that produced it, for messages.
+    model: str = "tts_base"
+    #: Hash of the checkpoint configuration that produced the encoding.
+    fingerprint: str = ""
+    #: Hash of the clip and transcript it was derived from (:func:`voice_content`).
+    content: str = ""
+
+
+def save_prompt(directory: Path | str, data: PromptData) -> Path:
+    """Write one card atomically and return its path.
+
+    The destination is :func:`prompt_path`, so a second model never overwrites the
+    first one's card. npz rather than a pickled tensor file: a voice directory is
+    meant to be copied between machines, and loading a shared file must not be
+    able to run code. Each card is a few tens of kilobytes.
+    """
+    directory = Path(directory)
+    target = prompt_path(directory, data.backend, data.fingerprint)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".pending-{target.name}")
+    content = data.content or voice_content(directory / WAV_NAME, data.ref_text)
+    meta = {
+        "version": PROMPT_VERSION,
+        "backend": data.backend,
+        "model": data.model,
+        "fingerprint": data.fingerprint,
+        "content": content,
+        "x_vector_only": bool(data.x_vector_only),
+        "ref_text": data.ref_text,
+        "codes_shape": (
+            None if data.ref_code is None else list(np.shape(data.ref_code))
+        ),
+        "embedding_dim": int(np.size(data.ref_spk_embedding)),
+    }
+    payload: dict[str, Any] = {
+        "meta": np.array(json.dumps(meta, ensure_ascii=False)),
+        "ref_spk_embedding": np.asarray(
+            data.ref_spk_embedding, dtype=np.float32
+        ),
+    }
+    if data.ref_code is not None:
+        # Keep the tokenizer's integer dtype: the decoder concatenates these
+        # codes with freshly generated ones, and a dtype change would break it.
+        payload["ref_code"] = np.asarray(data.ref_code)
+    try:
+        np.savez(tmp, **payload)
+        os.replace(tmp, target)
+    finally:
+        # A failed save must not leave scratch files behind.
+        tmp.unlink(missing_ok=True)
+    _LOGGER.info("Saved the %s card to %s", data.backend, target)
+    return target
+
+
+def load_prompt(path: Path | str) -> PromptData:
+    """Read a stored card.
+
+    Raises:
+        VoiceNotFoundError: If the file is missing, unreadable, or incomplete.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise VoiceNotFoundError(f"No voice card at {source}.")
+    try:
+        with np.load(source, allow_pickle=False) as archive:
+            meta = json.loads(str(archive["meta"]))
+            embedding = np.asarray(archive["ref_spk_embedding"], dtype=np.float32)
+            codes = (
+                np.asarray(archive["ref_code"])
+                if "ref_code" in archive.files
+                else None
+            )
+    except (OSError, ValueError, KeyError) as exc:
+        raise VoiceNotFoundError(
+            f"Voice card at {source} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(meta, dict):
+        raise VoiceNotFoundError(f"Voice card at {source} has invalid metadata.")
+    if embedding.size == 0:
+        raise VoiceNotFoundError(f"Voice card at {source} has no speaker embedding.")
+    x_vector_only = bool(meta.get("x_vector_only", False))
+    if codes is None and not x_vector_only:
+        raise VoiceNotFoundError(
+            f"Voice card at {source} has no speech codes for ICL mode."
+        )
+    return PromptData(
+        ref_code=codes,
+        ref_spk_embedding=embedding,
+        x_vector_only=x_vector_only,
+        ref_text=str(meta.get("ref_text") or ""),
+        backend=str(meta.get("backend") or "qwen"),
+        model=str(meta.get("model") or meta.get("base_model") or "tts_base"),
+        fingerprint=str(meta.get("fingerprint") or ""),
+        content=str(meta.get("content") or ""),
+    )
+
+
+def cards_in(directory: Path | str) -> dict[tuple[str, str], Path]:
+    """Every card stored in a voice folder, keyed by ``(backend, fingerprint)``.
+
+    Best effort: an unreadable card is skipped rather than hiding the others, and
+    a legacy root ``prompt.npz`` counts as whatever it declares itself to be.
+    Derived data, so an empty result is normal.
+    """
+    directory = Path(directory)
+    found: dict[tuple[str, str], Path] = {}
+    for path in sorted((directory / PROMPT_DIR).glob("*.npz")):
+        if path.name.startswith("."):
+            continue
+        try:
+            data = load_prompt(path)
+        except VoiceNotFoundError as exc:
+            _LOGGER.debug("Skipping unreadable card %s: %s", path, exc)
+            continue
+        found.setdefault((data.backend, data.fingerprint), path)
+    legacy = directory / LEGACY_PROMPT_NAME
+    if legacy.is_file():
+        try:
+            data = load_prompt(legacy)
+        except VoiceNotFoundError as exc:
+            _LOGGER.debug("Skipping unreadable card %s: %s", legacy, exc)
+        else:
+            found.setdefault((data.backend, data.fingerprint), legacy)
+    return found
+
+
+def find_prompt(
+    directory: Path | str,
+    backend: str,
+    fingerprint: str,
+    *,
+    ref_text: str = "",
+) -> Path | None:
+    """The card for exactly this backend, model and voice content, if any.
+
+    An exact match only. Cards for other checkpoints are *kept* beside it, so
+    switching models is instant in both directions, and a card whose clip or
+    transcript no longer matches is treated as absent rather than trusted: it
+    would be a different voice.
+    """
+    directory = Path(directory)
+    expected = voice_content(directory / WAV_NAME, ref_text)
+    candidate = prompt_path(directory, backend, fingerprint)
+    options = [candidate]
+    legacy = directory / LEGACY_PROMPT_NAME
+    if legacy.is_file():
+        options.append(legacy)
+    for path in options:
+        if not path.is_file():
+            continue
+        try:
+            data = load_prompt(path)
+        except VoiceNotFoundError as exc:
+            _LOGGER.debug("Ignoring unreadable card %s: %s", path, exc)
+            continue
+        if data.backend != backend or data.fingerprint != fingerprint:
+            continue
+        # A card written before contents were recorded cannot be proven current,
+        # so it is not used; the next encode replaces it in the new location.
+        if data.content and data.content == expected:
+            return path
+    return None
+
+
 @dataclass(frozen=True)
 class VoicePrint:
     """A saved voice: its reference clip, transcript and provenance."""
@@ -171,6 +436,10 @@ class VoicePrint:
     rate_band: str = "normal"
     #: Length of the reference clip in seconds.
     seconds: float = 0.0
+    #: Stored encodings that belong to this voice, keyed by
+    #: ``(backend, fingerprint)``. Derived data: any of them may be deleted, and
+    #: several coexist because each model keeps its own card.
+    cards: dict[tuple[str, str], Path] = field(default_factory=dict)
 
     @property
     def directory(self) -> Path:
@@ -182,8 +451,17 @@ class VoicePrint:
         """Path of the sidecar manifest."""
         return self.directory / MANIFEST_NAME
 
+    def card_for(self, backend: str, fingerprint: str) -> Path | None:
+        """The stored encoding for one backend and model, if this voice has it."""
+        return self.cards.get((backend, fingerprint))
+
     def to_manifest(self) -> dict[str, Any]:
-        """Serialisable form, written as ``voice.json``."""
+        """Serialisable form, written as ``voice.json``.
+
+        Encodings are deliberately absent: they are discovered on disk, so a card
+        can be copied in or deleted without editing the manifest, and no entry
+        can point at a file that no longer exists.
+        """
         return {
             "version": MANIFEST_VERSION,
             "label": self.label,
@@ -199,11 +477,17 @@ class VoicePrint:
 
     def summary(self) -> str:
         """One-line human description for ``voices --list``."""
-        origin = (
-            f'design: "{self.instruct}"'
-            if self.source == "design" and self.instruct
-            else self.source
-        )
+        if self.source == "design" and self.instruct:
+            origin = f'design: "{self.instruct}"'
+        elif self.source == "import":
+            origin = "import" if self.ref_text.strip() else "import (no transcript)"
+        elif self.cards:
+            backends = ", ".join(sorted({backend for backend, _ in self.cards}))
+            origin = f"clone + {backends} card"
+            if len(self.cards) > 1:
+                origin += f" ×{len(self.cards)}"
+        else:
+            origin = "clone"
         return (
             f"{self.label:<24}{self.language:<12}{self.seconds:6.1f}s  "
             f"{self.gender}  {self.rate_band:<7}{origin}"
@@ -226,7 +510,10 @@ def _manifest_from_dict(payload: dict[str, Any], *, wav: Path) -> VoicePrint:
             f"Voice {label!r} has an unknown source {source!r} in {manifest}."
         )
     ref_text = str(payload.get("ref_text") or "")
-    if not ref_text.strip():
+    # A designed or cloned voice is backed by audio whose transcript is known, and
+    # ICL cloning needs it. An imported clip may legitimately have none: the voice
+    # then clones from the speaker embedding alone.
+    if source != "import" and not ref_text.strip():
         raise VoiceNotFoundError(
             f"Voice {label!r} has no transcript in {manifest}; it cannot be used to clone."
         )
@@ -251,7 +538,18 @@ def _manifest_from_dict(payload: dict[str, Any], *, wav: Path) -> VoicePrint:
         gender=str(payload.get("gender") or "u"),
         rate_band=str(payload.get("rate_band") or "normal"),
         seconds=seconds,
+        cards=_cards(wav),
     )
+
+
+def _cards(wav: Path) -> dict[tuple[str, str], Path]:
+    """The stored encodings beside ``wav``, discovered rather than declared.
+
+    A card is derived data, so the manifest does not list them: one can be copied
+    in, deleted, or belong to a model that is not installed right now, and none of
+    that should touch ``voice.json``.
+    """
+    return cards_in(wav.parent)
 
 
 def save_voice(
@@ -264,6 +562,7 @@ def save_voice(
     source: str,
     ref_text: str,
     instruct: str | None = None,
+    prompt: PromptData | None = None,
     force: bool = False,
 ) -> VoicePrint:
     """Write a voice print to ``root/<label>/``.
@@ -281,14 +580,17 @@ def save_voice(
         source: ``design`` or ``clone``.
         ref_text: Exact transcript of ``samples``.
         instruct: The description, for designed voices.
+        prompt: The checkpoint's encoding of ``samples``, when the caller already
+            produced one. Stored under ``prompts/`` for that backend and model.
         force: Overwrite an existing voice with the same label.
 
     Returns:
         The saved :class:`VoicePrint`.
 
     Raises:
-        TTSError: If the clip is empty, the source is unknown, or the label exists
-            and ``force`` is not set.
+        TTSError: If the clip is empty, the source is unknown, the label exists
+            and ``force`` is not set, or a designed/cloned voice has no
+            transcript.
     """
     if source not in _SOURCES:
         raise TTSError(
@@ -299,9 +601,13 @@ def save_voice(
         raise TTSError("Cannot save a voice: the reference clip is empty.")
     if int(sample_rate) <= 0:
         raise TTSError("Cannot save a voice: the sample rate must be positive.")
-    if not ref_text or not ref_text.strip():
+    # A designed or cloned voice is rendered/encoded from a passage whose
+    # transcript is known, and ICL cloning needs it. An imported clip may have
+    # none, in which case it clones from the speaker embedding alone.
+    if source != "import" and (not ref_text or not ref_text.strip()):
         raise TTSError(
-            "Cannot save a voice without its transcript: the clone prompt needs it."
+            "Cannot save a voice without its transcript: the clone prompt needs it. "
+            "Only an imported clip may be saved without one."
         )
 
     directory, wav, manifest = voice_paths(root, label)
@@ -337,6 +643,9 @@ def save_voice(
 
         write_audio(tmp_wav, data, int(sample_rate))
         os.replace(tmp_wav, wav)
+        if prompt is not None:
+            # Written *after* the audio because the card records a hash of it.
+            save_prompt(directory, prompt)
         tmp_json.write_text(
             json.dumps(print_.to_manifest(), indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -347,15 +656,73 @@ def save_voice(
         tmp_wav.unlink(missing_ok=True)
         tmp_json.unlink(missing_ok=True)
 
+    # Cards are never deleted here, not even on an overwrite: one written by a
+    # different model stays valid for that model, and one for the *old* content is
+    # rejected at lookup because it records the clip it was derived from.
+    saved = replace(print_, cards=cards_in(directory))
     _LOGGER.info(
-        "Saved %s voice %r (%s, %.1fs) to %s",
-        print_.source,
-        print_.label,
-        print_.language,
-        print_.seconds,
+        "Saved %s voice %r (%s, %.1fs)%s to %s",
+        saved.source,
+        saved.label,
+        saved.language,
+        saved.seconds,
+        f" with {len(saved.cards)} card(s)" if saved.cards else "",
         directory,
     )
-    return print_
+    return saved
+
+
+def import_voice(
+    root: Path | str,
+    label: str,
+    audio: Path | str | tuple[np.ndarray, int],
+    *,
+    language: str,
+    ref_text: str = "",
+    force: bool = False,
+) -> VoicePrint:
+    """Register an existing clip as a voice, with no model work at all.
+
+    Nothing is rendered or encoded: the clip is copied into the library (mono,
+    at its own rate) and the transcript is stored exactly as given. The first
+    consumer that needs an encoding pays for it once, and can then cache it with
+    :func:`save_prompt`.
+
+    Args:
+        root: Voice-library directory.
+        label: Name to save under; slugified before use.
+        audio: The clip's path, or an ``(samples, sample_rate)`` pair when the
+            caller already decoded it (to transcribe it, for instance).
+        language: Language spoken in the clip.
+        ref_text: Its exact transcript. Optional: without one the voice clones
+            from the speaker embedding alone, which is less faithful.
+        force: Overwrite an existing voice with the same label.
+
+    Returns:
+        The saved :class:`VoicePrint`.
+
+    Raises:
+        TTSError: If the clip cannot be read or holds no audio.
+    """
+    if isinstance(audio, tuple):
+        samples, sample_rate = audio
+    else:
+        from .media import load_audio
+
+        try:
+            samples, sample_rate = load_audio(audio)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a user-facing error
+            raise TTSError(f"Could not read {audio}: {exc}") from exc
+    return save_voice(
+        root,
+        label,
+        samples,
+        sample_rate,
+        language=language,
+        source="import",
+        ref_text=ref_text,
+        force=force,
+    )
 
 
 def load_voice(root: Path | str, label: str) -> VoicePrint:

@@ -23,13 +23,22 @@ attempt yet.
 | `--style-plan is only valid with --backend customvoice` | The LLM-written verbatim instruction is CustomVoice-only. Other backends use `--prosody-plan llm` for structured prosody |
 | `--style-plan-scope only applies with --style-plan llm` | Add `--style-plan llm`, or drop `--style-plan-scope` |
 | `fish-speech is not installed` | Create `.venv-fish` (see [Voices](voices.md#fish-speech-environment)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
-| `index-tts is not installed` | Create `.venv-indextts` (see [Voices](voices.md#indextts2-environment)) or set `INDEXTTS_PYTHON`; weights: `python dub.py models --download tts_index_tts2` |
-| `--emotion-audio` / `--duration is only valid with --backend indextts2` | Those controls are IndexTTS2-only; add `--backend indextts2` or remove the flag |
-| `--emotion-alpha requires --emotion-audio` | Add an emotion reference clip, or drop `--emotion-alpha` |
-| `Fish Speech S2-Pro needs about 24 GB of VRAM` | The 4.56 B model does not fit on a 12 GB card. Retry with `--device cpu` (slow) or use a larger GPU |
-| `A Fish emotion seems to have no effect` | Fish only has documented tags `[excited]`, `[angry]`, `[sad]`, `[whisper]`, `[laughing]`, `[pause]`; an unknown emotion is dropped with a warning. `pace`, `volume` and `breath` have no tag |
+| `--backend fish ... has no --prosody/--emotion/--prosody-plan channel` | Fish takes its delivery from `[tag]` cues in `--text`: write them yourself, or pass `--fish-tag-mode llm` and let the model write them |
+| `Fish Speech S2-Pro needs about 24 GB of VRAM` | That message means the bf16 weights were requested (`--fish-quantize off`) or the int8 path could not start. Drop the flag to use the int8 default, retry with `--device cpu` (slow), or use a larger GPU |
+| `int8 Fish Speech needs torchao` | `.venv-fish/bin/pip install torchao==0.13.0`, or pass `--fish-quantize off` (needs ~24 GB) |
+| `A Fish emotion seems to have no effect` | Fish reads `[tag]` cues from the text; the checkpoint documents a common set but accepts free-form descriptions too (`[tender]`, `[whisper in small voice]`). If a line has no tag at all, nothing changes its delivery |
+| `Fish inline plan changed the words of a line; keeping the original` | The planner rewrote something other than tag placement (a synonym, a dropped word, a translation), so that line is spoken **without tags**. Missing spaces after punctuation (`modestes.Et`) are not a word change and are tolerated. If it keeps happening, shorten the lines or pass `--fish-tag-mode keep` and write the tags yourself |
 | `Unsupported language 'xx'` | Use one of the ten supported languages |
 | `No saved voice named …` | List the library with `python dub.py voices --list`, or create the voice first |
+| `--add needs --lang …` | Say which language the clip is in (`--lang fr`), or pass `--transcribe` and let the ASR detect it |
+| `--transcribe and --clone-text are alternatives` | Pass one or the other: `--transcribe` derives the text, `--clone-text` supplies it |
+| `No speech was recognised in …` | The ASR heard nothing usable (silence, music, very short clip). Pass `--clone-text` with the exact words instead |
+| `No usable qwen card for this model; 1 existing card(s) are kept.` | Informational: the voice was encoded by a different checkpoint (or by an older card format). That card stays, a new one is written beside it, and switching back needs no re-encode |
+| A voice encodes on every run | No card matches *this* model and *this* clip + transcript (the log says `No usable qwen card…`), the card is unreadable, or `VOICES_PROMPT_CACHE=0` is set. `Loaded the stored prompt` means it was reused |
+| A voice folder has several `prompts/qwen-*.npz` cards | Expected: one per model configuration. Each is ~30 KB and only the one matching the current weights is used |
+| A stored card is not used by `--backend fish` | Cards hold one backend's encoding, and are Qwen-only for now. Fish (and CosyVoice3/Chatterbox) always read `voice.wav`, and the log says so |
+| A voice added with `--add` does not sound like the speaker | Without a transcript it clones from the speaker embedding alone. Add `--clone-text` (or `--transcribe`) for ICL, and use a clip with only that one speaker, no music and 3–30 s of speech |
+| The clone drifts away from the donor's voice | Check the transcript: ICL aligns the speech codes against it, so a paraphrased or corrected text yields a different voice. Run `voices … --verify` to have the ASR compare the two |
 | CUDA out of memory | `--device cpu`, or free the GPU (a large local LLM often occupies it). On a multi-GPU box, `--device cuda:1` pins the run to the other card |
 | On a long video, repeatedly | See [Memory on a long video](performance.md#memory-on-a-long-video): check `report.json` → `tts.oom_retries` and `tts.ceiling_shrinks`. The pipeline budgets each batch by decoded audio and releases cached blocks when free memory falls below 3 GB; if the counters are still non-zero, lower `--tts-batch`, or use a shorter reference clip — it is charged once per line |
 | An unexpected amount of VRAM is in use | `--device cuda:1` now genuinely uses the second GPU; the log line and `report.json` → `device` both report the card that was used |

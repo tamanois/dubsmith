@@ -12,6 +12,7 @@ Download everything the MVP needs with::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ __all__ = [
     "download_model",
     "download_many",
     "resolve_model",
+    "model_fingerprint",
     "is_available",
     "registry_status",
     "download_hint",
@@ -85,13 +87,6 @@ REGISTRY: dict[str, ModelSpec] = {
         description="Voice design from text descriptions (P2 accent anchor)",
         license="Apache-2.0",
     ),
-    "tts_cosyvoice": ModelSpec(
-        name="tts_cosyvoice",
-        repo_id="FunAudioLLM/CosyVoice2-0.5B",
-        dir_name="CosyVoice2-0.5B",
-        description="CosyVoice2: cloned voice + per-utterance emotion instruction",
-        license="Apache-2.0",
-    ),
     "tts_cosyvoice3": ModelSpec(
         name="tts_cosyvoice3",
         repo_id="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
@@ -143,19 +138,10 @@ REGISTRY: dict[str, ModelSpec] = {
         dir_name="fish-speech-s2-pro",
         description=(
             "Fish Speech S2-Pro: cloned voice + inline emotion/paralinguistic "
-            "tags (needs ~24 GB VRAM)"
+            "tags (int8 by default, ~6 GB resident; --fish-quantize off needs "
+            "~24 GB)"
         ),
         license="Fish Audio Research License (non-commercial)",
-    ),
-    "tts_index_tts2": ModelSpec(
-        name="tts_index_tts2",
-        repo_id="IndexTeam/IndexTTS-2",
-        dir_name="IndexTTS2",
-        description=(
-            "IndexTTS2: cloned voice + a separate emotion reference; output is "
-            "time-fitted by the pipeline's stretcher"
-        ),
-        license="Bilibili IndexTTS License (non-commercial)",
     ),
     "tts_tokenizer": ModelSpec(
         name="tts_tokenizer",
@@ -251,6 +237,42 @@ def resolve_model(name: str, models_dir: Path | str = "models") -> Path:
         )
     _LOGGER.debug("Resolved model %s -> %s", name, root)
     return root
+
+
+#: Files whose *contents* identify a checkpoint's speech pipeline. The weights
+#: are deliberately excluded: hashing several GB costs more than the encode it
+#: would protect, while a different config is exactly the case that must not
+#: reuse an encoding.
+_FINGERPRINT_FILES = ("config.json", "speech_tokenizer/config.json")
+
+
+def model_fingerprint(name: str, models_dir: Path | str = "models") -> str:
+    """Short hash of a model's configuration, for validating derived artifacts.
+
+    A saved voice may carry a clone prompt: speech codes and a speaker embedding
+    produced by one checkpoint. Reusing them against a different checkpoint is a
+    *wrong voice* rather than a slow run, so the prompt records this hash and a
+    mismatch falls back to encoding the reference audio again.
+
+    Args:
+        name: Registry name, e.g. ``tts_base``.
+        models_dir: Root that holds the model directories.
+
+    Returns:
+        Twelve hex characters; the same value for the same configuration.
+    """
+    root = Path(models_dir) / _spec(name).dir_name
+    digest = hashlib.sha256()
+    digest.update(name.encode("utf-8"))
+    for relative in _FINGERPRINT_FILES:
+        digest.update(relative.encode("utf-8"))
+        try:
+            digest.update((root / relative).read_bytes())
+        except OSError:
+            # A missing config only happens on a manual/incomplete checkout;
+            # folding that into the hash keeps the answer stable and cheap.
+            digest.update(b"<missing>")
+    return digest.hexdigest()[:12]
 
 
 def _directory_size(root: Path) -> int:
