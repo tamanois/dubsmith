@@ -40,7 +40,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy==1.26.4",
+    "numpy==2.2.6",
     "typing_extensions",
     "torch>=2.1.0",
     "soundfile",

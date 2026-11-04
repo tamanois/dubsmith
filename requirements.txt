@@ -20,7 +20,7 @@
 # System binaries (ffmpeg, rubberband) are NOT installed here.
 # See README.md -> "Prerequisites" for the copy-paste install commands.
 
-numpy==1.26.4
+numpy==2.2.6
 typing_extensions==4.16.0
 
 # Deep-learning runtime. Any 2.1+ release works; see the index note above.
@@ -31,14 +31,14 @@ soundfile==0.14.0
 librosa==0.11.0
 
 # Validation
-pydantic==2.13.5
+pydantic==2.14.2
 
 # Pipeline stages
 qwen-tts==0.1.1        # voice cloning / TTS (Qwen3-TTS)
 faster-whisper==1.2.1  # ASR (ships its own Silero VAD, no extra dependency)
 huggingface-hub>=0.23  # model download and cache resolution
 pyloudnorm==0.2.0      # EBU R128 loudness measurement + normalisation
-openai==3.19.0         # OpenAI-compatible client used for translation
+openai==3.42.0         # OpenAI-compatible client used for translation
 
 # Optional: multi-speaker dubbing. Provides the speaker-verification model
 # (ERes2NetV2, ~30 MB, cached under ~/.cache/modelscope) used to tell voices
