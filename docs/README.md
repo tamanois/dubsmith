@@ -5,6 +5,7 @@ Start with the [README](../README.md) for the short version, then pick a guide:
 | Guide | Read it when you want to… |
 |---|---|
 | [Setup](setup.md) | install from scratch, configure the LLM endpoint, download models, install optional backends |
+| [Docker](docker.md) | build a portable image with all dependencies (model weights excluded) |
 | [Usage](usage.md) | choose a command, see worked examples, iterate quickly |
 | [Options](options.md) | look up a flag, default, or environment variable |
 | [Voices](voices.md) | design, clone, or import a saved voice; understand accent modes and cards |

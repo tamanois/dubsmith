@@ -1,0 +1,56 @@
+# Local data, weights and artifacts. They are mounted at runtime instead of
+# being baked into the image.
+/models/
+/voices/
+/input/
+/output*/
+/third_party/
+/.venv*/
+/.stretch_tmp/
+
+# Local configuration (may contain API keys); keep the template.
+.env
+.env.*
+!.env.example
+
+# Python and build leftovers
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Git history is not needed inside the image
+.git/
+.gitattributes
+
+# Large documentation media
+docs/media/
+
+# Model weights and media outside the ignored directories
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.mp4
+*.mkv
+*.mov
+*.webm
+
+# Logs and editor cruft
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

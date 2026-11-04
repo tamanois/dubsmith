@@ -1486,7 +1486,8 @@ above is not read as "finished".
 - No coverage measurement, so the >85% target is unverified. CI now exists
   (`.github/workflows/ci.yml`: Python 3.10 and 3.12 on a CPU-only runner) and runs
   the whole suite, but it does not measure coverage.
-- No `Dockerfile`, no `scripts/`.
+- No `scripts/`; a `Dockerfile` provides an optional portable image (models
+  excluded) and is not used by CI.
 - No real tiny-fixture integration test; every heavy part is faked.
 - `structlog`/`Loguru` are not used (stdlib logging), but every record already carries
   a `job_id` via `pipeline/logging_utils.py`.

@@ -1,7 +1,8 @@
 # Setup
 
 Full installation and configuration. For the copy-paste happy path, see
-[Quick start](../README.md#quick-start).
+[Quick start](../README.md#quick-start). For a container image with every
+dependency, see [Docker](docker.md).
 
 ## Hardware requirements
 
@@ -261,13 +262,13 @@ pip install \
   "lightning==2.2.4" "gdown==5.1.0" "matplotlib==3.7.5" \
   "pyarrow==18.1.0" "pyworld==0.3.4" "onnxruntime-gpu==1.18.0" \
   "hyperpyyaml==1.2.3" "hydra-core==1.3.2" "omegaconf==2.3.0" \
-  "modelscope==1.20.0" "torchcodec" "setuptools<81"
+  "modelscope==1.20.0" "wget==3.2" "torchcodec" "setuptools<81"
 ```
 
 A few of these are easy to miss:
 
-- `hyperpyyaml`, `hydra-core`, `omegaconf` and `modelscope` are imported by
-  CosyVoice at load time but are not installed by the core project.
+- `hyperpyyaml`, `hydra-core`, `omegaconf`, `modelscope` and `wget` are imported
+  by CosyVoice at load time but are not installed by the core project.
 - `openai-whisper==20250625`, not the older pin in CosyVoice's own
   `requirements.txt`: releases up to 20231117 build with `pkg_resources`, which
   setuptools 81+ no longer ships.

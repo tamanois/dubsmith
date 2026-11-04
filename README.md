@@ -108,6 +108,9 @@ python dub.py say --voice warm-fr --text "Bonjour, ceci est un test."
 For the full setup matrix — CPU-only installs, CUDA 12 libraries for GPU ASR,
 optional backends, macOS notes, `MODELS_DIR` — see [docs/setup.md](docs/setup.md).
 
+Prefer containers? The repository ships an optional `Dockerfile` with every
+dependency (models excluded); see [docs/docker.md](docs/docker.md).
+
 ---
 
 ## Main commands
