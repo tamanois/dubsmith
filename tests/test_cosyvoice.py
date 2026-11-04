@@ -286,6 +286,21 @@ def test_worker_missing_package_is_actionable(
         engine._run_worker(tmp_path / "request.json", tmp_path)
 
 
+def test_worker_missing_third_party_module_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "ModuleNotFoundError: No module named 'hyperpyyaml'"
+
+    monkeypatch.setattr("pipeline.cosyvoice.subprocess.run", lambda *a, **k: Failed())
+    engine = CosyVoiceEngine("m", device="cpu")
+
+    with pytest.raises(DependencyError, match="hyperpyyaml"):
+        engine._run_worker(tmp_path / "request.json", tmp_path)
+
+
 def test_missing_package_is_reported_by_the_engine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

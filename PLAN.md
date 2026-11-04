@@ -37,7 +37,7 @@
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1354 passing | `tests/` |
+| Tests | ✅ 1356 tests (1353 passed, 3 skipped) | `tests/` |
 
 Verification performed:
 

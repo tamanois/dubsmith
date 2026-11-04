@@ -2532,6 +2532,7 @@ class Pipeline:
                         [texts[index] for index in indexes],
                         language=self.job.target_language,
                     )
+                    recorder.set_plan_source("llm")
                 except Exception as exc:  # noqa: BLE001 - fall back on any failure
                     if self.job.prosody_plan == "llm":
                         raise
@@ -2567,6 +2568,7 @@ class Pipeline:
             )
             try:
                 planned_specs = planner.plan([texts[index] for index in indexes])
+                recorder.set_plan_source("llm")
             except Exception as exc:  # noqa: BLE001 - fall back on any failure
                 if self.job.prosody_plan == "llm":
                     raise

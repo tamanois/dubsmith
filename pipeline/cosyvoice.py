@@ -22,6 +22,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,22 @@ class CosyVoiceEngine:
                     "cosyvoice could not be imported by the worker. Clone the "
                     "CosyVoice repository and install its Matcha-TTS submodule "
                     "(see docs/setup.md)."
+                )
+            missing = re.search(
+                r"ModuleNotFoundError: No module named '([^']+)'", stderr
+            )
+            if missing is not None:
+                module = missing.group(1)
+                raise DependencyError(
+                    f"the CosyVoice worker is missing the Python module "
+                    f"{module!r}. Install the CosyVoice dependencies from "
+                    "docs/setup.md and retry."
+                    + (
+                        " 'pkg_resources' comes from setuptools: install "
+                        "'setuptools<81' (lightning 2.2.4 imports it)."
+                        if module == "pkg_resources"
+                        else ""
+                    )
                 )
             tail = "\n".join(stderr.splitlines()[-12:])
             raise TTSError(

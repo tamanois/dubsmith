@@ -134,17 +134,27 @@ class TestExtractAndMux:
         assert command[command.index("-ar") + 1] == "16000"
         assert command[-1] == str(out)
 
-    def test_mux_audio_copies_video_and_shortest(
+    def test_mux_audio_caps_at_video_duration(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         captured: list[list[str]] = []
         monkeypatch.setattr(media, "require_binary", lambda *a, **k: "/usr/bin/ffmpeg")
         monkeypatch.setattr(media, "run_command", lambda cmd, **k: captured.append(list(cmd)))
+        monkeypatch.setattr(
+            media,
+            "probe",
+            lambda *a, **k: media.MediaInfo(
+                duration_s=12.5, has_audio=True, has_video=True
+            ),
+        )
 
         media.mux_audio(tmp_path / "in.mp4", tmp_path / "dub.wav", tmp_path / "out.mp4")
         command = captured[0]
         assert command[command.index("-c:v") + 1] == "copy"
-        assert "-shortest" in command
+        # `-shortest` would end at the SRT's last cue start and truncate the
+        # video, so the mux is capped at the video duration instead.
+        assert "-shortest" not in command
+        assert command[command.index("-t") + 1] == "12.500"
 
 
 class TestAudioIo:
@@ -173,7 +183,12 @@ class TestAudioIo:
         loaded, sample_rate = media.load_audio(path, sample_rate=24000)
         assert sample_rate == 24000
         assert loaded.size == pytest.approx(2400, abs=2)
+    def test_unreadable_file_raises_a_media_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "clip.mp4"
+        path.write_bytes(b"not actually audio")
 
+        with pytest.raises(MediaError, match="pass it with --video"):
+            media.load_audio(path)
     def test_resample_noop_when_rates_match(self) -> None:
         samples = np.ones(100, dtype=np.float32)
         assert media.resample(samples, 24000, 24000) is not None

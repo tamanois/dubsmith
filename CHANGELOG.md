@@ -32,6 +32,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Dubbing no longer truncates the muxed video and audio to the start of the
+  last subtitle cue. `mux_audio` caps the output at the video's own duration
+  instead of relying on `-shortest`, which misread the SRT stream length.
+- Passing a video container to `--audio` now raises an actionable `MediaError`
+  instead of leaking a raw `LibsndfileError` traceback.
+- `--prosody-plan auto` now records `plan_source: "llm"` in `prosody.json` when
+  the plan succeeded; previously only `llm` and failures were recorded, so a
+  successful automatic plan looked like planning was off.
+- CosyVoice setup instructions now install every runtime import
+  (`hyperpyyaml`, `hydra-core`, `omegaconf`, `modelscope`), `torchcodec` for
+  recent torchaudio, and `setuptools<81` for lightning 2.2.4. The whisper pin
+  moves to 20250625 because older releases need `pkg_resources` to build.
+- A missing CosyVoice dependency now names the module and points at the setup
+  guide instead of printing a traceback.
+- The Fish setup guide now provides the full PortAudio-free dependency list, so
+  installing on a stock machine does not stop at the `pyaudio` build, and it
+  explains that the resulting `pip check` warning is harmless.
 - Documentation links, test counts, and setup instructions no longer point at
   removed anchors or private sample paths.
 - Fish S2-Pro is clearly marked as non-commercial and remains optional.

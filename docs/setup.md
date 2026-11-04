@@ -63,12 +63,15 @@ Python **3.10–3.12** is required (developed and tested on 3.10.12; CI covers
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install .              # or: pip install -r requirements.txt
+pip install .              # installs the package and the `dub` command
 pip check
 ```
 
 The package installs a `dub` command, so `python dub.py --target fr` and
-`dub --target fr` are the same thing. Optional features are extras:
+`dub --target fr` are the same thing. `pip install -r requirements.txt` installs
+only the dependencies: it is useful for a source checkout where you run
+`python dub.py`, but it does not create the `dub` console script. Optional
+features are extras:
 
 ```bash
 pip install ".[background]"    # Demucs: keep the original music and ambience
@@ -254,13 +257,31 @@ git clone --depth 1 --recursive https://github.com/FunAudioLLM/CosyVoice.git thi
 
 pip install \
   "diffusers==0.29.0" "conformer==0.3.2" "x-transformers==2.11.24" \
-  "wetext==0.0.4" "inflect==7.3.1" "openai-whisper==20231117" \
+  "wetext==0.0.4" "inflect==7.3.1" "openai-whisper==20250625" \
   "lightning==2.2.4" "gdown==5.1.0" "matplotlib==3.7.5" \
-  "pyarrow==18.1.0" "pyworld==0.3.4" "onnxruntime-gpu==1.18.0"
+  "pyarrow==18.1.0" "pyworld==0.3.4" "onnxruntime-gpu==1.18.0" \
+  "hyperpyyaml==1.2.3" "hydra-core==1.3.2" "omegaconf==2.3.0" \
+  "modelscope==1.20.0" "torchcodec" "setuptools<81"
 ```
 
-CosyVoice's own `requirements.txt` pins `torch==2.3.1`; the project accepts any
-`torch>=2.1.0`, so torch 2.3.1 is fine. `onnxruntime-gpu` replaces the CPU
+A few of these are easy to miss:
+
+- `hyperpyyaml`, `hydra-core`, `omegaconf` and `modelscope` are imported by
+  CosyVoice at load time but are not installed by the core project.
+- `openai-whisper==20250625`, not the older pin in CosyVoice's own
+  `requirements.txt`: releases up to 20231117 build with `pkg_resources`, which
+  setuptools 81+ no longer ships.
+- `setuptools<81` for the same reason at *runtime*: `lightning==2.2.4` imports
+  `pkg_resources`. Keep the pin installed; re-running `pip install .` can
+  upgrade setuptools again.
+- `torchcodec` on torchaudio 2.9+ (which modern torch pulls in). CosyVoice calls
+  `torchaudio.load(..., backend="soundfile")`, and recent torchaudio routes that
+  through torchcodec instead. Install the matching CPU or CUDA build.
+
+CosyVoice's own `requirements.txt` pins `torch==2.3.1`. The project accepts any
+`torch>=2.1.0`, and CosyVoice runs in a child process that uses the main
+environment's torch, so there is no need to downgrade it; do not install torch
+2.3.1 into the Qwen environment. `onnxruntime-gpu` replaces the CPU
 `onnxruntime` distribution; if its CUDA provider cannot load
 (`libcublasLt.so.11`), the ONNX frontend falls back to the CPU and synthesis
 still works.
@@ -325,20 +346,39 @@ checkpoint. Install it in its own environment:
 ```bash
 python3 -m venv .venv-fish
 git clone --depth 1 https://github.com/fishaudio/fish-speech.git third_party/fish-speech
-.venv-fish/bin/pip install -e third_party/fish-speech
+```
+
+Fish's `pyaudio` dependency is only for its microphone demo, and this pipeline
+never records audio. Without PortAudio headers the plain
+`.venv-fish/bin/pip install -e third_party/fish-speech` fails while building
+`pyaudio`, so install the runtime dependencies (everything in Fish's
+`pyproject.toml` except `pyaudio`) and then the checkout itself:
+
+```bash
+.venv-fish/bin/pip install \
+  "numpy" "torch==2.8.0" "torchaudio==2.8.0" "transformers==5.19.0" \
+  "hydra-core>=1.3.2" "natsort>=8.4.0" "einops>=0.7.0" \
+  "librosa>=0.10.1" "kui>=1.6.0" "uvicorn>=0.30.0" "loguru>=0.6.0" \
+  "pyrootutils>=1.0.4" "resampy>=0.4.3" "einx[torch]==0.2.2" \
+  "pydub" "modelscope==1.17.1" "opencc-python-reimplemented==0.1.7" \
+  "silero-vad" "ormsgpack" "tiktoken>=0.8.0" "pydantic==2.9.2" \
+  "cachetools" "descript-audio-codec" "safetensors" \
+  "tokenizers==0.23.2" "soundfile>=0.12.1"
+.venv-fish/bin/pip install --no-deps -e third_party/fish-speech
 .venv-fish/bin/pip install torchao==0.13.0   # int8 loading
 python dub.py models --download tts_fish   # fishaudio/s2-pro
 ```
+
+`pip check` will still report `fish-speech 3.0.0 requires pyaudio`; that is
+expected on this path and harmless. If PortAudio **is** installed
+(`sudo apt install portaudio19-dev`), replace the explicit dependency list with
+`.venv-fish/bin/pip install -e third_party/fish-speech`, then run the `torchao`
+line.
 
 There is no int8 checkpoint to download: Fish publishes the model in bf16 only,
 so the worker quantizes the 201 linear layers on the CPU after loading and only
 then moves the model to the GPU. `--fish-quantize off` skips that and loads the
 bf16 weights, which is what Fish documents as needing ~24 GB.
-
-Fish's `pyaudio` dependency needs PortAudio headers (`apt install
-portaudio19-dev`). Without them, install the runtime dependencies from its
-`pyproject.toml` and then `.venv-fish/bin/pip install --no-deps -e
-third_party/fish-speech`; the worker never uses audio input.
 
 The backend runs `pipeline.fish_worker` with `.venv-fish/bin/python`; set
 `FISH_PYTHON` to point at another environment.

@@ -9,6 +9,7 @@ attempt yet.
 |---|---|
 | `Missing model: 'whisper_large_v3' …` | Run `python dub.py models --download all` |
 | `Required binary 'ffmpeg' was not found on PATH` | `sudo apt-get install -y ffmpeg` (audio-only jobs still work) |
+| `Could not read audio from … Format not recognised` | The file is a video container. Pass it with `--video`; `--audio` is for audio-only files (or extract the track first) |
 | `… contains no audio stream, so there is nothing to transcribe` | The file is video-only. Verify with `ffprobe -v error -show_entries stream=codec_type file.mp4`; mux an audio track in first |
 | `CUDA is unusable for speech recognition … libcublas.so.12` | Informational — ASR fell back to CPU. Install `nvidia-cublas-cu12 nvidia-cudnn-cu12` for GPU ASR (Setup §3) |
 | `No speech detected in the input` | No audible speech, or the wrong audio track. Check with `ffprobe` |
@@ -23,9 +24,11 @@ attempt yet.
 | `--style-plan is only valid with --backend customvoice` | The LLM-written verbatim instruction is CustomVoice-only. Other backends use `--prosody-plan llm` for structured prosody |
 | `--style-plan-scope only applies with --style-plan llm` | Add `--style-plan llm`, or drop `--style-plan-scope` |
 | `fish-speech is not installed` | Create `.venv-fish` (see [Setup](setup.md#fish-speech-s2-pro-optional-expressive-speech)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
+| `the CosyVoice worker is missing the Python module '…'` | A CosyVoice runtime dependency is absent. Install the full list in [Setup](setup.md#cosyvoice-3-optional-expressive-speech). If the module is `pkg_resources`, run `pip install "setuptools<81"` |
 | `--backend fish ... has no --prosody/--emotion/--prosody-plan channel` | Fish takes its delivery from `[tag]` cues in `--text`: write them yourself, or pass `--fish-tag-mode llm` and let the model write them |
 | `Fish Speech S2-Pro needs about 24 GB of VRAM` | That message means the bf16 weights were requested (`--fish-quantize off`) or the int8 path could not start. Drop the flag to use the int8 default, retry with `--device cpu` (slow), or use a larger GPU |
 | `int8 Fish Speech needs torchao` | `.venv-fish/bin/pip install torchao==0.13.0`, or pass `--fish-quantize off` (needs ~24 GB) |
+| `fish-speech 3.0.0 requires pyaudio, which is not installed` | Expected after the PortAudio-free install: the worker never opens a microphone. Ignore it, or install `portaudio19-dev` and reinstall fish-speech without `--no-deps` |
 | `A Fish emotion seems to have no effect` | Fish reads `[tag]` cues from the text; the checkpoint documents a common set but accepts free-form descriptions too (`[tender]`, `[whisper in small voice]`). If a line has no tag at all, nothing changes its delivery |
 | `Fish inline plan changed the words of a line; keeping the original` | The planner rewrote something other than tag placement (a synonym, a dropped word, a translation), so that line is spoken **without tags**. Missing spaces after punctuation (`modestes.Et`) are not a word change and are tolerated. If it keeps happening, shorten the lines or pass `--fish-tag-mode keep` and write the tags yourself |
 | `Unsupported language 'xx'` | Use one of the ten supported languages |

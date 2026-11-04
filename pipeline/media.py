@@ -331,7 +331,16 @@ def load_audio(
 
     Uses soundfile + librosa so audio-only inputs never require ffmpeg.
     """
-    data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    try:
+        data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    except (OSError, RuntimeError) as exc:
+        # soundfile raises LibsndfileError (a RuntimeError) for unrecognised
+        # containers, and OSError for unreadable paths. Both are expected user
+        # mistakes, so turn them into the friendly error surface.
+        raise MediaError(
+            f"Could not read audio from {path}: {exc} "
+            "If this is a video file, pass it with --video instead of --audio."
+        ) from exc
     if data.ndim > 1:
         data = data.mean(axis=-1)
     data = np.ascontiguousarray(data, dtype=np.float32)
@@ -373,11 +382,14 @@ def mux_audio(
 ) -> Path:
     """Replace the video's audio track, copying the video stream untouched.
 
-    ``-shortest`` prevents an audio track longer than the video from extending
-    the container, and the ``-map`` flags avoid accidentally carrying over the
-    original audio. When ``subtitle_srt`` is given, that track is added to the
-    result (replacing an existing stream in the same language); subtitle streams
-    in other languages are preserved.
+    The output is capped at the video's own duration, which stops a longer dub
+    from extending the container. ``-shortest`` cannot be used for that: the SRT
+    demuxer reports the *start* of the last cue as the end of its stream, so
+    ffmpeg would truncate the video and audio to the last subtitle. The ``-map``
+    flags avoid accidentally carrying over the original audio. When
+    ``subtitle_srt`` is given, that track is added to the result (replacing an
+    existing stream in the same language); subtitle streams in other languages
+    are preserved.
     """
     require_binary("ffmpeg", hint="Install ffmpeg.")
     out = Path(out)
@@ -422,7 +434,15 @@ def mux_audio(
         tag = language_code_for_metadata(subtitle_language)
         if tag:
             command.extend([f"-metadata:s:s:{new_index}", f"language={tag}"])
-    command.extend(["-shortest", str(out)])
+    # Cap at the video's duration rather than using `-shortest`: the SRT
+    # demuxer ends at the start of the last cue, which would cut the video and
+    # audio short whenever a subtitle track is muxed in the same pass.
+    duration = probe(video).duration_s
+    if duration > 0:
+        command.extend(["-t", f"{duration:.3f}"])
+    else:
+        command.append("-shortest")
+    command.append(str(out))
     run_command(command)
     return out
 
