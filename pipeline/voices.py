@@ -563,6 +563,7 @@ def save_voice(
     ref_text: str,
     instruct: str | None = None,
     prompt: PromptData | None = None,
+    provenance: dict[str, Any] | None = None,
     force: bool = False,
 ) -> VoicePrint:
     """Write a voice print to ``root/<label>/``.
@@ -582,6 +583,8 @@ def save_voice(
         instruct: The description, for designed voices.
         prompt: The checkpoint's encoding of ``samples``, when the caller already
             produced one. Stored under ``prompts/`` for that backend and model.
+        provenance: Extra fields to record in the voice's timestamped provenance
+            artifact (model, fingerprint, source clip, transcript origin).
         force: Overwrite an existing voice with the same label.
 
     Returns:
@@ -660,6 +663,32 @@ def save_voice(
     # different model stays valid for that model, and one for the *old* content is
     # rejected at lookup because it records the clip it was derived from.
     saved = replace(print_, cards=cards_in(directory))
+    if provenance is not None:
+        from .provenance import ProvenanceRecorder, timed_provenance_path
+
+        recorder = ProvenanceRecorder(
+            "voice",
+            str(provenance.get("backend") or source),
+            language=language,
+            plan_source=str(provenance.get("plan_source") or "off"),
+        )
+        recorder.record_voice(
+            mode=source,
+            label=saved.label,
+            prompt=instruct,
+            instruct=instruct,
+            ref_audio=provenance.get("ref_audio"),
+            ref_text=ref_text,
+            text_source=provenance.get("text_source"),
+            model=provenance.get("model"),
+            fingerprint=provenance.get("fingerprint"),
+            verify=provenance.get("verify"),
+            detected_language=provenance.get("detected_language"),
+            seconds=round(seconds, 2),
+            gender=saved.gender,
+            rate_band=saved.rate_band,
+        )
+        recorder.write(timed_provenance_path(directory / "provenance"))
     _LOGGER.info(
         "Saved %s voice %r (%s, %.1fs)%s to %s",
         saved.source,
@@ -679,6 +708,7 @@ def import_voice(
     *,
     language: str,
     ref_text: str = "",
+    provenance: dict[str, Any] | None = None,
     force: bool = False,
 ) -> VoicePrint:
     """Register an existing clip as a voice, with no model work at all.
@@ -721,6 +751,7 @@ def import_voice(
         language=language,
         source="import",
         ref_text=ref_text,
+        provenance=provenance,
         force=force,
     )
 

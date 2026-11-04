@@ -862,3 +862,78 @@ def test_backend_capabilities_cover_the_surviving_backends() -> None:
         "chatterbox",
         "customvoice",
     }
+
+
+def test_planner_records_config_and_reply() -> None:
+    from pipeline.provenance import ProvenanceRecorder
+
+    recorder = ProvenanceRecorder("say", "chatterbox", language="French")
+    planner = ProsodyPlanner(
+        base_url="http://x",
+        api_key="secret-key",
+        model="m",
+        temperature=0.2,
+        backend="chatterbox",
+        client=_PlanFakeClient(),
+        recorder=recorder,
+        chunk_size=40,
+    )
+
+    planner.plan(["first", "second"])
+    report = recorder.build()
+
+    assert report.planner is not None
+    assert report.planner.config is not None
+    assert report.planner.config.model == "m"
+    assert report.planner.config.backend == "chatterbox"
+    assert report.planner.config.temperature == 0.2
+    assert report.planner.calls
+    assert "prosody" in report.planner.calls[0].response
+    # The key must never reach the artifact.
+    assert "secret-key" not in json.dumps(report.to_dict())
+
+
+def test_planner_records_the_overview_when_chunked() -> None:
+    from pipeline.provenance import ProvenanceRecorder
+
+    recorder = ProvenanceRecorder("dub", "chatterbox", language="French")
+    planner = ProsodyPlanner(
+        base_url="http://x",
+        api_key="k",
+        model="m",
+        backend="chatterbox",
+        client=_PlanFakeClient(),
+        recorder=recorder,
+        chunk_size=1,
+    )
+
+    planner.plan(["first line", "second line"])
+    report = recorder.build()
+
+    assert report.planner is not None
+    assert report.planner.overview is not None
+    assert report.planner.overview.startswith("A calm opening")
+    assert len(report.planner.calls) >= 2
+
+
+def test_planner_records_a_failure_and_still_raises() -> None:
+    from pipeline.provenance import ProvenanceRecorder
+
+    recorder = ProvenanceRecorder("dub", "chatterbox", language="French")
+    planner = ProsodyPlanner(
+        base_url="http://x",
+        api_key="k",
+        model="m",
+        backend="chatterbox",
+        client=_PlanFakeClient(fail=True),
+        recorder=recorder,
+        chunk_size=40,
+    )
+
+    with pytest.raises(TranslationError):
+        planner.plan(["first"])
+
+    report = recorder.build()
+    assert report.planner is not None
+    assert report.planner.error is not None
+    assert "boom" in report.planner.error

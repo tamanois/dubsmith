@@ -333,6 +333,7 @@ class CosyVoiceEngine:
         prosody: Sequence[ProsodySpec] | None = None,
         ref_text: str | None = None,
         language: str | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> list[np.ndarray]:
         """Synthesise each line in the reference voice.
 
@@ -369,6 +370,17 @@ class CosyVoiceEngine:
             ref_text=ref_text,
             language=language,
         )
+        if trace is not None:
+            for text, instruct, prompt, mode in zip(texts, values, prompts, modes):
+                trace.append(
+                    {
+                        "channel": "cosyvoice",
+                        "text": text,
+                        "instruct": instruct,
+                        "prompt": prompt,
+                        "mode": mode,
+                    }
+                )
         self._ensure_available()
 
         _LOGGER.debug(

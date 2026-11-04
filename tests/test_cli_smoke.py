@@ -1368,7 +1368,14 @@ def test_fish_dispatch_defaults_to_int8(
             captured["quantize"] = kwargs.get("quantize")
 
         def synthesize(
-            self, lines, *, reference, prosody=None, ref_text=None, language=None
+            self,
+            lines,
+            *,
+            reference,
+            prosody=None,
+            ref_text=None,
+            language=None,
+            trace=None,
         ):
             return [np.zeros(240, dtype=np.float32) for _ in lines]
 
@@ -1407,7 +1414,14 @@ def test_fish_quantize_off_reaches_the_engine(
             captured["quantize"] = kwargs.get("quantize")
 
         def synthesize(
-            self, lines, *, reference, prosody=None, ref_text=None, language=None
+            self,
+            lines,
+            *,
+            reference,
+            prosody=None,
+            ref_text=None,
+            language=None,
+            trace=None,
         ):
             return [np.zeros(240, dtype=np.float32) for _ in lines]
 
@@ -1529,6 +1543,7 @@ def test_fish_keep_sends_the_tags_as_written(
             prosody=None,
             ref_text=None,
             language=None,
+            trace=None,
         ):
             captured["lines"] = list(lines)
             return [np.zeros(240, dtype=np.float32) for _ in lines]
@@ -1584,6 +1599,7 @@ def test_fish_llm_dispatch_sends_the_planned_lines(
             prosody=None,
             ref_text=None,
             language=None,
+            trace=None,
         ):
             captured["lines"] = list(lines)
             return [np.zeros(240, dtype=np.float32) for _ in lines]

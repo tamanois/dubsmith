@@ -159,6 +159,7 @@ Fixes a long translation by wording rather than by cutting audio.
 | `--subtitles-mode MODE` | `soft` | How the target subtitles reach the video: `soft` muxes a toggleable track and copies every other stream (other subtitle languages are kept), `burn` draws them into the frames and re-encodes the video, `off` writes the SRT files only. |
 | `--no-subtitles` | off | Skips both SRT files and implies `--subtitles-mode off`. |
 | `--force` | off | Ignores the stage cache and rebuilds everything. |
+| `--no-provenance` | off | Skips the timestamped provenance artifact (`prosody.json` + `provenance/`) that records the per-line prosody, the LLM reply and the text transformations. |
 | `--log-file PATH` | `<job folder>/run.log` | Where the run log is also written, alongside stderr. Created with its parent directory, appended to across runs (each one opens with a `Run started` line, so they stay separable), and stamped with the time so a line can be matched against `report.json` → `stage_seconds`. `LOG_FILE` sets the same default, which is why the log never invalidates a cached stage. |
 | `--log-max-bytes N` | `2097152` | Size at which the log is rotated. Once the file reaches it, it is renamed to `run-<YYYYmmdd-HHMMSS>.log` and a fresh one begins — at a run boundary, so a run is never split across two files. `0` keeps a single file forever. |
 | `--no-log-file` | off | Writes no log file at all — the escape hatch when a caller wants stderr alone. |
@@ -194,6 +195,7 @@ model, the prosody plan, per-line render times and a total.
 | `--fish-tag-mode {keep,llm}` | `keep` | `fish` only. `keep` speaks `--text` exactly as written, tags included; `llm` has the model insert the tags, guarded so the words cannot change. Fish has no `--prosody`/`--emotion`/`--prosody-plan` channel. |
 | `--fish-quantize {int8,off}` | `int8` | `fish` only. `int8` loads 8-bit weight-only (~6 GB resident, ~11 GB peak) so the model fits a 12 GB card; `off` loads the bf16 weights Fish documents as needing ~24 GB. CPU runs always use bf16. |
 | `--clone-text TEXT` | — | Transcript of `--clone`. Optional: without it `qwen` clones from the speaker embedding alone (lower similarity), and CosyVoice loses the reference's accent. |
+| `--no-provenance` | off | Skips the timestamped `provenance/provenance-<timestamp>.json` record of the per-line prosody, the LLM reply and the text transformations. |
 
 `--text` is split into one utterance per line. Both a real newline and a literal
 `\n` are treated as breaks, so `--text "one\ntwo"` works even though a shell does

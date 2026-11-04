@@ -211,6 +211,7 @@ class ChatterboxEngine:
         reference: Path | str,
         prosody: Sequence[ProsodySpec] | None = None,
         language: str | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> list[np.ndarray]:
         """Synthesise each line in the reference voice.
 
@@ -234,6 +235,15 @@ class ChatterboxEngine:
 
         specs = resolve_prosody(lines, prosody)
         exaggerations = [self._line_exaggeration(spec) for spec in specs]
+        if trace is not None:
+            for line, exaggeration in zip(lines, exaggerations):
+                trace.append(
+                    {
+                        "channel": "chatterbox",
+                        "text": str(line),
+                        "exaggeration": exaggeration,
+                    }
+                )
         self._ensure_available()
 
         _LOGGER.debug(

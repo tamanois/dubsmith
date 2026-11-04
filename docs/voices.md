@@ -61,7 +61,12 @@ Voices live in `voices/` by default (override with `VOICES_DIR` or
 voices/delphine/voice.wav                   # the reference clip (the donor, as given)
 voices/delphine/voice.json                  # label, language, source, transcript, gender, pace
 voices/delphine/prompts/qwen-<fingerprint>.npz   # Qwen's encoding: codes + embedding
+voices/delphine/provenance/provenance-<timestamp>.json   # how the voice was made
 ```
+
+`provenance/` records each save: the mode, the design prompt (or the reference
+clip and where its transcript came from), the model and fingerprint, and the
+measured gender/pace. It is timestamped per run, so `--force` keeps the history.
 
 `voice.wav` is the voice, and it works with every backend. A **card** under
 `prompts/` is derived data: one checkpoint's encoding of that clip, which lets it

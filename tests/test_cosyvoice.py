@@ -95,10 +95,12 @@ def test_synthesize_renders_structured_prosody(
     monkeypatch.setattr(CosyVoiceEngine, "_run_worker", fake_run)
 
     engine = CosyVoiceEngine("m", device="cpu")
+    trace: list[dict] = []
     engine.synthesize(
         ["Hello there. How are you?"],
         reference=tmp_path / "voice.wav",
         prosody=[ProsodySpec(emotion="happy", pace="fast", breath=True)],
+        trace=trace,
     )
 
     payload = captured[0]
@@ -106,6 +108,9 @@ def test_synthesize_renders_structured_prosody(
     assert payload["instructs"][0].startswith("You are a helpful assistant.")
     assert payload["instructs"][0].endswith("<|endofprompt|>")
     assert "开心" in payload["instructs"][0]
+    assert trace[0]["channel"] == "cosyvoice"
+    assert trace[0]["mode"] == "instruct2"
+    assert trace[0]["instruct"] == payload["instructs"][0]
 
 
 def _capturing_engine(

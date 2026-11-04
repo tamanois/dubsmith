@@ -23,6 +23,8 @@ output/talk/
 ├── 03d_prefit.json      # lines re-worded before synthesis, and how much of the wording survived
 ├── 04_dubbed/           # one synthesised clip per segment (+ .done marker)
 │   ├── donor.json       # which voice was cloned for each speaker, and from what
+│   ├── prosody.json     # latest per-line prosody: settings, LLM reply, text transforms
+│   ├── provenance/      # timestamped prosody.json snapshots, one per run
 │   ├── reference_blend.wav   # only in reference-accent: the clip every line is cloned from
 │   ├── reference_blend_SPK_1.wav   # ...one per speaker once there are several
 │   └── blend.json       # only in reference-accent: how each clip was chosen
@@ -38,6 +40,11 @@ output/talk/
 ├── run.log              # the log from stderr, appended across runs
 └── run-20260929-070308.log    # only once it passes --log-max-bytes
 ```
+
+`prosody.json` is the emotion record: for every segment it states the planned text,
+the text actually spoken, the effective `ProsodySpec`, and the exact tokens/tags
+the renderer added. `provenance/` keeps one timestamped copy per synthesis, so an
+earlier run's plan is never overwritten. `--no-provenance` disables both.
 
 `report.json` is the quickest way to judge a run without listening to it:
 

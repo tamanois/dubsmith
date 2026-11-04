@@ -627,6 +627,15 @@ def build_say_parser() -> argparse.ArgumentParser:
             "forever."
         ),
     )
+    parser.add_argument(
+        "--no-provenance",
+        dest="no_provenance",
+        action="store_true",
+        help=(
+            "Do not write the timestamped provenance artifact (per-line prosody, "
+            "the LLM reply and the text transformations sent to the backend)."
+        ),
+    )
     return parser
 
 
@@ -1189,6 +1198,15 @@ def build_dub_parser() -> argparse.ArgumentParser:
         help="Show the program version and exit.",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
+    parser.add_argument(
+        "--no-provenance",
+        dest="no_provenance",
+        action="store_true",
+        help=(
+            "Do not write the timestamped provenance artifact (per-line prosody, "
+            "the LLM reply and the text transformations sent to the backend)."
+        ),
+    )
     return parser
 
 
@@ -1631,6 +1649,12 @@ def cmd_voices(argv: Sequence[str]) -> int:
             ref_text=anchor_text,
             instruct=args.prompt,
             force=args.force,
+            provenance={
+                "backend": "voice-design",
+                "model": str(resolve_model("tts_voice_design", models_dir)),
+                "text_source": "anchor",
+                "plan_source": "manual",
+            },
         )
         if args.speak:
             speech, speech_rate = engine.generate(args.speak, args.prompt, language)
@@ -1680,6 +1704,15 @@ def cmd_voices(argv: Sequence[str]) -> int:
             ref_text=ref_text,
             prompt=prompt,
             force=args.force,
+            provenance={
+                "backend": "voice-clone",
+                "model": str(resolve_model("tts_base", models_dir)),
+                "ref_audio": str(args.audio),
+                "text_source": "transcribe" if args.transcribe else "clone-text",
+                "detected_language": detected,
+                "fingerprint": model_fingerprint("tts_base", models_dir),
+                "plan_source": "manual",
+            },
         )
         if args.speak:
             rendered = engine.synthesize([args.speak], language=language)
@@ -1747,6 +1780,17 @@ def _cmd_voices_add(args: argparse.Namespace, root: Path, models_dir: Path) -> i
         language=language,
         ref_text=ref_text,
         force=args.force,
+        provenance={
+            "backend": "voice-add",
+            "ref_audio": str(audio),
+            "text_source": (
+                "transcribe"
+                if args.transcribe
+                else ("clone-text" if (args.clone_text or "").strip() else "none")
+            ),
+            "detected_language": detected,
+            "plan_source": "manual",
+        },
     )
     print(
         f"Registered voice {saved.label!r} ({saved.language}, {saved.seconds:.1f}s) "
@@ -1937,6 +1981,53 @@ def _one_per_line(
     return items
 
 
+def _say_plan_source(backend: str, args: argparse.Namespace) -> str:
+    """Whether a ``say`` plan came from the model, the CLI, or nowhere."""
+    tag_mode = getattr(args, "fish_tag_mode", "keep")
+    if backend == "customvoice":
+        if getattr(args, "style_plan", "off") == "llm":
+            return "llm"
+        if (
+            getattr(args, "style_instructs", None)
+            or getattr(args, "prosody", None)
+            or getattr(args, "emotions", None)
+        ):
+            return "manual"
+        return "off"
+    if tag_mode == "llm":
+        return "llm"
+    if getattr(args, "prosody_plan", "off") == "llm":
+        return "llm"
+    if getattr(args, "prosody", None) or getattr(args, "emotions", None):
+        return "manual"
+    if backend == "fish":
+        return "manual"  # Fish takes its direction from tags in --text
+    return "off"
+
+
+def _write_say_provenance(recorder: Any, name: str) -> None:
+    """Write a ``say`` run's provenance beside its lines, timestamped per run."""
+    from pipeline.provenance import timed_provenance_path
+
+    recorder.write(timed_provenance_path(Path("output") / "say" / name / "provenance"))
+
+
+def _write_qwen_say_provenance(
+    name: str, language: str | None, mode: str, *, enabled: bool = True
+) -> None:
+    """Record the absence of a prosody channel for a Qwen ``say`` run."""
+    if not enabled:
+        return
+    from pipeline.provenance import ProvenanceRecorder, timed_provenance_path
+
+    recorder = ProvenanceRecorder("say", "qwen", language=language, plan_source="off")
+    recorder.record_output(mode=mode)
+    recorder.write(
+        timed_provenance_path(Path("output") / "say" / name / "provenance"),
+        supported=False,
+    )
+
+
 def _resolve_prosody_specs(
     lines: Sequence[str],
     *,
@@ -1946,6 +2037,7 @@ def _resolve_prosody_specs(
     settings: Settings,
     backend: str,
     chunk_size: int | None = None,
+    recorder: Any | None = None,
 ) -> list[Any]:
     """Per-line :class:`ProsodySpec` from the CLI and, optionally, the LLM.
 
@@ -1964,6 +2056,7 @@ def _resolve_prosody_specs(
             timeout_s=settings.llm_timeout_s,
             backend=backend,
             chunk_size=chunk_size or settings.llm_plan_chunk_size,
+            recorder=recorder,
         )
         specs = planner.plan(lines)
 
@@ -2110,6 +2203,27 @@ def _cmd_say_neural(
     if not lines:
         raise ConfigError("--text contains no lines to speak.")
 
+    from pipeline.provenance import (
+        LineProvenance,
+        NullRecorder,
+        ProvenanceRecorder,
+        describe_transformations,
+    )
+
+    recorder = (
+        NullRecorder()
+        if getattr(args, "no_provenance", False)
+        else ProvenanceRecorder(
+            "say",
+            backend,
+            language=language,
+            plan_source=_say_plan_source(backend, args),
+        )
+    )
+    trace: list[dict[str, Any]] = []
+    specs: list[Any] | None = None
+    tagged: list[str] | None = None
+
     log.info(
         "Backend %s: reference=%s language=%s lines=%d",
         backend,
@@ -2145,6 +2259,7 @@ def _cmd_say_neural(
             model=settings.llm_model,
             timeout_s=settings.llm_timeout_s,
             chunk_size=args.plan_chunk or settings.llm_plan_chunk_size,
+            recorder=recorder,
         )
         tagged = planner.plan_lines(lines, language=language)
         for index, text in enumerate(tagged, start=1):
@@ -2160,6 +2275,7 @@ def _cmd_say_neural(
                 reference=reference,
                 ref_text=ref_text,
                 language=language,
+                trace=trace,
             )
     elif backend == "fish":
         # The caller wrote the tags. Reserved <|...|> tokens were rejected in
@@ -2200,6 +2316,7 @@ def _cmd_say_neural(
                 reference=reference,
                 ref_text=ref_text,
                 language=language,
+                trace=trace,
             )
     else:
         # CosyVoice 3 and Chatterbox: one spec per line, rendered by the engine.
@@ -2211,6 +2328,7 @@ def _cmd_say_neural(
             settings=settings,
             backend=backend,
             chunk_size=args.plan_chunk,
+            recorder=recorder,
         )
         log.info(
             "Prosody: %s for %d line(s)",
@@ -2231,6 +2349,7 @@ def _cmd_say_neural(
                     reference=reference,
                     prosody=specs,
                     language=NAME_TO_CODE.get(language),
+                    trace=trace,
                 )
             else:
                 rendered = engine.synthesize(
@@ -2239,6 +2358,7 @@ def _cmd_say_neural(
                     prosody=specs,
                     ref_text=ref_text,
                     language=language,
+                    trace=trace,
                 )
 
     out_dir = Path("output") / "say" / name
@@ -2253,6 +2373,35 @@ def _cmd_say_neural(
             args.output if args.output is not None else out_dir / "speech.wav"
         )
         write_audio(combined_path, combined, engine.sample_rate)
+
+    spoken_lines = tagged if tagged is not None else lines
+    for index, planned in enumerate(lines):
+        record = trace[index] if index < len(trace) else None
+        spoken = str(record.get("text")) if record else spoken_lines[index]
+        spec = (
+            specs[index].model_dump()
+            if specs is not None and index < len(specs)
+            else None
+        )
+        recorder.record_line(
+            LineProvenance(
+                key=index,
+                text_planned=planned,
+                text_spoken=spoken,
+                overrides={"prosody": args.prosody, "emotion": emotions},
+                spec=spec,
+                rendered=record,
+                transformations=describe_transformations(
+                    planned,
+                    spoken,
+                    channel=str(record.get("channel")) if record else backend,
+                    spec=spec,
+                    instruct=record.get("instruct") if record else None,
+                    exaggeration=record.get("exaggeration") if record else None,
+                ),
+            )
+        )
+    _write_say_provenance(recorder, name)
     release_gpu_memory()
 
     log.info("Output: %s (combined %s)", out_dir, combined_path)
@@ -2360,6 +2509,24 @@ def _cmd_say_customvoice(
     if not lines:
         raise ConfigError("--text contains no lines to speak.")
 
+    from pipeline.provenance import (
+        LineProvenance,
+        NullRecorder,
+        ProvenanceRecorder,
+        describe_transformations,
+    )
+
+    recorder = (
+        NullRecorder()
+        if getattr(args, "no_provenance", False)
+        else ProvenanceRecorder(
+            "say",
+            "customvoice",
+            language=language,
+            plan_source=_say_plan_source("customvoice", args),
+        )
+    )
+
     if args.style_instructs:
         # A verbatim instruction is the checkpoint's own input format, so it is
         # sent as typed; anything structural given alongside it is dropped.
@@ -2392,6 +2559,7 @@ def _cmd_say_customvoice(
             timeout_s=settings.llm_timeout_s,
             chunk_size=args.plan_chunk or settings.llm_plan_chunk_size,
             backend="customvoice",
+            recorder=recorder,
         )
         if args.style_plan_scope == "whole":
             instruction = planner.plan_whole(
@@ -2414,6 +2582,7 @@ def _cmd_say_customvoice(
             settings=settings,
             backend="customvoice",
             chunk_size=args.plan_chunk,
+            recorder=recorder,
         )
         instructs = [customvoice_instruct(spec) for spec in specs]
         mode = "rendered"
@@ -2482,6 +2651,41 @@ def _cmd_say_customvoice(
         )
         write_audio(combined_path, combined, sample_rate)
     release_gpu_memory()
+
+    for index, (text, instruct) in enumerate(zip(lines, instructs)):
+        record = {
+            "channel": "customvoice",
+            "text": text,
+            "instruct": instruct,
+            "speaker": args.speaker,
+        }
+        spec = (
+            specs[index].model_dump()
+            if specs is not None and index < len(specs)
+            else None
+        )
+        recorder.record_line(
+            LineProvenance(
+                key=index,
+                text_planned=text,
+                text_spoken=text,
+                overrides={
+                    "style_instruct": args.style_instructs,
+                    "prosody": args.prosody,
+                    "emotion": emotions,
+                },
+                spec=spec,
+                rendered=record,
+                transformations=describe_transformations(
+                    text,
+                    text,
+                    channel="customvoice",
+                    spec=spec,
+                    instruct=instruct,
+                ),
+            )
+        )
+    _write_say_provenance(recorder, _say_name(args))
 
     log.info("Output: %s (combined %s)", out_dir, combined_path)
     print(f"Wrote {len(rendered)} line(s) to {out_dir} (combined: {combined_path})")
@@ -2630,6 +2834,12 @@ def cmd_say(argv: Sequence[str]) -> int:
             raise TTSError("The model returned no audio.")
         out = _write_say_output(args.output, saved.label, speech, engine.sample_rate)
         release_gpu_memory()
+        _write_qwen_say_provenance(
+            _say_name(args),
+            language,
+            "voice",
+            enabled=not getattr(args, "no_provenance", False),
+        )
         log.info("Output: %s", out)
         print(f"Wrote {out}")
         return _STOP
@@ -2667,11 +2877,23 @@ def cmd_say(argv: Sequence[str]) -> int:
                 ref_text=anchor_text,
                 instruct=args.design,
                 force=args.force,
+                provenance={
+                    "backend": "voice-design",
+                    "model": str(resolve_model("tts_voice_design", models_dir)),
+                    "text_source": "anchor",
+                    "plan_source": "manual",
+                },
             )
         out = _write_say_output(
             args.output, args.save_as or "design", speech, sample_rate
         )
         release_gpu_memory()
+        _write_qwen_say_provenance(
+            _say_name(args),
+            language,
+            "design",
+            enabled=not getattr(args, "no_provenance", False),
+        )
         log.info("Output: %s", out)
         print(f"Wrote {out}")
         return _STOP
@@ -2722,11 +2944,25 @@ def cmd_say(argv: Sequence[str]) -> int:
                 fingerprint=model_fingerprint("tts_base", models_dir)
             ),
             force=args.force,
+            provenance={
+                "backend": "voice-clone",
+                "model": str(resolve_model("tts_base", models_dir)),
+                "ref_audio": str(args.clone),
+                "text_source": "clone-text" if clone_text else "none",
+                "fingerprint": model_fingerprint("tts_base", models_dir),
+                "plan_source": "manual",
+            },
         )
     out = _write_say_output(
         args.output, args.save_as or "clone", speech, engine.sample_rate
     )
     release_gpu_memory()
+    _write_qwen_say_provenance(
+        _say_name(args),
+        language,
+        "clone",
+        enabled=not getattr(args, "no_provenance", False),
+    )
     log.info("Output: %s", out)
     print(f"Wrote {out}")
     return _STOP
@@ -2828,6 +3064,7 @@ def job_config_from_args(
         fish_temperature=getattr(args, "fish_temperature", None),
         fish_top_p=getattr(args, "fish_top_p", None),
         fish_quantize=getattr(args, "fish_quantize", None),
+        provenance=not getattr(args, "no_provenance", False),
         min_stretch=args.min_stretch,
         max_stretch=args.max_stretch,
         max_overrun=args.max_overrun,

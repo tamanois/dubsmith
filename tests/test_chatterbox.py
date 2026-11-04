@@ -47,11 +47,13 @@ def test_synthesize_builds_the_request_and_reads_wavs(
     monkeypatch.setattr(ChatterboxEngine, "_run_worker", fake_run)
 
     engine = ChatterboxEngine("models/chatterbox", device="cpu")
+    trace: list[dict] = []
     out = engine.synthesize(
         ["bonjour", "au revoir"],
         reference=tmp_path / "voice.wav",
         prosody=[ProsodySpec(emotion="happy"), ProsodySpec(emotion="sad")],
         language="fr",
+        trace=trace,
     )
 
     assert len(out) == 2
@@ -62,6 +64,8 @@ def test_synthesize_builds_the_request_and_reads_wavs(
     assert payload["language"] == "fr"
     assert payload["exaggerations"][0] > payload["exaggerations"][1]
     assert payload["reference"].endswith("voice.wav")
+    assert [item["channel"] for item in trace] == ["chatterbox", "chatterbox"]
+    assert trace[0]["exaggeration"] == payload["exaggerations"][0]
 
 
 def test_engine_overrides_exaggeration_and_passes_sampling(

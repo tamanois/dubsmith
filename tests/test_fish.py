@@ -49,10 +49,12 @@ def test_synthesize_sends_the_lines_as_written(
     monkeypatch.setattr(FishEngine, "_run_worker", run)
 
     engine = FishEngine("models/fish", device="cpu")
+    trace: list[dict] = []
     out = engine.synthesize(
         ["[excited] First one.", "[whisper] Second one [pause]"],
         reference=tmp_path / "voice.wav",
         ref_text="reference words",
+        trace=trace,
     )
 
     assert len(out) == 2
@@ -65,6 +67,10 @@ def test_synthesize_sends_the_lines_as_written(
     ]
     assert payload["reference_text"] == "reference words"
     assert payload["device"] == "cpu"
+    assert trace == [
+        {"channel": "fish", "text": "[excited] First one."},
+        {"channel": "fish", "text": "[whisper] Second one [pause]"},
+    ]
 
 
 def test_sampling_is_forwarded(

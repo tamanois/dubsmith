@@ -70,6 +70,7 @@ pipeline/
 ├── tts.py                 per-speaker donor selection + voice cloning
 ├── voice.py               one voice: the facts that build its clone prompt
 ├── voices.py              saved voices: clip + manifest + stored encoding
+├── provenance.py          emotion/prosody provenance artifact (schema + recorder)
 ├── parallel.py            fan-out: tasks, the worker pool, per-device counters
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates

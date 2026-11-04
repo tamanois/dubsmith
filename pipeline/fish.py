@@ -199,6 +199,7 @@ class FishEngine:
         reference: Path | str,
         ref_text: str | None = None,
         language: str | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> list[np.ndarray]:
         """Synthesise each line in the reference voice, tags included.
 
@@ -219,6 +220,9 @@ class FishEngine:
             return []
 
         tagged = [str(line) for line in lines]
+        if trace is not None:
+            for text in tagged:
+                trace.append({"channel": "fish", "text": text})
         self._ensure_available()
 
         _LOGGER.debug(

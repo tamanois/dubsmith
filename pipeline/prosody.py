@@ -1268,6 +1268,7 @@ class _LLMPlanner:
         temperature: float = 0.3,
         chunk_size: int = 10,
         backend: str | None = None,
+        recorder: Any | None = None,
         client: Any | None = None,
     ) -> None:
         self.base_url = base_url
@@ -1279,6 +1280,10 @@ class _LLMPlanner:
         #: Backend whose capabilities the planner is told about, so it does not
         #: propose controls that engine will drop.
         self.backend = backend
+        #: Optional provenance sink: receives the config, every reply and any
+        #: failure. ``None`` keeps planning completely free of it.
+        self._recorder = recorder
+        self._last_used_fallback = False
         self._client = client
 
     @property
@@ -1320,12 +1325,27 @@ class _LLMPlanner:
             try:
                 response = self._complete(messages, json_mode=json_mode)
             except Exception as exc:  # noqa: BLE001 - reported as a domain error
+                if self._recorder is not None:
+                    self._recorder.record_error(exc)
                 raise TranslationError(
                     f"{label} planning failed against {self.base_url} "
                     f"(model {self.model!r}): {exc}"
                 ) from exc
         reply = self._content(response)
         _LOGGER.debug("%s reply%s: %s", label, suffix, reply)
+        if self._recorder is not None:
+            self._recorder.record_planner_config(
+                model=self.model,
+                base_url=self.base_url,
+                temperature=self.temperature,
+                chunk_size=self.chunk_size,
+                backend=self.backend,
+            )
+            self._recorder.record_call(
+                f"{label}{suffix}",
+                reply,
+                fallback=self._last_used_fallback,
+            )
         return reply
 
     def _plan_with_overview(
@@ -1357,6 +1377,8 @@ class _LLMPlanner:
             )
             overview = str(reply or "").strip() or None
             _LOGGER.info("%s overview: %s", label, overview or "(empty)")
+            if self._recorder is not None:
+                self._recorder.record_overview(overview)
 
         results: list[Any] = []
         context: list[str] = []
@@ -1386,6 +1408,7 @@ class _LLMPlanner:
         prose, so this is a best-effort improvement rather than a requirement.
         Free-text calls (the overview) skip JSON mode entirely.
         """
+        self._last_used_fallback = False
         if not json_mode:
             return self.client.chat.completions.create(
                 model=self.model,
@@ -1400,6 +1423,7 @@ class _LLMPlanner:
                 response_format={"type": "json_object"},
             )
         except Exception:  # noqa: BLE001 - fall back to a plain completion
+            self._last_used_fallback = True
             return self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -1465,6 +1489,7 @@ class StylePlanner(_LLMPlanner):
         temperature: float = 0.7,
         chunk_size: int = 10,
         backend: str | None = None,
+        recorder: Any | None = None,
         client: Any | None = None,
     ) -> None:
         super().__init__(
@@ -1475,6 +1500,7 @@ class StylePlanner(_LLMPlanner):
             temperature=temperature,
             chunk_size=chunk_size,
             backend=backend,
+            recorder=recorder,
             client=client,
         )
 
@@ -1766,6 +1792,7 @@ class FishInlinePlanner(_LLMPlanner):
         timeout_s: float = 60.0,
         temperature: float = 0.7,
         chunk_size: int = 10,
+        recorder: Any | None = None,
         client: Any | None = None,
     ) -> None:
         super().__init__(
@@ -1776,6 +1803,7 @@ class FishInlinePlanner(_LLMPlanner):
             temperature=temperature,
             chunk_size=chunk_size,
             backend="fish",
+            recorder=recorder,
             client=client,
         )
 

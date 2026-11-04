@@ -417,6 +417,9 @@ class JobConfig(BaseModel):
     fish_temperature: float | None = None
     fish_top_p: float | None = None
     fish_quantize: str | None = None
+    #: Write the timestamped provenance artifact for this run (per-line prosody,
+    #: the LLM reply and the text transformations). ``--no-provenance`` turns it off.
+    provenance: bool = True
 
     # Duration fitting.
     #: How far a line may be *compressed* to fit. This is an intelligibility

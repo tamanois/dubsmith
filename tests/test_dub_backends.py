@@ -130,7 +130,8 @@ class TestPlanProsody:
     def test_qwen_returns_nothing(self, tmp_path: Path) -> None:
         pipeline = _pipeline(tmp_path, tts_backend="qwen")
         lines = [Segment(id=0, start=0.0, end=1.0, text="a")]
-        assert pipeline._plan_prosody(lines, {0: "Bonjour"}) == {}
+        planned, _recorder = pipeline._plan_prosody(lines, {0: "Bonjour"})
+        assert planned == {}
 
     def test_off_never_calls_the_llm(self, tmp_path: Path, monkeypatch) -> None:
         pipeline = _pipeline(tmp_path, tts_backend="chatterbox", prosody_plan="off")
@@ -141,7 +142,8 @@ class TestPlanProsody:
 
         monkeypatch.setattr("pipeline.prosody.ProsodyPlanner", Boom)
         lines = [Segment(id=0, start=0.0, end=1.0, text="a")]
-        assert pipeline._plan_prosody(lines, {0: "Bonjour"}) == {}
+        planned, _recorder = pipeline._plan_prosody(lines, {0: "Bonjour"})
+        assert planned == {}
 
     def test_auto_falls_back_to_neutral_when_planning_fails(
         self, tmp_path: Path, monkeypatch
@@ -160,7 +162,9 @@ class TestPlanProsody:
             Segment(id=0, start=0.0, end=1.0, text="a"),
             Segment(id=1, start=1.0, end=2.0, text="b"),
         ]
-        planned = pipeline._plan_prosody(lines, {0: "Bonjour", 1: "Salut"})
+        planned, _recorder = pipeline._plan_prosody(
+            lines, {0: "Bonjour", 1: "Salut"}
+        )
         assert set(planned) == {0, 1}
         assert all(spec.is_empty() for spec in planned.values())
 
@@ -193,7 +197,8 @@ class TestPlanProsody:
 
         monkeypatch.setattr("pipeline.prosody.FishInlinePlanner", Broken)
         lines = [Segment(id=0, start=0.0, end=1.0, text="a")]
-        assert pipeline._plan_prosody(lines, {0: "Bonjour"}) == {0: "Bonjour"}
+        planned, _recorder = pipeline._plan_prosody(lines, {0: "Bonjour"})
+        assert planned == {0: "Bonjour"}
 
     def test_blank_lines_are_skipped_but_keep_an_entry(
         self, tmp_path: Path, monkeypatch
@@ -215,7 +220,9 @@ class TestPlanProsody:
             Segment(id=1, start=1.0, end=2.0, text=""),
             Segment(id=2, start=2.0, end=3.0, text="c"),
         ]
-        planned = pipeline._plan_prosody(lines, {0: "Bonjour", 1: "", 2: "Salut"})
+        planned, _recorder = pipeline._plan_prosody(
+            lines, {0: "Bonjour", 1: "", 2: "Salut"}
+        )
         assert seen == ["Bonjour", "Salut"]
         assert set(planned) == {0, 1, 2}
         assert planned[1].is_empty()

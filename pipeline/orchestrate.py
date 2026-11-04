@@ -2236,6 +2236,7 @@ class Pipeline:
             donors = self._resolve_donors(audio_path, transcript)
             self._write_voices(transcript, donors, blends)
 
+            recorder: Any | None = None
             if self.job.tts_backend == "qwen":
                 produced, sample_rate = self._synthesize_all(
                     lines, script, donors, blends
@@ -2244,12 +2245,12 @@ class Pipeline:
                     owned, texts, donors, blends, tmp_dir
                 )
             else:
-                prosody = self._plan_prosody(lines, script)
+                prosody, recorder = self._plan_prosody(lines, script)
                 produced, sample_rate = self._synthesize_expressive(
-                    lines, script, donors, tmp_dir, prosody
+                    lines, script, donors, tmp_dir, prosody, recorder
                 )
                 resynthesize = lambda owned, texts: self._retry_lines(  # noqa: E731
-                    owned, texts, donors, blends, tmp_dir, prosody
+                    owned, texts, donors, blends, tmp_dir, prosody, recorder
                 )
             if sample_rate > 0:
                 wavs = self._refine_overlong(
@@ -2287,6 +2288,7 @@ class Pipeline:
             for stale in out_dir.glob("seg_*.wav"):
                 if stale not in expected.values():
                     stale.unlink()
+            self._write_synthesis_provenance(recorder, len(written))
             # A marker keeps the cache independent of how many lines were blank.
             marker.write_text(str(len(written)), encoding="utf-8")
             return written
@@ -2412,21 +2414,23 @@ class Pipeline:
         blends: Mapping[str, Path],
         tmp_dir: Path,
         prosody: Mapping[int, Any] | None = None,
+        recorder: Any | None = None,
     ) -> list[np.ndarray | None]:
         """Re-synthesise rewritten lines, each in its own speaker's voice.
 
         The rewritten text is new, so a Fish plan (tags written *into* the line)
         is re-derived for just these lines; the structured specs the other
-        backends use are keyed by segment id and stay valid.
+        backends use are keyed by segment id and stay valid. The same recorder is
+        kept, so the artifact reflects the text that was actually spoken.
         """
         by_id = {segment.id: text for segment, text in zip(segments, texts)}
         if self.job.tts_backend == "qwen":
             produced, _rate = self._synthesize_all(segments, by_id, donors, blends)
         else:
             if self.job.tts_backend == "fish":
-                prosody = self._plan_prosody(segments, by_id)
+                prosody, recorder = self._plan_prosody(segments, by_id, recorder)
             produced, _rate = self._synthesize_expressive(
-                segments, by_id, donors, tmp_dir, prosody
+                segments, by_id, donors, tmp_dir, prosody, recorder
             )
         return [produced.get(segment.id) for segment in segments]
 
@@ -2457,8 +2461,11 @@ class Pipeline:
         return self._expressive_engine
 
     def _plan_prosody(
-        self, lines: Sequence[Segment], script: Mapping[int, str]
-    ) -> dict[int, Any]:
+        self,
+        lines: Sequence[Segment],
+        script: Mapping[int, str],
+        recorder: Any | None = None,
+    ) -> tuple[dict[int, Any], Any]:
         """Per-line delivery for the expressive backends, keyed by segment id.
 
         ``qwen`` has no prosody control and returns nothing. For Fish the plan is
@@ -2467,17 +2474,36 @@ class Pipeline:
 
         ``auto`` falls back to a neutral delivery when the LLM is unreachable;
         ``llm`` lets the error propagate so a broken endpoint is not silent.
+
+        Returns the plan and the recorder that captured how it was made, so the
+        synthesis stage can write one artifact covering both.
         """
+        from .provenance import NullRecorder, ProvenanceRecorder
+
         backend = self.job.tts_backend
+        if recorder is None:
+            if not self.job.provenance:
+                recorder = NullRecorder()
+            else:
+                recorder = ProvenanceRecorder(
+                "dub",
+                backend,
+                language=self.job.target_language,
+                plan_source=(
+                    "llm"
+                    if backend != "qwen" and self.job.prosody_plan == "llm"
+                    else "off"
+                ),
+            )
         if backend == "qwen":
             if self.job.prosody_plan == "llm":
                 self.log.warning(
                     "Qwen Base has no prosody controls; --prosody-plan llm is "
                     "ignored."
                 )
-            return {}
+            return {}, recorder
         if self.job.prosody_plan == "off":
-            return {}
+            return {}, recorder
 
         ids = [segment.id for segment in lines]
         texts = [script.get(segment_id, "") for segment_id in ids]
@@ -2494,6 +2520,7 @@ class Pipeline:
                     model=self.job.llm_model or self.settings.llm_model,
                     timeout_s=self.settings.llm_timeout_s,
                     chunk_size=self.settings.llm_plan_chunk_size,
+                    recorder=recorder,
                 )
                 try:
                     tagged = planner.plan_lines(
@@ -2503,6 +2530,7 @@ class Pipeline:
                 except Exception as exc:  # noqa: BLE001 - fall back on any failure
                     if self.job.prosody_plan == "llm":
                         raise
+                    recorder.set_plan_source("llm_failed")
                     self.log.warning(
                         "Fish tag planning failed (%s); lines will be spoken "
                         "without tags.",
@@ -2514,10 +2542,10 @@ class Pipeline:
                         tagged[position] if position < len(tagged) else texts[index]
                     )
             self.log.info("Planned Fish tags for %d line(s).", len(indexes))
-            return {
-                segment_id: planned[index]
-                for index, segment_id in enumerate(ids)
-            }
+            return (
+                {segment_id: planned[index] for index, segment_id in enumerate(ids)},
+                recorder,
+            )
 
         from .prosody import ProsodyPlanner, ProsodySpec
 
@@ -2530,12 +2558,14 @@ class Pipeline:
                 timeout_s=self.settings.llm_timeout_s,
                 backend=backend,
                 chunk_size=self.settings.llm_plan_chunk_size,
+                recorder=recorder,
             )
             try:
                 planned_specs = planner.plan([texts[index] for index in indexes])
             except Exception as exc:  # noqa: BLE001 - fall back on any failure
                 if self.job.prosody_plan == "llm":
                     raise
+                recorder.set_plan_source("llm_failed")
                 self.log.warning(
                     "Prosody planning failed (%s); lines will be spoken neutral.",
                     exc,
@@ -2548,7 +2578,10 @@ class Pipeline:
                     else ProsodySpec()
                 )
         self.log.info("Planned prosody for %d line(s) with %s.", len(indexes), backend)
-        return {segment_id: specs[index] for index, segment_id in enumerate(ids)}
+        return (
+            {segment_id: specs[index] for index, segment_id in enumerate(ids)},
+            recorder,
+        )
 
     def _expressive_reference(
         self,
@@ -2583,12 +2616,14 @@ class Pipeline:
         donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
         tmp_dir: Path,
         prosody: Mapping[int, Any] | None = None,
+        recorder: Any | None = None,
     ) -> tuple[dict[int, np.ndarray], int]:
         """Synthesise every line with an expressive backend, one voice at a time.
 
         Blank lines map to ``None`` (they are never sent to the engine), matching
         the Qwen path so the timing stage can emit a matching stretch of silence.
         """
+        from .provenance import LineProvenance, describe_transformations
         from .prosody import ProsodySpec
 
         prosody = prosody or {}
@@ -2627,12 +2662,14 @@ class Pipeline:
                     specs.append(prosody.get(segment.id) or ProsodySpec())
             if not ids:
                 continue
+            trace: list[dict[str, Any]] = []
             if backend == "fish":
                 wavs = engine.synthesize(
                     speak,
                     reference=reference,
                     ref_text=ref_text,
                     language=language,
+                    trace=trace,
                 )
             elif backend == "chatterbox":
                 wavs = engine.synthesize(
@@ -2640,6 +2677,7 @@ class Pipeline:
                     reference=reference,
                     prosody=specs,
                     language=language_code,
+                    trace=trace,
                 )
             else:  # cosyvoice3
                 wavs = engine.synthesize(
@@ -2648,11 +2686,50 @@ class Pipeline:
                     prosody=specs,
                     ref_text=ref_text,
                     language=language,
+                    trace=trace,
                 )
             if len(wavs) != len(ids):
                 raise TTSError(
                     f"{backend} returned {len(wavs)} clip(s) for {len(ids)} line(s)."
                 )
+            if recorder is not None:
+                for position, segment_id in enumerate(ids):
+                    record = trace[position] if position < len(trace) else None
+                    planned = texts.get(segment_id, "")
+                    spoken = (
+                        str(record.get("text")) if record else speak[position]
+                    )
+                    spec = (
+                        specs[position].model_dump()
+                        if backend != "fish" and position < len(specs)
+                        else None
+                    )
+                    recorder.record_line(
+                        LineProvenance(
+                            key=segment_id,
+                            speaker=name,
+                            text_planned=planned,
+                            text_spoken=spoken,
+                            spec=spec,
+                            rendered=record,
+                            transformations=describe_transformations(
+                                planned,
+                                spoken,
+                                channel=(
+                                    str(record.get("channel"))
+                                    if record
+                                    else backend
+                                ),
+                                spec=spec,
+                                instruct=(
+                                    record.get("instruct") if record else None
+                                ),
+                                exaggeration=(
+                                    record.get("exaggeration") if record else None
+                                ),
+                            ),
+                        )
+                    )
             for segment_id, wav in zip(ids, wavs):
                 samples = np.ascontiguousarray(
                     np.asarray(wav, dtype=np.float32).reshape(-1)
@@ -2666,6 +2743,32 @@ class Pipeline:
                     sample_rate = 0
         return produced, sample_rate
 
+    def _write_synthesis_provenance(
+        self, recorder: Any | None, line_count: int
+    ) -> None:
+        """Write the dub's prosody artifact: a stable latest plus one per run.
+
+        ``qwen`` has no prosody channel, so its artifact says so explicitly rather
+        than being absent.
+        """
+        if not self.job.provenance:
+            return
+        from .provenance import ProvenanceRecorder, timed_provenance_path
+
+        out_dir = self.job_dir / _DUBBED_DIR
+        if recorder is None:
+            recorder = ProvenanceRecorder(
+                "dub",
+                "qwen",
+                language=self.job.target_language,
+                plan_source="off",
+            )
+            report = recorder.build(supported=False)
+        else:
+            report = recorder.build()
+        report.output = {"lines": int(line_count)}
+        report.write(out_dir / "prosody.json")
+        report.write(timed_provenance_path(out_dir / "provenance"))
 
     def _write_voices(
         self,
