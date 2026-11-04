@@ -31,6 +31,59 @@ python -m pytest -k accent -q                  # everything accent-related
 python -m pytest tests/test_voices.py -q       # saved voice prints
 ```
 
+## Real dubs against the local checkpoints
+
+The suite proves the wiring with fakes. To hear the feature, dub a short excerpt
+with each backend. `python dub.py models --list` shows what is present; download
+any missing checkpoint by name:
+
+```bash
+python dub.py models --download tts_chatterbox
+python dub.py models --download tts_fish
+python dub.py models --download tts_cosyvoice3
+```
+
+Use a 15–25 s clip: every run pays for ASR, diarization and translation once, so
+short input keeps the loop quick without changing the synthesis path.
+
+```bash
+ffmpeg -y -ss 00:01:00 -t 20 -i source.mp4 -vn -ac 1 -ar 24000 /tmp/clip.wav
+```
+
+Dub the same clip with each backend, in its own output folder so the runs cannot
+share a cache:
+
+```bash
+python dub.py --audio /tmp/clip.wav --target fr --backend qwen       --output-dir /tmp/dub-qwen
+python dub.py --audio /tmp/clip.wav --target fr --backend chatterbox --prosody-plan auto --output-dir /tmp/dub-chatterbox
+python dub.py --audio /tmp/clip.wav --target fr --backend cosyvoice3 --prosody-plan auto --output-dir /tmp/dub-cosyvoice
+python dub.py --audio /tmp/clip.wav --target fr --backend fish       --prosody-plan auto --output-dir /tmp/dub-fish
+```
+
+What to check, in order:
+
+1. **The plan was produced.** Run one backend with `-v` and read the planning
+   and request lines:
+   ```bash
+   python dub.py --audio /tmp/clip.wav --target fr --backend chatterbox \
+     --prosody-plan llm --output-dir /tmp/dub-chatterbox -v 2>&1 \
+     | grep -Ei "planned prosody|exaggerations="
+   ```
+   `Planned prosody for N line(s)` means the LLM answered; `exaggerations=[...]`
+   in the engine request shows the plan reaching Chatterbox.
+2. **The voice record names the backend.** `output/<stem>/04_dubbed/donor.json`
+   has `"backend": "chatterbox"` and the per-speaker donor clip.
+3. **It sounds acted, not read.** A/B the `dub.wav` from `/tmp/dub-qwen` against
+   the expressive run; energy and pacing should change line by line.
+4. **The neutral escape hatch.** `--prosody-plan off` (and the `qwen` default)
+   must sound flat — that is the unchanged behaviour.
+5. **Switching backends re-synthesises.** Change `--backend` and rerun; the
+   fingerprint includes it, so the dub is rebuilt rather than served from cache.
+
+`auto` is the default because translation already needs the same
+OpenAI-compatible endpoint: when it is reachable, planning runs. When it is not,
+`auto` logs a warning and speaks neutral, while `llm` fails the run.
+
 ### Auditing a dub's voice, line by line
 
 `audit_timbre.py` measures whether each synthesised line kept the speaker's

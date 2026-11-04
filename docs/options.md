@@ -37,6 +37,38 @@ With `--voice`, a saved voice already in the target language clones directly
 with no transcript cannot do ICL at all, so it uses `speaker-only`. An explicit
 `--accent-mode` always wins.
 
+## Emotion (dubbing backend and prosody plan)
+
+By default the dub clones each speaker with the Qwen Base checkpoint: the voice
+is kept, but the model has no emotion control. Pick an expressive `--backend`
+and `--prosody-plan` lets the configured model decide how each translated line
+should be delivered.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--backend NAME` | `qwen` | `qwen` clones with the Base checkpoint (no prosody). `cosyvoice3` adds instruct emotion plus `[breath]`/`[laughter]` tokens. `chatterbox` adds a single expression intensity. `fish` reads inline `[tag]` cues. All four clone each speaker from a clip of their own voice. |
+| `--prosody-plan {off,llm,auto}` | `auto` | `auto` asks the LLM for per-line delivery when it is reachable and falls back to neutral otherwise; `llm` fails if it is unreachable; `off` speaks neutral. Ignored by `qwen`. |
+| `--chatterbox-exaggeration 0..1` | derived | `chatterbox` only: fixed expression intensity for every line, overriding the planned emotion. |
+| `--chatterbox-cfg-weight FLOAT` | `0.5` | `chatterbox` guidance weight. |
+| `--chatterbox-temperature FLOAT` | `0.8` | `chatterbox` sampling temperature. |
+| `--fish-temperature FLOAT` | `0.7` | `fish` sampling temperature. |
+| `--fish-top-p FLOAT` | `0.7` | `fish` nucleus sampling probability. |
+| `--fish-quantize {int8,off}` | `int8` | `fish` weight format: `int8` fits a 12 GB card, `off` loads the bf16 weights. |
+
+The plan is written from the **translated** lines; a long video is chunked with
+a whole-passage overview so the delivery keeps one arc. Fish has no side
+channel, so its plan is the text itself: tags are written into each line, guarded
+so the words cannot change.
+
+Accent: the expressive backends clone from the speaker's donor clip, so the Qwen
+accent machinery (generated anchors, two-stage blend, rate probe) does not run.
+`cosyvoice3` keeps the reference accent on its zero-shot path; instruct-based
+emotion can pull the delivery toward the target language. `chatterbox` and
+`fish` keep the reference's timbre and accent.
+
+`qwen` has no prosody channel: with the default `auto` the plan is skipped
+silently, while an explicit `--prosody-plan llm` logs a warning and is ignored.
+
 ## Saved voices (`dub.py voices`)
 
 | Option | Default | What it achieves |

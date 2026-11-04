@@ -397,6 +397,27 @@ class JobConfig(BaseModel):
     #: escape hatch for a machine with less headroom than the default assumes.
     tts_batch: int = Field(default=8, ge=1, le=64)
 
+    # Synthesis backend for the dubbed lines. Every option clones the source
+    # speaker; the expressive ones additionally render per-line prosody.
+    #   "qwen"       -> Qwen Base clone, no prosody control (default, unchanged)
+    #   "cosyvoice3" -> CosyVoice3: instruct emotion plus inline tokens
+    #   "chatterbox" -> Chatterbox: a single exaggeration scalar
+    #   "fish"       -> Fish Speech: inline [tag] cues in the line itself
+    tts_backend: str = "qwen"
+    #: Per-line prosody planning for the lines that are synthesised.
+    #:   "off"  -> speak neutral, no LLM call
+    #:   "llm"  -> plan and fail if the endpoint is unreachable
+    #:   "auto" -> plan when the backend supports it, fall back to neutral on error
+    prosody_plan: str = "auto"
+    #: Chatterbox tuning. Ignored by every other backend.
+    chatterbox_exaggeration: float | None = Field(default=None, ge=0.0, le=1.0)
+    chatterbox_cfg_weight: float | None = None
+    chatterbox_temperature: float | None = None
+    #: Fish tuning. Ignored by every other backend.
+    fish_temperature: float | None = None
+    fish_top_p: float | None = None
+    fish_quantize: str | None = None
+
     # Duration fitting.
     #: How far a line may be *compressed* to fit. This is an intelligibility
     #: floor, not the point where trimming begins: past it the wording has to give
@@ -772,6 +793,39 @@ class JobConfig(BaseModel):
     @classmethod
     def _check_dtype(cls, value: str) -> str:
         return normalize_dtype(value)
+
+    @field_validator("tts_backend")
+    @classmethod
+    def _check_tts_backend(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "qwen": "qwen",
+            "base": "qwen",
+            "cosyvoice": "cosyvoice3",
+            "cosyvoice3": "cosyvoice3",
+            "chatterbox": "chatterbox",
+            "fish": "fish",
+            "fish-speech": "fish",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown TTS backend {value!r}. Use: qwen, cosyvoice3, "
+                "chatterbox or fish"
+            ) from None
+
+    @field_validator("prosody_plan")
+    @classmethod
+    def _check_prosody_plan(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {"off": "off", "none": "off", "llm": "llm", "auto": "auto"}
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown prosody plan {value!r}. Use: off, llm or auto"
+            ) from None
 
     @field_validator("devices")
     @classmethod

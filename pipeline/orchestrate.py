@@ -44,6 +44,7 @@ from .asr import (
 )
 from .config import (
     JobConfig,
+    NAME_TO_CODE,
     Settings,
     configure_allocator,
     language_code_for_name,
@@ -52,7 +53,7 @@ from .config import (
     release_gpu_memory,
 )
 from .diarize import NullDiarizer, assign_streams, detect_diarizer, single_speaker_labels
-from .errors import ASRError, DubbingError, MediaError, TimingError
+from .errors import ASRError, DubbingError, MediaError, TTSError, TimingError
 from .logging_utils import job_logger
 from .models import anchors_dir, resolve_model
 from .mixing import apply_room, duck_and_mix, room_tone_floor
@@ -345,6 +346,7 @@ class Pipeline:
         transcriber: Callable[[Path], Transcript] | None = None,
         translator: Translator | None = None,
         tts_engine: TTSEngine | None = None,
+        expressive_engine: Any | None = None,
         anchor_engine: Any | None = None,
         stretcher: Any | None = None,
         separator: Any | None = None,
@@ -364,6 +366,9 @@ class Pipeline:
         self._transcriber = transcriber
         self._translator = translator
         self._tts = tts_engine
+        #: Expressive-backend engine, injected in tests; ``None`` resolves the
+        #: real one lazily, and only when a non-qwen backend is selected.
+        self._expressive_engine = expressive_engine
         #: VoiceDesign engine used to generate accent anchors. Injected in tests;
         #: ``None`` resolves the real checkpoint lazily, and only on a cache miss.
         self._anchor_engine = anchor_engine
@@ -1555,6 +1560,10 @@ class Pipeline:
         simply ignores. One probe render per speaker buys the measurement; it is a
         single line of the accent text, so it is noise beside the job it sizes.
         """
+        if self.job.tts_backend != "qwen":
+            # The probe renders through the Base checkpoint; expressive backends
+            # fall back to the anchor/reference clip rate below.
+            return {}
         out = self.job_dir / _RATE_NAME
         speakers = self._speaker_order(transcript.segments)
 
@@ -1955,6 +1964,16 @@ class Pipeline:
         The anchor is generated only on a cache miss, so a warm cache never loads
         the VoiceDesign checkpoint at all.
         """
+        if self.job.tts_backend != "qwen" and self.job.accent_mode != "reference-accent":
+            # An expressive backend clones each speaker from the donor/pinned clip
+            # and takes its accent from there. The Qwen anchor machinery is not
+            # used, and generating it would require the VoiceDesign checkpoint, so
+            # resolve nothing; the word budget falls back to duration hints only.
+            self._accents, self._accent_records = {}, {}
+            self._primary_accent = None
+            self._primary_speaker_name = None
+            return {}
+
         speakers = self._speaker_order(transcript.segments)
 
         if self.job.accent_mode == "reference-accent":
@@ -2118,6 +2137,10 @@ class Pipeline:
         clips fix the voice of the whole video: regenerating them would make an
         otherwise identical rerun sound like different people.
         """
+        if self.job.tts_backend != "qwen":
+            # The two-stage blend is a Qwen-Base mechanism, and running it would
+            # load that checkpoint. Expressive backends clone the donor directly.
+            return {}
         if self.job.accent_mode not in ("native", "reference-accent"):
             return {}
         if self.job.accent_blend_mode != "two-stage":
@@ -2213,7 +2236,21 @@ class Pipeline:
             donors = self._resolve_donors(audio_path, transcript)
             self._write_voices(transcript, donors, blends)
 
-            produced, sample_rate = self._synthesize_all(lines, script, donors, blends)
+            if self.job.tts_backend == "qwen":
+                produced, sample_rate = self._synthesize_all(
+                    lines, script, donors, blends
+                )
+                resynthesize = lambda owned, texts: self._retry_lines(  # noqa: E731
+                    owned, texts, donors, blends, tmp_dir
+                )
+            else:
+                prosody = self._plan_prosody(lines, script)
+                produced, sample_rate = self._synthesize_expressive(
+                    lines, script, donors, tmp_dir, prosody
+                )
+                resynthesize = lambda owned, texts: self._retry_lines(  # noqa: E731
+                    owned, texts, donors, blends, tmp_dir, prosody
+                )
             if sample_rate > 0:
                 wavs = self._refine_overlong(
                     sample_rate,
@@ -2221,9 +2258,7 @@ class Pipeline:
                     script,
                     [produced.get(segment.id) for segment in lines],
                     tmp_dir,
-                    resynthesize=lambda owned, texts: self._retry_lines(
-                        owned, texts, donors, blends
-                    ),
+                    resynthesize=resynthesize,
                 )
             else:
                 # Nothing was synthesised (every line blank), so there is nothing
@@ -2375,11 +2410,262 @@ class Pipeline:
         texts: Sequence[str],
         donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
         blends: Mapping[str, Path],
+        tmp_dir: Path,
+        prosody: Mapping[int, Any] | None = None,
     ) -> list[np.ndarray | None]:
-        """Re-synthesise rewritten lines, each in its own speaker's voice."""
+        """Re-synthesise rewritten lines, each in its own speaker's voice.
+
+        The rewritten text is new, so a Fish plan (tags written *into* the line)
+        is re-derived for just these lines; the structured specs the other
+        backends use are keyed by segment id and stay valid.
+        """
         by_id = {segment.id: text for segment, text in zip(segments, texts)}
-        produced, _rate = self._synthesize_all(segments, by_id, donors, blends)
+        if self.job.tts_backend == "qwen":
+            produced, _rate = self._synthesize_all(segments, by_id, donors, blends)
+        else:
+            if self.job.tts_backend == "fish":
+                prosody = self._plan_prosody(segments, by_id)
+            produced, _rate = self._synthesize_expressive(
+                segments, by_id, donors, tmp_dir, prosody
+            )
         return [produced.get(segment.id) for segment in segments]
+
+    # -- expressive backends ----------------------------------------------- #
+
+    def _resolve_expressive_engine(self) -> Any:
+        """The engine for :attr:`JobConfig.tts_backend`, built once and kept."""
+        if self._expressive_engine is not None:
+            return self._expressive_engine
+        from .backends import build_expressive_engine
+
+        self.log.info(
+            "Synthesising with the %s backend on %s.",
+            self.job.tts_backend,
+            self.job.primary_device,
+        )
+        self._expressive_engine = build_expressive_engine(
+            self.job.tts_backend,
+            self.settings.models_dir,
+            self.job.primary_device,
+            exaggeration=self.job.chatterbox_exaggeration,
+            cfg_weight=self.job.chatterbox_cfg_weight,
+            temperature=self.job.chatterbox_temperature,
+            fish_temperature=self.job.fish_temperature,
+            fish_top_p=self.job.fish_top_p,
+            fish_quantize=self.job.fish_quantize,
+        )
+        return self._expressive_engine
+
+    def _plan_prosody(
+        self, lines: Sequence[Segment], script: Mapping[int, str]
+    ) -> dict[int, Any]:
+        """Per-line delivery for the expressive backends, keyed by segment id.
+
+        ``qwen`` has no prosody control and returns nothing. For Fish the plan is
+        the *text itself* (tags written into the line); for CosyVoice3 and
+        Chatterbox it is one :class:`~pipeline.prosody.ProsodySpec` per line.
+
+        ``auto`` falls back to a neutral delivery when the LLM is unreachable;
+        ``llm`` lets the error propagate so a broken endpoint is not silent.
+        """
+        backend = self.job.tts_backend
+        if backend == "qwen":
+            if self.job.prosody_plan == "llm":
+                self.log.warning(
+                    "Qwen Base has no prosody controls; --prosody-plan llm is "
+                    "ignored."
+                )
+            return {}
+        if self.job.prosody_plan == "off":
+            return {}
+
+        ids = [segment.id for segment in lines]
+        texts = [script.get(segment_id, "") for segment_id in ids]
+        indexes = [index for index, text in enumerate(texts) if text.strip()]
+
+        if backend == "fish":
+            from .prosody import FishInlinePlanner
+
+            planned = list(texts)
+            if indexes:
+                planner = FishInlinePlanner(
+                    base_url=self.settings.llm_base_url,
+                    api_key=self.settings.llm_api_key,
+                    model=self.job.llm_model or self.settings.llm_model,
+                    timeout_s=self.settings.llm_timeout_s,
+                    chunk_size=self.settings.llm_plan_chunk_size,
+                )
+                try:
+                    tagged = planner.plan_lines(
+                        [texts[index] for index in indexes],
+                        language=self.job.target_language,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fall back on any failure
+                    if self.job.prosody_plan == "llm":
+                        raise
+                    self.log.warning(
+                        "Fish tag planning failed (%s); lines will be spoken "
+                        "without tags.",
+                        exc,
+                    )
+                    tagged = [texts[index] for index in indexes]
+                for position, index in enumerate(indexes):
+                    planned[index] = (
+                        tagged[position] if position < len(tagged) else texts[index]
+                    )
+            self.log.info("Planned Fish tags for %d line(s).", len(indexes))
+            return {
+                segment_id: planned[index]
+                for index, segment_id in enumerate(ids)
+            }
+
+        from .prosody import ProsodyPlanner, ProsodySpec
+
+        specs: list[Any] = [ProsodySpec() for _ in texts]
+        if indexes:
+            planner = ProsodyPlanner(
+                base_url=self.settings.llm_base_url,
+                api_key=self.settings.llm_api_key,
+                model=self.job.llm_model or self.settings.llm_model,
+                timeout_s=self.settings.llm_timeout_s,
+                backend=backend,
+                chunk_size=self.settings.llm_plan_chunk_size,
+            )
+            try:
+                planned_specs = planner.plan([texts[index] for index in indexes])
+            except Exception as exc:  # noqa: BLE001 - fall back on any failure
+                if self.job.prosody_plan == "llm":
+                    raise
+                self.log.warning(
+                    "Prosody planning failed (%s); lines will be spoken neutral.",
+                    exc,
+                )
+                planned_specs = [ProsodySpec() for _ in indexes]
+            for position, index in enumerate(indexes):
+                specs[index] = (
+                    planned_specs[position]
+                    if position < len(planned_specs)
+                    else ProsodySpec()
+                )
+        self.log.info("Planned prosody for %d line(s) with %s.", len(indexes), backend)
+        return {segment_id: specs[index] for index, segment_id in enumerate(ids)}
+
+    def _expressive_reference(
+        self,
+        name: str,
+        donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
+        tmp_dir: Path,
+    ) -> tuple[Any, str | None]:
+        """The clip an expressive backend clones ``name`` from, and its transcript.
+
+        A pinned reference (``--ref-audio``/``--voice``) is used as-is for every
+        speaker. Otherwise the speaker's auto-selected donor is written to a WAV
+        under the job's scratch directory, because the engines load a path.
+        """
+        if self.job.ref_audio is not None:
+            return self.job.ref_audio, (self.job.ref_text or "").strip() or None
+        donor, _info = donors.get(name, (None, {}))
+        if donor is not None:
+            safe = "".join(char if char.isalnum() else "_" for char in name)
+            path = tmp_dir / f"donor_{safe or 'speaker'}.wav"
+            media.write_audio(path, donor.samples, donor.sample_rate)
+            return path, (donor.text or "").strip() or None
+        accent = self._accents.get(name)
+        if accent is not None:
+            clip, text = accent
+            return clip, (text or "").strip() or None
+        raise TTSError(f"No reference clip is available for speaker {name!r}.")
+
+    def _synthesize_expressive(
+        self,
+        segments: Sequence[Segment],
+        texts: Mapping[int, str],
+        donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
+        tmp_dir: Path,
+        prosody: Mapping[int, Any] | None = None,
+    ) -> tuple[dict[int, np.ndarray], int]:
+        """Synthesise every line with an expressive backend, one voice at a time.
+
+        Blank lines map to ``None`` (they are never sent to the engine), matching
+        the Qwen path so the timing stage can emit a matching stretch of silence.
+        """
+        from .prosody import ProsodySpec
+
+        prosody = prosody or {}
+        engine = self._resolve_expressive_engine()
+        backend = self.job.tts_backend
+        language = self.job.target_language
+        language_code = NAME_TO_CODE.get(language)
+        produced: dict[int, np.ndarray] = {}
+        sample_rate = 0
+
+        grouped = [
+            (
+                name,
+                [
+                    segment
+                    for segment in segments
+                    if self._speaker_of(segment) == name
+                ],
+            )
+            for name in self._speaker_order(segments)
+        ]
+        for name, owned in grouped:
+            reference, ref_text = self._expressive_reference(name, donors, tmp_dir)
+            ids: list[int] = []
+            speak: list[str] = []
+            specs: list[Any] = []
+            for segment in owned:
+                text = texts.get(segment.id, "")
+                if not text.strip():
+                    continue
+                ids.append(segment.id)
+                if backend == "fish":
+                    speak.append(str(prosody.get(segment.id, text)))
+                else:
+                    speak.append(text)
+                    specs.append(prosody.get(segment.id) or ProsodySpec())
+            if not ids:
+                continue
+            if backend == "fish":
+                wavs = engine.synthesize(
+                    speak,
+                    reference=reference,
+                    ref_text=ref_text,
+                    language=language,
+                )
+            elif backend == "chatterbox":
+                wavs = engine.synthesize(
+                    speak,
+                    reference=reference,
+                    prosody=specs,
+                    language=language_code,
+                )
+            else:  # cosyvoice3
+                wavs = engine.synthesize(
+                    speak,
+                    reference=reference,
+                    prosody=specs,
+                    ref_text=ref_text,
+                    language=language,
+                )
+            if len(wavs) != len(ids):
+                raise TTSError(
+                    f"{backend} returned {len(wavs)} clip(s) for {len(ids)} line(s)."
+                )
+            for segment_id, wav in zip(ids, wavs):
+                samples = np.ascontiguousarray(
+                    np.asarray(wav, dtype=np.float32).reshape(-1)
+                )
+                if samples.size:
+                    produced[segment_id] = samples
+            if sample_rate <= 0:
+                try:
+                    sample_rate = int(engine.sample_rate)
+                except Exception:  # noqa: BLE001 - only needed to write the files
+                    sample_rate = 0
+        return produced, sample_rate
+
 
     def _write_voices(
         self,
@@ -2399,6 +2685,7 @@ class Pipeline:
         for name in self._speaker_order(transcript.segments):
             _donor, info = donors.get(name, (None, {}))
             record: dict[str, Any] = dict(info)
+            record["backend"] = self.job.tts_backend
             record["accent_mode"] = self.job.accent_mode
             accent_record = self._accent_records.get(name)
             if accent_record is not None:

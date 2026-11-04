@@ -737,6 +737,80 @@ def build_dub_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--backend",
+        dest="tts_backend",
+        default="qwen",
+        choices=["qwen", "cosyvoice3", "chatterbox", "fish"],
+        help=(
+            "Synthesiser for the dubbed lines. 'qwen' (default) clones with the "
+            "Qwen Base checkpoint and has no prosody control; 'cosyvoice3', "
+            "'chatterbox' and 'fish' additionally render per-line emotion (see "
+            "--prosody-plan). All four clone each speaker from a clip of their "
+            "own voice."
+        ),
+    )
+    parser.add_argument(
+        "--prosody-plan",
+        dest="prosody_plan",
+        default="auto",
+        choices=["off", "llm", "auto"],
+        help=(
+            "Let the configured OpenAI-compatible model decide per-line delivery "
+            "(emotion, pace, volume, breath, pause, laughter) for the expressive "
+            "backends. 'auto' plans when the LLM is reachable and falls back to "
+            "neutral otherwise; 'llm' fails if it is unreachable; 'off' speaks "
+            "neutral. Ignored by --backend qwen, which has no prosody control."
+        ),
+    )
+    parser.add_argument(
+        "--chatterbox-exaggeration",
+        type=float,
+        default=None,
+        metavar="0..1",
+        help=(
+            "Chatterbox: fixed expression intensity for every line, overriding "
+            "the value derived from the planned emotion."
+        ),
+    )
+    parser.add_argument(
+        "--chatterbox-cfg-weight",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Chatterbox: classifier-free guidance weight (package default 0.5).",
+    )
+    parser.add_argument(
+        "--chatterbox-temperature",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Chatterbox: sampling temperature (package default 0.8).",
+    )
+    parser.add_argument(
+        "--fish-temperature",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fish Speech: sampling temperature (model default 0.7).",
+    )
+    parser.add_argument(
+        "--fish-top-p",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fish Speech: nucleus sampling probability (model default 0.7).",
+    )
+    parser.add_argument(
+        "--fish-quantize",
+        dest="fish_quantize",
+        default=None,
+        choices=["int8", "off"],
+        help=(
+            "Fish Speech weight format. 'int8' loads 8-bit weight-only so the "
+            "model fits a 12 GB card; 'off' loads the bf16 weights."
+        ),
+    )
+    parser.add_argument(
         "--stretcher",
         default="auto",
         choices=["auto", "rubberband", "sox", "librosa", "none"],
@@ -1922,43 +1996,24 @@ def _neural_engine(
     fish_top_p: float | None = None,
     fish_quantize: str | None = None,
 ) -> Any:
-    """Build the engine for one expressive backend."""
-    if backend == "cosyvoice3":
-        from pipeline.cosyvoice import CosyVoiceEngine
+    """Build the engine for one expressive backend.
 
-        return CosyVoiceEngine(
-            resolve_model("tts_cosyvoice3", models_dir),
-            device=device,
-        )
-    if backend == "chatterbox":
-        from pipeline.chatterbox import ChatterboxEngine
+    Delegates to :func:`pipeline.backends.build_expressive_engine` so the dubbing
+    pipeline resolves exactly the same engine from the same knobs.
+    """
+    from pipeline.backends import build_expressive_engine
 
-        try:
-            model_dir: Path | None = resolve_model("tts_chatterbox", models_dir)
-        except ModelNotFoundError:
-            # Chatterbox fetches its own weights by repo id; a missing local copy
-            # is not an error.
-            model_dir = None
-        return ChatterboxEngine(
-            model_dir,
-            device=device,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
-            temperature=temperature,
-        )
-    if backend == "fish":
-        from pipeline.fish import FishEngine
-
-        return FishEngine(
-            resolve_model("tts_fish", models_dir),
-            device=device,
-            temperature=fish_temperature,
-            top_p=fish_top_p,
-            quantize=fish_quantize,
-        )
-    raise ConfigError(
-        f"Unknown backend {backend!r}. Use: qwen, customvoice, cosyvoice3, "
-        "chatterbox, fish"
+    return build_expressive_engine(
+        backend,
+        models_dir,
+        device,
+        exaggeration=exaggeration,
+        cfg_weight=cfg_weight,
+        temperature=temperature,
+        fish_temperature=fish_temperature,
+        fish_top_p=fish_top_p,
+        fish_quantize=fish_quantize,
+        resolve=resolve_model,
     )
 
 
@@ -2765,6 +2820,14 @@ def job_config_from_args(
         whisper_model=args.whisper_model,
         llm_model=args.llm_model,
         tts_batch=args.tts_batch,
+        tts_backend=getattr(args, "tts_backend", "qwen"),
+        prosody_plan=getattr(args, "prosody_plan", "auto"),
+        chatterbox_exaggeration=getattr(args, "chatterbox_exaggeration", None),
+        chatterbox_cfg_weight=getattr(args, "chatterbox_cfg_weight", None),
+        chatterbox_temperature=getattr(args, "chatterbox_temperature", None),
+        fish_temperature=getattr(args, "fish_temperature", None),
+        fish_top_p=getattr(args, "fish_top_p", None),
+        fish_quantize=getattr(args, "fish_quantize", None),
         min_stretch=args.min_stretch,
         max_stretch=args.max_stretch,
         max_overrun=args.max_overrun,
