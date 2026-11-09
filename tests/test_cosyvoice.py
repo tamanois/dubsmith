@@ -171,6 +171,45 @@ def test_inline_tokens_use_cross_lingual(
     )
 
 
+def test_cross_lingual_neutral_line_drops_the_reference_accent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
+    engine.synthesize(
+        ["Bonjour."],
+        reference=tmp_path / "voice.wav",
+        prosody=[ProsodySpec()],
+        ref_text="Hello, this is the same speaker.",
+        language="French",
+        cross_lingual=True,
+    )
+
+    payload = captured[0]
+    assert payload["modes"] == ["cross_lingual"]
+    assert payload["prompts"] == [""]
+    assert payload["lines"][0].startswith(
+        "You are a helpful assistant.<|endofprompt|>"
+    )
+
+
+def test_cross_lingual_does_not_override_an_instruct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, captured = _capturing_engine(tmp_path, monkeypatch)
+    engine.synthesize(
+        ["Félicitations!"],
+        reference=tmp_path / "voice.wav",
+        prosody=[ProsodySpec(emotion="happy")],
+        ref_text="Félicitations, vous avez gagné.",
+        language="French",
+        cross_lingual=True,
+    )
+
+    payload = captured[0]
+    assert payload["modes"] == ["zero_shot"]
+    assert payload["prompts"][0].endswith("Félicitations, vous avez gagné.")
+
+
 def test_synthesize_french_instruct_uses_zero_shot_with_the_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

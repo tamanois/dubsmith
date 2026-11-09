@@ -134,12 +134,18 @@ translated line:
 python dub.py --video talk.mp4 --target fr --backend chatterbox --prosody-plan auto
 python dub.py --video talk.mp4 --target fr --backend cosyvoice3 --prosody-plan llm
 python dub.py --video talk.mp4 --target fr --backend fish --prosody-plan auto
+
+# keep the speaker's timbre but take a native target accent
+python dub.py --video talk.mp4 --target fr --backend fish \
+  --expressive-accent blend
 ```
 
 `--prosody-plan auto` is the dubbing default: it plans when the LLM endpoint is
 reachable and falls back to neutral otherwise. `off` speaks neutral; `llm` fails
 if the endpoint is unreachable. `customvoice` is **speech-generation only** and
-is not a dubbing backend.
+is not a dubbing backend. Expressive backends clone the source-language donor by
+default, so they keep its accent; `--expressive-accent blend` builds the
+target-language reference with Qwen Base first and then clones that.
 
 **Add subtitles without dubbing**
 

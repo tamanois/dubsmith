@@ -537,6 +537,11 @@ class JobConfig(BaseModel):
     #: (the accent clip's voice) to ``1.0`` (a French utterance in the speaker's own
     #: voice). Iteration stops as soon as it is met; ``0`` disables the search.
     blend_ratio: float | None = None
+    #: How an expressive backend gets the clip it clones.
+    #   "donor" -> clone the source-language donor/pinned clip (current behaviour)
+    #   "blend" -> clone the Qwen-built target-language blended reference, which
+    #              keeps the speaker's timbre but takes a native target accent
+    expressive_accent: str = "donor"
 
     # Speaker separation.
     #   "auto" -> cluster per-segment speaker embeddings, so each voice is cloned
@@ -648,6 +653,25 @@ class JobConfig(BaseModel):
         except KeyError:
             raise ConfigError(
                 f"Unknown accent blend {value!r}. Use: two-stage or single-stage"
+            ) from None
+
+    @field_validator("expressive_accent")
+    @classmethod
+    def _check_expressive_accent(cls, value: str) -> str:
+        key = str(value).strip().lower().replace("_", "-")
+        aliases = {
+            "donor": "donor",
+            "preserve": "donor",
+            "source": "donor",
+            "blend": "blend",
+            "native": "blend",
+            "anchor": "blend",
+        }
+        try:
+            return aliases[key]
+        except KeyError:
+            raise ConfigError(
+                f"Unknown expressive accent {value!r}. Use: donor or blend"
             ) from None
 
     @field_validator("blend_takes")
@@ -939,6 +963,26 @@ class JobConfig(BaseModel):
                 raise ConfigError(
                     f"--accent-match only applies to --accent-mode native, not "
                     f"{self.accent_mode!r}."
+                )
+
+        if self.expressive_accent == "blend":
+            if self.tts_backend == "qwen":
+                raise ConfigError(
+                    "--expressive-accent blend only applies to the expressive "
+                    "backends (cosyvoice3, chatterbox, fish); the Qwen path "
+                    "already builds the blend."
+                )
+            if self.accent_mode not in ("native", "reference-accent"):
+                raise ConfigError(
+                    "--expressive-accent blend requires --accent-mode native "
+                    "or reference-accent: it needs a target-language accent "
+                    "source to blend."
+                )
+            if self.accent_blend_mode != "two-stage":
+                raise ConfigError(
+                    "--expressive-accent blend requires --accent-blend "
+                    "two-stage: single-stage leaves no clip for the backend "
+                    "to clone."
                 )
 
         # The blend knobs only mean anything for a blended accent (native or

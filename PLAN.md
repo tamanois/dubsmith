@@ -35,9 +35,10 @@
 | Room matching (P3d) | ✅ | `pipeline/mixing.py`, `--room match` |
 | Quality gate (P3e) | ✅ | `audit_qc.py`, `pipeline/audit.py` |
 | Native accent by default (P2) | ✅ | `pipeline/anchors.py`, `Pipeline._stage_accent_anchor`, `dub.py anchors`, `--accent-match` |
+| Expressive native accent (`--expressive-accent blend`) | ✅ | `pipeline/orchestrate.py`, `pipeline/cosyvoice.py`, `--expressive-accent` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1356 tests (1353 passed, 3 skipped) | `tests/` |
+| Tests | ✅ 1396 tests (all passed) | `tests/` |
 
 Verification performed:
 

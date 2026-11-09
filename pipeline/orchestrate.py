@@ -394,6 +394,9 @@ class Pipeline:
         self._stage_seconds: dict[str, float] = {}
         #: Segments of the run currently being refined (set by the length repair).
         self._segments_for_refine: list[Any] = []
+        #: Language detected by ASR (a Whisper code), used to decide whether an
+        #: expressive backend is cloning a source-language donor.
+        self._source_language: str | None = None
         #: Accent clip per speaker (path/array + its transcript), resolved once by
         #: the accent stage and consumed by the blend and synthesis stages.
         self._accents: dict[str, tuple[Any, str]] = {}
@@ -433,6 +436,7 @@ class Pipeline:
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         self.log.info("Starting job for %s", self.input_path.name)
+        self._warn_expressive_accent_scope()
         run_started = time.perf_counter()
         try:
             audio_path = self._stage_audio()
@@ -441,6 +445,7 @@ class Pipeline:
             # music and ambience only degrade both.
             source_audio = speech_path or audio_path
             transcript = self._stage_transcribe(source_audio, tmp_dir)
+            self._source_language = transcript.language
             # Who speaks each line. Annotates the segments in place, and is a no-op
             # beyond one speaker when diarization is off or unavailable.
             self._stage_diarize(source_audio, transcript)
@@ -501,6 +506,10 @@ class Pipeline:
             # blend and the probe both need the base checkpoint, so they run back
             # to back and it loads once.
             rates = self._stage_rate_probe(source_audio, transcript, accents, blends)
+            if self._uses_expressive_accent_blend():
+                # The blend just used Qwen Base. Drop it before the expressive
+                # backend loads its own checkpoint on the same primary device.
+                self._release_expressive_blend_engine()
             script = self._stage_translate(transcript, lines, rates)
             # What will actually be spoken: the script, minus the lines whose
             # translation cannot fit even at the compression floor. Checked here
@@ -523,6 +532,58 @@ class Pipeline:
             )
             # Never leak scratch space, even on failure.
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _uses_expressive_accent_blend(self) -> bool:
+        """True when an expressive backend should clone the Qwen-built blend.
+
+        The blend is opt-in because it loads Qwen Base during stage 1. It is only
+        meaningful where there is an accent source to blend with, so ``preserve``
+        and ``speaker-only`` stay on the donor path.
+        """
+        return (
+            self.job.tts_backend != "qwen"
+            and self.job.expressive_accent == "blend"
+            and self.job.accent_mode in ("native", "reference-accent")
+        )
+
+    def _release_expressive_blend_engine(self) -> None:
+        """Drop the Qwen engine that only built an expressive accent reference.
+
+        The blend runs on Qwen Base, but the lines are synthesised by an
+        expressive backend on the same primary device. Keeping the Base engine
+        resident would make the two checkpoints contend for VRAM.
+        """
+        self._close_runner()
+        self._tts = None
+        release_gpu_memory()
+
+    def _warn_expressive_accent_scope(self) -> None:
+        """Say when an accent mode will not reach the selected backend.
+
+        The accent modes are implemented by the Qwen prompt builder. An
+        expressive backend takes a single reference clip, so without the opt-in
+        blend it clones the donor's source accent. A silent fallback here is the
+        difference between "French with an English accent" and a clear next step.
+        """
+        backend = self.job.tts_backend
+        if backend == "qwen" or self.job.expressive_accent == "blend":
+            return
+        if self.job.accent_mode == "preserve":
+            return
+        message = (
+            f"Backend {backend} clones the source speaker's accent; "
+            f"--accent-mode {self.job.accent_mode} is only applied by Qwen. "
+            "Use --expressive-accent blend for a target-language reference, "
+            "or --accent-mode preserve to make this fallback explicit."
+        )
+        if backend == "fish":
+            message += (
+                " Fish has no language parameter, so it cannot separate timbre "
+                "from the reference accent."
+            )
+        if self.job.accent_match != "off":
+            message += " --accent-match has no effect in this fallback."
+        self.log.warning(message)
 
     # -- stage plumbing ---------------------------------------------------- #
 
@@ -1969,11 +2030,16 @@ class Pipeline:
         The anchor is generated only on a cache miss, so a warm cache never loads
         the VoiceDesign checkpoint at all.
         """
-        if self.job.tts_backend != "qwen" and self.job.accent_mode != "reference-accent":
-            # An expressive backend clones each speaker from the donor/pinned clip
-            # and takes its accent from there. The Qwen anchor machinery is not
-            # used, and generating it would require the VoiceDesign checkpoint, so
-            # resolve nothing; the word budget falls back to duration hints only.
+        if (
+            self.job.tts_backend != "qwen"
+            and not self._uses_expressive_accent_blend()
+            and self.job.accent_mode != "reference-accent"
+        ):
+            # Without the opt-in expressive blend, an expressive backend clones
+            # each speaker from the donor/pinned clip and takes its accent from
+            # there. The Qwen anchor machinery is not used, and generating it
+            # would require the VoiceDesign checkpoint, so resolve nothing; the
+            # word budget falls back to duration hints only.
             self._accents, self._accent_records = {}, {}
             self._primary_accent = None
             self._primary_speaker_name = None
@@ -2142,14 +2208,20 @@ class Pipeline:
         clips fix the voice of the whole video: regenerating them would make an
         otherwise identical rerun sound like different people.
         """
-        if self.job.tts_backend != "qwen":
+        if self.job.tts_backend != "qwen" and not self._uses_expressive_accent_blend():
             # The two-stage blend is a Qwen-Base mechanism, and running it would
-            # load that checkpoint. Expressive backends clone the donor directly.
+            # load that checkpoint. Without the opt-in expressive blend, an
+            # expressive backend clones the donor directly.
             return {}
         if self.job.accent_mode not in ("native", "reference-accent"):
             return {}
         if self.job.accent_blend_mode != "two-stage":
             return {}
+        if self.job.tts_backend != "qwen":
+            self.log.info(
+                "Building the target-language reference for %s with Qwen Base.",
+                self.job.tts_backend,
+            )
 
         resolved = dict(accents) if accents is not None else dict(self._accents)
         speakers = self._speaker_order(transcript.segments)
@@ -2252,7 +2324,7 @@ class Pipeline:
             else:
                 prosody, recorder = self._plan_prosody(lines, script)
                 produced, sample_rate = self._synthesize_expressive(
-                    lines, script, donors, tmp_dir, prosody, recorder
+                    lines, script, donors, tmp_dir, prosody, recorder, blends
                 )
                 resynthesize = lambda owned, texts: self._retry_lines(  # noqa: E731
                     owned, texts, donors, blends, tmp_dir, prosody, recorder
@@ -2435,7 +2507,7 @@ class Pipeline:
             if self.job.tts_backend == "fish":
                 prosody, recorder = self._plan_prosody(segments, by_id, recorder)
             produced, _rate = self._synthesize_expressive(
-                segments, by_id, donors, tmp_dir, prosody, recorder
+                segments, by_id, donors, tmp_dir, prosody, recorder, blends
             )
         return [produced.get(segment.id) for segment in segments]
 
@@ -2595,13 +2667,23 @@ class Pipeline:
         name: str,
         donors: Mapping[str, tuple[DonorClip | None, dict[str, Any]]],
         tmp_dir: Path,
+        blends: Mapping[str, Path] | None = None,
     ) -> tuple[Any, str | None]:
         """The clip an expressive backend clones ``name`` from, and its transcript.
 
-        A pinned reference (``--ref-audio``/``--voice``) is used as-is for every
-        speaker. Otherwise the speaker's auto-selected donor is written to a WAV
-        under the job's scratch directory, because the engines load a path.
+        The opt-in expressive blend is used first: it already speaks the accent
+        transcript in the speaker's timbre, so its own transcript is the right
+        alignment text. Otherwise a pinned reference (``--ref-audio``/``--voice``)
+        is used as-is for every speaker, and failing that the speaker's
+        auto-selected donor is written to a WAV under the job's scratch directory,
+        because the engines load a path.
         """
+        if blends and name in blends:
+            accent = self._accents.get(name)
+            text = (
+                accent[1] if accent is not None else self.job.accent_text or ""
+            ).strip()
+            return blends[name], text or None
         if self.job.ref_audio is not None:
             return self.job.ref_audio, (self.job.ref_text or "").strip() or None
         donor, _info = donors.get(name, (None, {}))
@@ -2624,6 +2706,7 @@ class Pipeline:
         tmp_dir: Path,
         prosody: Mapping[int, Any] | None = None,
         recorder: Any | None = None,
+        blends: Mapping[str, Path] | None = None,
     ) -> tuple[dict[int, np.ndarray], int]:
         """Synthesise every line with an expressive backend, one voice at a time.
 
@@ -2634,10 +2717,27 @@ class Pipeline:
         from .provenance import LineProvenance, describe_transformations
 
         prosody = prosody or {}
+        blends = blends or {}
         engine = self._resolve_expressive_engine()
         backend = self.job.tts_backend
         language = self.job.target_language
         language_code = NAME_TO_CODE.get(language)
+        source_code = language_code_for_name(self._source_language)
+        # A source-language donor's accent leaks through CosyVoice's zero-shot
+        # prompt. Cross-lingual drops those speech codes and lets the model use
+        # its own phonetics for the target language. A blend already speaks the
+        # target language, so it keeps the grounding transcript instead. Compare
+        # codes so an unsupported auto-detected language simply stays on the
+        # zero-shot path rather than raising.
+        cross_lingual = (
+            backend == "cosyvoice3"
+            and not blends
+            and self.job.accent_mode != "preserve"
+            and self.job.ref_audio is None
+            and source_code is not None
+            and language_code is not None
+            and source_code != language_code
+        )
         produced: dict[int, np.ndarray] = {}
         sample_rate = 0
 
@@ -2653,7 +2753,9 @@ class Pipeline:
             for name in self._speaker_order(segments)
         ]
         for name, owned in grouped:
-            reference, ref_text = self._expressive_reference(name, donors, tmp_dir)
+            reference, ref_text = self._expressive_reference(
+                name, donors, tmp_dir, blends
+            )
             ids: list[int] = []
             speak: list[str] = []
             specs: list[Any] = []
@@ -2693,6 +2795,7 @@ class Pipeline:
                     prosody=specs,
                     ref_text=ref_text,
                     language=language,
+                    cross_lingual=cross_lingual,
                     trace=trace,
                 )
             if len(wavs) != len(ids):
@@ -3517,6 +3620,7 @@ class Pipeline:
             "background_preserved": has_background,
             "duck_db": effective_duck,
             "accent_mode": self.job.accent_mode,
+            "expressive_accent": self.job.expressive_accent,
             #: Which device and precision the models ran on.
             "device": self._device_info(),
             #: How synthesis batched, and the memory it actually reached. A run

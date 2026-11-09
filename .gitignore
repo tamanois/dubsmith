@@ -52,6 +52,7 @@ Thumbs.db
 *.mkv
 *.mov
 *.webm
+*.out
 
 # …but allow small, consented demo assets.
 !docs/media/**

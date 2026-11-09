@@ -294,6 +294,7 @@ class CosyVoiceEngine:
         prosody: Sequence[ProsodySpec] | None,
         ref_text: str | None,
         language: str | None = None,
+        cross_lingual: bool = False,
     ) -> tuple[list[str], list[str], list[str], list[str]]:
         """Per-line ``(text, instruct, prompt, mode)`` for the worker."""
         specs = resolve_prosody(lines, prosody)
@@ -306,10 +307,12 @@ class CosyVoiceEngine:
         for index, line in enumerate(lines):
             spec = specs[index]
             mode = cosyvoice_mode(spec)
-            if mode == "zero_shot" and not have_transcript:
-                # No transcript to condition on: the token path still clones
-                # the speaker and keeps the language, where an empty prompt
-                # would weaken the clone.
+            if mode == "zero_shot" and (cross_lingual or not have_transcript):
+                # Cross-lingual drops the reference speech codes, which is what
+                # keeps a source-language donor from lending its accent. It is
+                # also the fallback when there is no transcript to condition on:
+                # the token path still clones the speaker and keeps the language,
+                # where an empty prompt would weaken the clone.
                 mode = "cross_lingual"
             if mode == "instruct2":
                 text = apply_inline_tokens(line, spec)
@@ -350,6 +353,7 @@ class CosyVoiceEngine:
         prosody: Sequence[ProsodySpec] | None = None,
         ref_text: str | None = None,
         language: str | None = None,
+        cross_lingual: bool = False,
         trace: list[dict[str, Any]] | None = None,
     ) -> list[np.ndarray]:
         """Synthesise each line in the reference voice.
@@ -363,6 +367,12 @@ class CosyVoiceEngine:
         * only inline tokens (breath/pause/laughter) -> ``inference_cross_lingual``;
         * emotion/pace/volume -> ``inference_instruct2``.
 
+        When the reference clip speaks another language than the target, pass
+        ``cross_lingual=True``. Neutral lines then use
+        ``inference_cross_lingual``, which clones the speaker without carrying the
+        reference's accent. Lines with an emotion/pace/volume instruction keep the
+        zero-shot path so their prosody still has a grounding transcript.
+
         Args:
             lines: Target-language lines to speak, one utterance each.
             reference: Path to a clip of the voice to clone. CosyVoice loads it
@@ -370,6 +380,8 @@ class CosyVoiceEngine:
             prosody: One spec per line; a single value broadcasts.
             ref_text: Exact transcript of ``reference``. Used by the zero-shot
                 clone path to keep the reference's accent and pronunciation.
+            cross_lingual: Use the cross-lingual method for neutral lines, so a
+                source-language reference does not lend its accent.
 
         Returns:
             One mono float32 array per line, in order.
@@ -386,6 +398,7 @@ class CosyVoiceEngine:
             prosody=prosody,
             ref_text=ref_text,
             language=language,
+            cross_lingual=cross_lingual,
         )
         if trace is not None:
             for text, instruct, prompt, mode in zip(texts, values, prompts, modes):
@@ -401,11 +414,12 @@ class CosyVoiceEngine:
         self._ensure_available()
 
         _LOGGER.debug(
-            "CosyVoice request: lines=%d reference=%s language=%s modes=%s "
-            "text_frontend=%s",
+            "CosyVoice request: lines=%d reference=%s language=%s "
+            "cross_lingual=%s modes=%s text_frontend=%s",
             len(lines),
             reference,
             language or "auto",
+            cross_lingual,
             modes,
             self._text_frontend,
         )

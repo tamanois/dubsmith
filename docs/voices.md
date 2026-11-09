@@ -447,6 +447,31 @@ available and unchanged. `speaker-only` is the cheap option — no extra clip, b
 the model chooses the delivery — and `reference-accent` costs you one clip and its
 transcript, buying an accent you pick by hand.
 
+### Expressive backends and accent modes
+
+The modes above are implemented by the Qwen prompt builder. CosyVoice3,
+Chatterbox and Fish clone from a single reference clip, so `native`,
+`reference-accent` and `speaker-only` cannot be applied by the backend itself. By
+default (`--expressive-accent donor`) they clone the source-language donor and
+keep its accent; a run logs a warning when the requested mode will not reach the
+backend. `--accent-mode preserve` is the explicit way to ask for that.
+
+To keep the speaker's timbre and get a native target accent, use
+`--expressive-accent blend` with `--accent-mode native` or `reference-accent`. The
+pipeline builds the same two-stage blend the Qwen path uses (Qwen Base plus the
+generated or supplied accent clip) and hands that target-language WAV to the
+expressive backend as its reference. This loads Qwen Base for the one-off blend,
+then frees it before the expressive checkpoint loads. It requires
+`--accent-blend two-stage` (the default); `single-stage` leaves no clip to clone.
+
+CosyVoice3 has a cheaper default for neutral lines: when the donor speaks another
+language and the mode is not `preserve`, it uses `inference_cross_lingual`, which
+drops the reference speech codes so the model uses its own target-language
+phonetics. Lines with an emotion/pace/volume instruction keep the zero-shot path
+so their prosody stays grounded, and may keep some source accent. Fish has no
+language parameter, so `--expressive-accent blend` is the only way to give it a
+native target accent while preserving the speaker's timbre.
+
 ### Automatic native accent
 
 The default mode generates its own accent reference, so the speaker's timbre comes

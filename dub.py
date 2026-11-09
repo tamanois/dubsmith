@@ -1015,6 +1015,21 @@ def build_dub_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--expressive-accent",
+        dest="expressive_accent",
+        default="donor",
+        choices=["donor", "blend"],
+        help=(
+            "How an expressive backend (cosyvoice3, chatterbox, fish) gets its "
+            "clone reference: 'donor' (default) clones the source-language "
+            "donor, keeping the source accent; 'blend' builds the target-language "
+            "blended reference the Qwen path uses and clones that, keeping the "
+            "speaker's timbre with a native target accent. 'blend' loads Qwen "
+            "Base for the one-off reference and requires --accent-mode native "
+            "or reference-accent."
+        ),
+    )
+    parser.add_argument(
         "--blend-takes",
         dest="blend_takes",
         type=int,
@@ -3157,6 +3172,7 @@ def job_config_from_args(
         accent_match=args.accent_match,
         accent_audio=accent_audio,
         accent_text=accent_text,
+        expressive_accent=args.expressive_accent,
         accent_blend=args.accent_blend,
         blend_takes=args.blend_takes,
         blend_iters=args.blend_iters,

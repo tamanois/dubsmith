@@ -8,6 +8,7 @@ loading the Base checkpoint.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -315,6 +316,117 @@ class TestSynthesizeExpressive:
         )
         assert engine.calls[0]["lines"] == ["[sad] Bonjour"]
 
+    def test_cosyvoice_cross_lingual_for_a_source_language_donor(
+        self, tmp_path: Path
+    ) -> None:
+        engine = FakeExpressiveEngine()
+        pipeline = _pipeline(
+            tmp_path,
+            engine=engine,
+            tts_backend="cosyvoice3",
+            accent_mode="native",
+            target_language="fr",
+        )
+        pipeline._source_language = "en"
+        segments = [Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")]
+        pipeline._synthesize_expressive(
+            segments, {0: "Bonjour"}, {"A": (_donor(0), {})}, tmp_path
+        )
+        assert engine.calls[0]["cross_lingual"] is True
+
+    def test_an_unsupported_source_language_keeps_zero_shot(
+        self, tmp_path: Path
+    ) -> None:
+        engine = FakeExpressiveEngine()
+        pipeline = _pipeline(
+            tmp_path,
+            engine=engine,
+            tts_backend="cosyvoice3",
+            accent_mode="native",
+            target_language="fr",
+        )
+        pipeline._source_language = "nl"
+        segments = [Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")]
+        pipeline._synthesize_expressive(
+            segments, {0: "Bonjour"}, {"A": (_donor(0), {})}, tmp_path
+        )
+        assert engine.calls[0]["cross_lingual"] is False
+
+    def test_preserve_keeps_cosyvoice_zero_shot(self, tmp_path: Path) -> None:
+        engine = FakeExpressiveEngine()
+        pipeline = _pipeline(
+            tmp_path,
+            engine=engine,
+            tts_backend="cosyvoice3",
+            accent_mode="preserve",
+            target_language="fr",
+        )
+        pipeline._source_language = "en"
+        segments = [Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")]
+        pipeline._synthesize_expressive(
+            segments, {0: "Bonjour"}, {"A": (_donor(0), {})}, tmp_path
+        )
+        assert engine.calls[0]["cross_lingual"] is False
+
+    def test_a_pinned_reference_keeps_cosyvoice_zero_shot(
+        self, tmp_path: Path
+    ) -> None:
+        engine = FakeExpressiveEngine()
+        ref = tmp_path / "pinned.wav"
+        ref.write_bytes(b"RIFF")
+        pipeline = _pipeline(
+            tmp_path,
+            engine=engine,
+            tts_backend="cosyvoice3",
+            accent_mode="native",
+            target_language="fr",
+            ref_audio=ref,
+        )
+        pipeline._source_language = "en"
+        segments = [Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")]
+        pipeline._synthesize_expressive(
+            segments, {0: "Bonjour"}, {"A": (None, {})}, tmp_path
+        )
+        assert engine.calls[0]["cross_lingual"] is False
+
+    def test_blend_is_the_reference_and_its_accent_text(self, tmp_path: Path) -> None:
+        pipeline = _pipeline(tmp_path, tts_backend="chatterbox", accent_mode="native")
+        blend = tmp_path / "blend.wav"
+        blend.write_bytes(b"RIFF")
+        pipeline._accents = {"A": (tmp_path / "anchor.wav", "Bonjour, ceci est un test.")}
+        reference, ref_text = pipeline._expressive_reference(
+            "A", {"A": (_donor(0), {})}, tmp_path, {"A": blend}
+        )
+        assert reference == blend
+        assert ref_text == "Bonjour, ceci est un test."
+
+    def test_synthesize_expressive_uses_the_blend_reference(
+        self, tmp_path: Path
+    ) -> None:
+        engine = FakeExpressiveEngine()
+        pipeline = _pipeline(
+            tmp_path,
+            engine=engine,
+            tts_backend="cosyvoice3",
+            accent_mode="native",
+            target_language="fr",
+        )
+        pipeline._source_language = "en"
+        pipeline._accents = {"A": (tmp_path / "anchor.wav", "Bonjour.")}
+        blend = tmp_path / "blend.wav"
+        blend.write_bytes(b"RIFF")
+        segments = [Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")]
+        pipeline._synthesize_expressive(
+            segments,
+            {0: "Bonjour"},
+            {"A": (_donor(0), {})},
+            tmp_path,
+            blends={"A": blend},
+        )
+        assert engine.calls[0]["reference"] == blend
+        assert engine.calls[0]["ref_text"] == "Bonjour."
+        assert engine.calls[0]["cross_lingual"] is False
+
 
 # --------------------------------------------------------------------------- #
 # Qwen-only stage guards
@@ -338,6 +450,69 @@ class TestQwenOnlyGuards:
         pipeline = _pipeline(tmp_path, tts_backend="chatterbox", accent_mode="native")
         transcript = _transcript(Segment(id=0, start=0.0, end=1.0, text="a"))
         assert pipeline._stage_accent_anchor(tmp_path / "a.wav", transcript) == {}
+
+    def test_the_opt_in_blend_is_not_qwen_only(self, tmp_path: Path) -> None:
+        pipeline = _pipeline(
+            tmp_path,
+            tts_backend="chatterbox",
+            accent_mode="native",
+            expressive_accent="blend",
+        )
+        assert pipeline._uses_expressive_accent_blend() is True
+
+    def test_the_accent_anchor_runs_for_the_opt_in_blend(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        pipeline = _pipeline(
+            tmp_path,
+            tts_backend="chatterbox",
+            accent_mode="native",
+            expressive_accent="blend",
+        )
+        anchor_wav = tmp_path / "anchor.wav"
+        anchor_wav.write_bytes(b"RIFF")
+        anchor_text = tmp_path / "anchor.txt"
+        anchor_text.write_text("Bonjour, ceci est un test.", encoding="utf-8")
+        monkeypatch.setattr(
+            "pipeline.orchestrate.ensure_anchor",
+            lambda root, spec, engine: (anchor_wav, anchor_text),
+        )
+        monkeypatch.setattr(pipeline, "_resolve_anchor_engine", lambda: object())
+        transcript = _transcript(
+            Segment(id=0, start=0.0, end=1.0, text="a", speaker="A")
+        )
+        accents = pipeline._stage_accent_anchor(tmp_path / "a.wav", transcript)
+        assert accents["A"][0] == anchor_wav
+        assert accents["A"][1] == "Bonjour, ceci est un test."
+
+    def test_the_blend_stays_qwen_only_without_the_opt_in(self, tmp_path: Path) -> None:
+        pipeline = _pipeline(tmp_path, tts_backend="chatterbox", accent_mode="native")
+        assert pipeline._uses_expressive_accent_blend() is False
+
+    def test_the_blend_is_never_used_by_qwen(self, tmp_path: Path) -> None:
+        pipeline = _pipeline(tmp_path, tts_backend="qwen", accent_mode="native")
+        assert pipeline._uses_expressive_accent_blend() is False
+
+    def test_warns_when_an_expressive_backend_ignores_the_accent_mode(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pipeline = _pipeline(tmp_path, tts_backend="fish", accent_mode="native")
+        with caplog.at_level(logging.WARNING):
+            pipeline._warn_expressive_accent_scope()
+        assert "Fish has no language parameter" in caplog.text
+
+    def test_does_not_warn_when_the_blend_is_opted_in(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pipeline = _pipeline(
+            tmp_path,
+            tts_backend="fish",
+            accent_mode="native",
+            expressive_accent="blend",
+        )
+        with caplog.at_level(logging.WARNING):
+            pipeline._warn_expressive_accent_scope()
+        assert caplog.records == []
 
 
 # --------------------------------------------------------------------------- #
@@ -376,4 +551,38 @@ class TestExpressiveJob:
             spec.emotion == "happy"
             for call in engine.calls
             for spec in call["prosody"]
+        )
+
+    def test_run_uses_the_blend_reference_when_opted_in(
+        self, tmp_path: Path, simple_transcript: Transcript, monkeypatch
+    ) -> None:
+        from tests.test_pipeline import make_pipeline
+
+        engine = FakeExpressiveEngine()
+        pipeline, *_ = make_pipeline(
+            tmp_path,
+            simple_transcript,
+            tts_backend="cosyvoice3",
+            accent_mode="native",
+            expressive_accent="blend",
+            prosody_plan="off",
+            expressive_engine=engine,
+        )
+        blend = tmp_path / "blend.wav"
+        blend.write_bytes(b"RIFF")
+        pipeline._accents = {
+            "SPK_0": (tmp_path / "anchor.wav", "Bonjour, ceci est un test.")
+        }
+        pipeline._primary_accent = None
+        monkeypatch.setattr(
+            pipeline, "_stage_accent_anchor", lambda *a, **k: dict(pipeline._accents)
+        )
+        monkeypatch.setattr(pipeline, "_stage_blend", lambda *a, **k: {"SPK_0": blend})
+
+        pipeline.run()
+
+        assert engine.calls
+        assert all(call["reference"] == blend for call in engine.calls)
+        assert all(
+            call["ref_text"] == "Bonjour, ceci est un test." for call in engine.calls
         )

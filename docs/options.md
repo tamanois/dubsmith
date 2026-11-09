@@ -29,6 +29,7 @@ See [Accent modes](voices.md#accent-modes) for how these interact.
 | `--accent-text TEXT` | – | Exact transcript of `--accent-audio`. Required with it. |
 | `--accent-voice LABEL` | – | Take both the accent clip and its exact transcript from a saved voice, so neither `--accent-audio` nor `--accent-text` is needed. Implies `--accent-mode reference-accent`, and cannot be combined with either of them. |
 | `--accent-blend MODE` | `two-stage` | `two-stage` renders the accent transcript once in the speaker's voice and clones every line from that clip, so its codes and its embedding cannot disagree. `single-stage` conditions each line on both sources directly. |
+| `--expressive-accent {donor,blend}` | `donor` | `cosyvoice3`, `chatterbox` and `fish` only. `donor` clones the source-language donor and keeps its accent; `blend` builds the target-language blended reference with Qwen Base and clones that, keeping the speaker's timbre with a native target accent. `blend` requires `--accent-mode native` or `reference-accent` and `--accent-blend two-stage`. |
 | `--blend-takes N` | `3` | How many times the one-off blend is rendered before keeping the take closest to the speaker. Only that clip is sampled this way, not the lines. |
 | `--blend-iters N` | `5` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](voices.md#choosing-the-blend-strength). |
 | `--blend-ratio T` | `0.85` | How far toward the speaker's own voice the blend should reach, from `0` (the accent voice) to `1` (a target-language utterance in the speaker's voice). Iteration stops there. `0` disables the search. See [Choosing the blend strength](voices.md#choosing-the-blend-strength). |
@@ -37,6 +38,12 @@ With `--voice`, a saved voice already in the target language clones directly
 (`preserve`), while one in another language uses the `native` anchor. A voice
 with no transcript cannot do ICL at all, so it uses `speaker-only`. An explicit
 `--accent-mode` always wins.
+
+The accent modes are applied by the Qwen prompt builder. An expressive backend
+(`cosyvoice3`, `chatterbox`, `fish`) clones a single reference clip, so without
+`--expressive-accent blend` it keeps the donor's source accent and logs a warning;
+`--accent-mode preserve` is the explicit way to ask for that. See
+[Expressive backends and accent modes](voices.md#expressive-backends-and-accent-modes).
 
 ## Emotion (dubbing backend and prosody plan)
 

@@ -1318,6 +1318,29 @@ def test_dtype_is_normalised_in_the_config() -> None:
     assert JobConfig(audio="a.wav", dtype="BFloat16").dtype == "bf16"
 
 
+def test_expressive_accent_defaults_to_the_donor() -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--target", "fr", "--backend", "chatterbox"]
+    )
+    assert job_config_from_args(args).expressive_accent == "donor"
+
+
+def test_expressive_accent_blend_reaches_the_job_config() -> None:
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--backend",
+            "fish",
+            "--expressive-accent",
+            "blend",
+        ]
+    )
+    assert job_config_from_args(args).expressive_accent == "blend"
+
+
 def test_say_parser_accepts_cosyvoice3_and_emotion() -> None:
     args = build_say_parser().parse_args(
         [

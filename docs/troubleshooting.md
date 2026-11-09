@@ -110,15 +110,29 @@ Third-party HTTP and model loggers stay at WARNING even under `-v`, so the debug
 output is about this pipeline rather than its dependencies.
 
 **CosyVoice sounds like it has an English accent, or words are added/garbled.**
-A neutral line clones the reference's accent from its speech codes
-(`inference_zero_shot`). Prosody on a non-English line now pairs the instruction
-with the reference transcript (zero-shot, so the speech codes are kept), adds a
-closing language clause (`请用法语说这句话。`), uses Chinese volume wording
-instead of the English clause, and applies pace by time-stretching rather than as
-an instruction — each of those otherwise destabilises French. Give the voice a
-transcript (a saved voice has one; `--clone-text` sets one) and pass `--lang`;
-without a transcript the backend falls back to `inference_instruct2`, which is
-less stable.
+A neutral line now uses `inference_cross_lingual` when the donor speaks another
+language than the target and `--accent-mode` is not `preserve`. That drops the
+reference speech codes, so the model uses its own target-language phonetics
+instead of cloning the donor's accent. Lines with an emotion/pace/volume
+instruction still use the zero-shot path: prosody on a non-English line pairs the
+instruction with the reference transcript, adds a closing language clause
+(`请用法语说这句话。`), uses Chinese volume wording instead of the English clause,
+and applies pace by time-stretching rather than as an instruction — each of those
+otherwise destabilises French. Those instructed lines may keep some source
+accent. Give the voice a transcript (a saved voice has one; `--clone-text` sets
+one) and pass `--lang`; without a transcript the backend falls back to
+`inference_instruct2`, which is less stable. For a fully native target accent on
+every line, use `--expressive-accent blend` with `--accent-mode native` or
+`reference-accent`.
+
+**Chatterbox or Fish still has the source accent.**
+Both clone a single reference clip. Without `--expressive-accent blend` that clip
+is the source-language donor, so the source accent comes with it. Fish has no
+language parameter at all; Chatterbox receives `language_id` but still conditions
+on the reference speech. Use `--expressive-accent blend` with
+`--accent-mode native` or `reference-accent` to build a target-language reference
+with Qwen Base first, or pass `--accent-mode preserve` to acknowledge the
+fallback. `-v` logs which reference each backend used.
 
 **A prosody value seems to have no effect.** CosyVoice only has trained emotion
 instructs for `happy`, `sad` and `angry`; `calm` deliberately adds no clause, and

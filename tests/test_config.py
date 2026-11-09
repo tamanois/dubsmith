@@ -759,6 +759,96 @@ class TestCliJobConfig:
         assert base.fingerprint() != louder.fingerprint()
 
 
+class TestExpressiveAccent:
+    """How an expressive backend gets its clone reference."""
+
+    def test_defaults_to_the_donor(self) -> None:
+        assert JobConfig(audio=Path("a.wav")).expressive_accent == "donor"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("donor", "donor"),
+            ("preserve", "donor"),
+            ("source", "donor"),
+            ("blend", "blend"),
+            ("native", "blend"),
+            ("anchor", "blend"),
+        ],
+    )
+    def test_aliases(self, raw: str, expected: str) -> None:
+        job = JobConfig(
+            audio=Path("a.wav"),
+            tts_backend="chatterbox",
+            accent_mode="native",
+            expressive_accent=raw,
+        )
+        assert job.expressive_accent == expected
+
+    def test_unknown_value_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown expressive accent"):
+            JobConfig(audio=Path("a.wav"), expressive_accent="telepathy")
+
+    def test_blend_is_rejected_for_qwen(self) -> None:
+        with pytest.raises(ConfigError, match="only applies to the expressive"):
+            JobConfig(
+                audio=Path("a.wav"),
+                tts_backend="qwen",
+                accent_mode="native",
+                expressive_accent="blend",
+            )
+
+    @pytest.mark.parametrize("mode", ["preserve", "speaker-only"])
+    def test_blend_needs_an_accent_source(self, mode: str) -> None:
+        with pytest.raises(ConfigError, match="requires --accent-mode"):
+            JobConfig(
+                audio=Path("a.wav"),
+                tts_backend="chatterbox",
+                accent_mode=mode,
+                expressive_accent="blend",
+            )
+
+    def test_blend_rejects_the_single_stage_strategy(self) -> None:
+        with pytest.raises(ConfigError, match="requires --accent-blend"):
+            JobConfig(
+                audio=Path("a.wav"),
+                tts_backend="fish",
+                accent_mode="native",
+                accent_blend="single-stage",
+                expressive_accent="blend",
+            )
+
+    def test_native_blend_is_accepted_for_an_expressive_backend(self) -> None:
+        job = JobConfig(
+            audio=Path("a.wav"),
+            tts_backend="chatterbox",
+            accent_mode="native",
+            expressive_accent="blend",
+        )
+        assert job.expressive_accent == "blend"
+
+    def test_reference_accent_blend_is_accepted(self) -> None:
+        job = JobConfig(
+            audio=Path("a.wav"),
+            tts_backend="cosyvoice3",
+            accent_mode="reference-accent",
+            accent_audio=Path("accent.wav"),
+            accent_text="Bonjour",
+            expressive_accent="blend",
+        )
+        assert job.expressive_accent == "blend"
+
+    def test_fingerprint_changes_with_the_reference_choice(self) -> None:
+        base = dict(
+            audio=Path("a.wav"),
+            tts_backend="chatterbox",
+            accent_mode="native",
+        )
+        donor = JobConfig(**base)  # type: ignore[arg-type]
+        blend = JobConfig(expressive_accent="blend", **base)  # type: ignore[arg-type]
+        assert donor.fingerprint() != blend.fingerprint()
+
+
 class TestDevices:
     """``--devices``: several cards sharing a stage, a worker process each."""
 
