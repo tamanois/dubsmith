@@ -514,7 +514,9 @@ class JobConfig(BaseModel):
     #   "rate"   -> a per-speaker anchor matching the source speaker's rate
     #   "gender" -> the same, plus the source speaker's gender
     accent_match: str = "off"
-    #: Native target-language clip whose phonetics the dub should adopt.
+    #: Native target-language clip whose phonetics the dub should adopt. The CLI
+    #: also fills this (and ``accent_text``) from ``--accent-voice``, a saved
+    #: voice that already stores its clip and transcript together.
     accent_audio: Path | None = None
     #: Exact transcript of ``accent_audio`` (required: it aligns the speech codes).
     accent_text: str | None = None
@@ -906,12 +908,15 @@ class JobConfig(BaseModel):
             if self.accent_audio is None:
                 raise ConfigError(
                     "--accent-mode reference-accent requires --accent-audio: a clip "
-                    "of a native target-language speaker, used for pronunciation only."
+                    "of a native target-language speaker, used for pronunciation "
+                    "only. Alternatively name a saved voice with --accent-voice, "
+                    "which supplies both the clip and its transcript."
                 )
             if self.accent_text is None or not self.accent_text.strip():
                 raise ConfigError(
                     "--accent-audio requires --accent-text (its exact transcript), "
-                    "which aligns the accent clip's speech codes."
+                    "which aligns the accent clip's speech codes. A saved voice "
+                    "already carries both: use --accent-voice instead."
                 )
             if self.accent_match != "off":
                 raise ConfigError(

@@ -18,6 +18,7 @@ Choose a command, copy a worked example, and iterate quickly.
 | to keep the source accent | `--accent-mode preserve` | clones the speaker's accent along with their voice |
 | to drop the source accent using the model's own phonetics | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
 | a native accent you choose yourself | `--accent-mode reference-accent --accent-audio nat.wav --accent-text "…"` | timbre from the video's speaker, pronunciation from `nat.wav` |
+| the same accent from a saved voice | `--accent-mode reference-accent --accent-voice deep-fr` | the saved voice supplies the clip and its exact transcript, no flags repeated |
 | every speaker in their own voice | *nothing* | finds the speakers and clones each one from their own voice — see [Dubbing a video with several speakers](multi-speaker.md#dubbing-a-video-with-several-speakers) |
 | one voice for the whole video | `--diarizer none` | the pre-P1 behaviour: whichever speaker talks most supplies the voice |
 | no music behind the voice | `--no-background` | discards the separated bed instead of ducking it |

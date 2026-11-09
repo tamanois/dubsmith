@@ -42,7 +42,9 @@ classifiers = [
 dependencies = [
     "numpy==1.26.4",
     "typing_extensions",
-    "torch>=2.1.0",
+    # Floor, not a pin: see the torch note in requirements.txt. Below 2.5 the
+    # Qwen3-TTS decode path dies in transformers' sliding-window mask builder.
+    "torch>=2.5.1",
     "soundfile",
     "librosa",
     "pydantic>=2.0",

@@ -56,6 +56,21 @@ def _saved_voice(root: Path, label: str = "warm-fr"):
     )
 
 
+def _imported_voice(root: Path, label: str = "silent-fr"):
+    """An imported clip saved without a transcript, for accent-anchor tests."""
+    t = np.linspace(0.0, 1.5, int(1.5 * SAMPLE_RATE), endpoint=False)
+    samples = (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    return save_voice(
+        root,
+        label,
+        samples,
+        SAMPLE_RATE,
+        language="French",
+        source="import",
+        ref_text="",
+    )
+
+
 def test_models_list_never_downloads(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["models", "--list", "--models-dir", str(tmp_path)]) == 0
 
@@ -297,6 +312,176 @@ def test_without_voice_the_accent_default_is_unchanged() -> None:
     args = build_dub_parser().parse_args(["--video", "in.mp4", "--target", "fr"])
 
     assert job_config_from_args(args).accent_mode == "native"
+
+
+# --------------------------------------------------------------------------- #
+# Reference accent from a saved voice
+# --------------------------------------------------------------------------- #
+
+
+def test_accent_voice_supplies_the_reference_assets(tmp_path: Path) -> None:
+    saved = _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-mode",
+            "reference-accent",
+            "--accent-voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    job = job_config_from_args(args)
+    assert job.accent_audio == saved.wav
+    assert job.accent_text == saved.ref_text
+
+
+def test_accent_voice_implies_reference_accent(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert job_config_from_args(args).accent_mode == "reference-accent"
+
+
+def test_accent_voice_conflicts_with_the_explicit_accent_clip(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-mode",
+            "reference-accent",
+            "--accent-voice",
+            "warm-fr",
+            "--accent-audio",
+            "nat.wav",
+            "--accent-text",
+            "Bonjour",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(ConfigError, match="cannot be combined"):
+        job_config_from_args(args)
+
+
+def test_accent_voice_conflicts_with_another_accent_mode(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-mode",
+            "native",
+            "--accent-voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(ConfigError, match="implies --accent-mode reference-accent"):
+        job_config_from_args(args)
+
+
+def test_accent_voice_rejects_an_unknown_label(tmp_path: Path) -> None:
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-voice",
+            "nope",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(VoiceNotFoundError, match="voices --list"):
+        job_config_from_args(args)
+
+
+def test_accent_voice_needs_a_transcript(tmp_path: Path) -> None:
+    _imported_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--accent-voice",
+            "silent-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(ConfigError, match="no transcript"):
+        job_config_from_args(args)
+
+
+def test_accent_voice_must_speak_the_target_language(tmp_path: Path) -> None:
+    _saved_voice(tmp_path)  # French
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "en",
+            "--accent-voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(ConfigError, match="native English accent"):
+        job_config_from_args(args)
+
+
+def test_voice_and_accent_voice_can_be_combined(tmp_path: Path) -> None:
+    saved = _saved_voice(tmp_path)
+    args = build_dub_parser().parse_args(
+        [
+            "--video",
+            "in.mp4",
+            "--target",
+            "fr",
+            "--voice",
+            "warm-fr",
+            "--accent-voice",
+            "warm-fr",
+            "--voices-dir",
+            str(tmp_path),
+        ]
+    )
+
+    job = job_config_from_args(args)
+    assert job.ref_audio == saved.wav
+    assert job.accent_mode == "reference-accent"
+    assert job.accent_audio == saved.wav
 
 
 def test_say_parser_accepts_a_saved_voice() -> None:

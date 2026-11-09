@@ -438,7 +438,7 @@ prosody ride in the reference *speech codes*, while vocal identity rides in the
 | `native` *(default)* | a **generated** native accent anchor | the reference voice, or the auto donor | The default: the speaker's timbre with a native target accent, no clip supplied |
 | `preserve` | the reference voice, or the auto-selected donor | same clip | You want the original speaker, including their accent |
 | `speaker-only` | none — the model chooses | the reference voice | The source accent is too strong and you want the model's own phonetics |
-| `reference-accent` | **`--accent-audio`** | the reference voice, or the auto donor | You want to choose the borrowed accent yourself |
+| `reference-accent` | **`--accent-audio`** or **`--accent-voice`** | the reference voice, or the auto donor | You want to choose the borrowed accent yourself |
 
 `native` asks for nothing: the anchor is synthesised by the VoiceDesign checkpoint
 from a short native-language passage (see
@@ -503,6 +503,21 @@ python dub.py --video talk.mp4 --target fr \
 
 Both flags are required together, and `--accent-text` must be the exact
 transcript of `--accent-audio` — it is what aligns the codes being borrowed.
+
+If the accent clip is already a saved voice, one flag replaces both: the voice's
+manifest stores its transcript, so `--accent-voice` supplies the clip and the text
+together and implies `--accent-mode reference-accent`:
+
+```bash
+python dub.py --video talk.mp4 --target fr \
+  --accent-mode reference-accent \
+  --accent-voice deep-fr
+```
+
+The voice must speak the target language, because the anchor is what supplies the
+pronunciation; a voice in another language is rejected rather than silently
+borrowing the wrong accent. `--accent-voice` is independent of `--voice`, so you
+can take the timbre from one saved voice and the accent from another.
 `--ref-audio` is optional: leave it out and the timbre is auto-selected from the
 video, exactly as in the other modes. Keep the accent clip short; 10–20 seconds
 is plenty, and a longer clip mostly costs synthesis time.

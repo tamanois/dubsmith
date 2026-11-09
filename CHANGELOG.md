@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `--accent-voice LABEL` takes the reference accent's clip and its exact
+  transcript from a saved voice, so `--accent-mode reference-accent` no longer
+  needs `--accent-audio` and `--accent-text` repeated by hand. It implies the
+  mode and is rejected alongside either of those flags.
+
+### Changed
+
+- `torch` and `torchaudio` are pinned to `2.5.1`, and the `torch` floor in the
+  package metadata is raised to the same release. Below 2.5, transformers 4.57's
+  sliding-window attention-mask builder writes in place onto an expanded tensor,
+  which aborts Qwen3-TTS synthesis with a `RuntimeError` about a written-to
+  tensor sharing a memory location.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

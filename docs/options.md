@@ -23,10 +23,11 @@ See [Accent modes](voices.md#accent-modes) for how these interact.
 | `--ref-audio PATH` | auto | Clones this recording instead of the speaker found in the video. |
 | `--ref-text TEXT` | – | Exact transcript of `--ref-audio`. Required with it in `preserve` mode; ignored by the other modes. |
 | `--voice LABEL` | – | Reuse a saved voice as the timbre source, including its stored encoding when it has one. Cannot be combined with `--ref-audio`; see [Voice library](voices.md#voice-library-saved-voices). |
-| `--accent-mode MODE` | `native` | Where pronunciation comes from: `native` (a generated accent anchor — the default), `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip). |
+| `--accent-mode MODE` | `native` | Where pronunciation comes from: `native` (a generated accent anchor — the default), `preserve` (the reference voice), `speaker-only` (the model's own phonetics), `reference-accent` (the `--accent-audio` clip, or `--accent-voice`). |
 | `--accent-match MODE` | `off` | With `--accent-mode native`, shape the generated anchor to the source voice: `rate` matches its speaking rate, `gender` also matches its gender. |
 | `--accent-audio PATH` | – | Native target-language clip to borrow pronunciation from. Requires `--accent-mode reference-accent`. |
 | `--accent-text TEXT` | – | Exact transcript of `--accent-audio`. Required with it. |
+| `--accent-voice LABEL` | – | Take both the accent clip and its exact transcript from a saved voice, so neither `--accent-audio` nor `--accent-text` is needed. Implies `--accent-mode reference-accent`, and cannot be combined with either of them. |
 | `--accent-blend MODE` | `two-stage` | `two-stage` renders the accent transcript once in the speaker's voice and clones every line from that clip, so its codes and its embedding cannot disagree. `single-stage` conditions each line on both sources directly. |
 | `--blend-takes N` | `3` | How many times the one-off blend is rendered before keeping the take closest to the speaker. Only that clip is sampled this way, not the lines. |
 | `--blend-iters N` | `5` | Maximum passes used to build the blend. Each pass re-reads the previous clip and re-injects the speaker's embedding, pulling the voice back toward the speaker. `1` disables the iteration. See [Choosing the blend strength](voices.md#choosing-the-blend-strength). |

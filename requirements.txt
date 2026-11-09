@@ -5,14 +5,25 @@
 # Versions are pinned to the combination this project is verified against, so a
 # fresh install matches the tested environment instead of drifting.
 #
-# torch is pinned as a *floor*, not an exact version, on purpose: which wheel is
-# correct depends on your hardware, and `requirements.lock` style freezes would
-# drag CUDA wheels onto a CPU-only machine. Pick the index that matches:
+# torch is pinned to the release this project is verified against. The *index*
+# still depends on your hardware: a bare `==2.5.1` matches every local variant,
+# so it is satisfied by 2.5.1+cu124 (the default Linux wheel) and by 2.5.1+cpu
+# alike. Pick the index that matches:
 #
 #   GPU (CUDA)   pip install -r requirements.txt
-#   CPU only     pip install torch --index-url https://download.pytorch.org/whl/cpu
-#                pip install -r requirements.txt
+#   CPU only     pip install torch==2.5.1 torchaudio==2.5.1 \
+#                  --index-url https://download.pytorch.org/whl/cpu
 #   AMD (ROCm)   see https://pytorch.org/get-started/locally/
+#
+# 2.5 is a floor *with a reason*. transformers 4.57 builds the sliding-window
+# attention mask with an in-place write (`causal_mask |= ...`) onto an expanded
+# tensor, which torch refuses before 2.5. On older torch that aborts every
+# Qwen3-TTS synthesis with "unsupported operation: more than one element of the
+# written-to tensor refers to a single memory location". Do not lower it.
+#
+# 2.6+ is deliberately not used either: it flips `torch.load` to
+# `weights_only=True`, which breaks the pickled checkpoints funasr, Demucs and
+# SpeechBrain load.
 #
 # Install numpy and typing_extensions FIRST if your environment struggles to
 # resolve them together with torch.
@@ -23,8 +34,10 @@
 numpy==1.26.4
 typing_extensions==4.16.0
 
-# Deep-learning runtime. Any 2.1+ release works; see the index note above.
-torch>=2.1.0
+# Deep-learning runtime. See the version note at the top before changing these;
+# torchaudio must match torch exactly.
+torch==2.5.1
+torchaudio==2.5.1
 
 # Audio + media
 soundfile==0.14.0
@@ -71,6 +84,16 @@ openai==3.19.0         # OpenAI-compatible client used for translation
 # Optional, like demucs and funasr: uncomment, or install the packaged extra.
 #   pip install "dubsmith[separation]"
 #speechbrain
+
+# Optional: GPU ONNX runtime. The CosyVoice3 overlay pins this same release, and
+# faster-whisper's Silero VAD loads through it. Install this variant, *not* the
+# CPU-only `onnxruntime`: both ship the same `onnxruntime` module, so whichever
+# was installed last wins and the loser's providers disappear - a CPU build
+# installed after this one silently removes CUDAExecutionProvider. `pip check`
+# then still reports that qwen-tts wants `onnxruntime`; on a GPU box that warning
+# is expected, because the GPU package provides the module under a different
+# distribution name.
+#onnxruntime-gpu==1.18.0
 
 # Optional: CUDA 12 runtime libraries for **GPU speech recognition**.
 # CTranslate2 (used by faster-whisper) links against CUDA 12 specifically, while

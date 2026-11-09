@@ -959,9 +959,9 @@ def build_dub_parser() -> argparse.ArgumentParser:
             "clones the speaker's accent along with their voice; 'speaker-only' "
             "keeps only the timbre embedding so the model uses its own phonetics "
             "for the target language; 'reference-accent' keeps the speaker's "
-            "timbre but takes pronunciation from --accent-audio. With --voice, a "
-            "saved voice already in the target language clones directly unless "
-            "this flag says otherwise."
+            "timbre but takes pronunciation from --accent-audio or --accent-voice. "
+            "With --voice, a saved voice already in the target language clones "
+            "directly unless this flag says otherwise."
         ),
     )
     parser.add_argument(
@@ -981,13 +981,26 @@ def build_dub_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Clip of a native target-language speaker whose pronunciation the dub "
-            "should adopt. Requires --accent-text and --accent-mode reference-accent."
+            "should adopt. Requires --accent-text and --accent-mode reference-accent. "
+            "Use --accent-voice instead to take both from a saved voice."
         ),
     )
     parser.add_argument(
         "--accent-text",
         default=None,
         help="Exact transcript of --accent-audio (required with it).",
+    )
+    parser.add_argument(
+        "--accent-voice",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Saved voice (see 'python dub.py voices --list') that supplies the "
+            "reference accent: its clip and its exact transcript, so neither "
+            "--accent-audio nor --accent-text is needed. Implies --accent-mode "
+            "reference-accent; cannot be combined with --accent-audio or "
+            "--accent-text."
+        ),
     )
     parser.add_argument(
         "--accent-blend",
@@ -1556,9 +1569,18 @@ def cmd_anchors(argv: Sequence[str]) -> int:
     return _STOP
 
 
-def _voices_root(args: argparse.Namespace, settings: Settings) -> Path:
-    """The voice library this invocation uses: ``--voices-dir``, else settings."""
-    return Path(args.voices_dir) if args.voices_dir is not None else settings.voices_dir
+def _voices_root(args: argparse.Namespace, settings: Settings | None) -> Path:
+    """The voice library this invocation uses: ``--voices-dir``, else settings.
+
+    ``settings`` may be ``None`` because :func:`job_config_from_args` is also
+    called without a resolved :class:`Settings`; the environment answers then.
+    """
+    root = getattr(args, "voices_dir", None)
+    if root is not None:
+        return Path(root)
+    if settings is None:
+        return Settings.from_env().voices_dir
+    return settings.voices_dir
 
 
 def _write_say_output(
@@ -2987,6 +3009,11 @@ def job_config_from_args(
     downstream stage (fingerprinting, donor selection, prompt building, fan-out
     workers) unchanged: a saved voice is simply a reference clip whose transcript
     and encoding are known.
+
+    ``--accent-voice`` is resolved the same way, into ``accent_audio`` and
+    ``accent_text``: a saved voice already carries its clip and its exact
+    transcript, so the reference accent can be named in one word instead of
+    repeating both on the command line.
     """
     ref_audio = args.ref_audio
     ref_text = args.ref_text
@@ -2996,8 +3023,18 @@ def job_config_from_args(
     # fits it without overriding an explicit choice. The pipeline's own default
     # is still ``native``.
     accent_mode = args.accent_mode or "native"
-    accent_requested = args.accent_mode is not None
+    # ``--accent-voice`` is an explicit request for reference-accent, so it must
+    # stop the ``--voice`` block below from inferring a mode of its own.
+    accent_requested = args.accent_mode is not None or bool(
+        getattr(args, "accent_voice", None)
+    )
     voice_label = getattr(args, "voice", None)
+    accent_voice_label = getattr(args, "accent_voice", None)
+    # Both flags read the same library, so resolve it once, and only when one of
+    # them is used: a plain run must not read the environment for it.
+    voices_root = (
+        _voices_root(args, settings) if voice_label or accent_voice_label else None
+    )
     if voice_label:
         if ref_audio is not None:
             raise ConfigError(
@@ -3006,13 +3043,7 @@ def job_config_from_args(
             )
         from pipeline.voices import find_prompt, load_voice
 
-        voices_root = getattr(args, "voices_dir", None)
-        if voices_root is None:
-            voices_root = (
-                settings.voices_dir
-                if settings is not None
-                else Settings.from_env().voices_dir
-            )
+        assert voices_root is not None  # set whenever voice_label is
         saved = load_voice(voices_root, voice_label)
         ref_audio = saved.wav
         ref_text = saved.ref_text
@@ -3042,6 +3073,47 @@ def job_config_from_args(
                 accent_mode = "speaker-only"
             elif saved.language == normalize_language(args.target_language):
                 accent_mode = "preserve"
+
+    accent_audio = args.accent_audio
+    accent_text = args.accent_text
+    if accent_voice_label:
+        # A saved voice already knows its clip and its exact transcript, so the
+        # accent anchor does not have to be repeated on the command line. Both
+        # routes produce the same representation (audio + text), so no stage
+        # below needs to know where the anchor came from.
+        if accent_audio is not None or (accent_text or "").strip():
+            raise ConfigError(
+                "--accent-voice cannot be combined with --accent-audio or "
+                "--accent-text: the saved voice already supplies both. Pick one."
+            )
+        if args.accent_mode is not None and args.accent_mode != "reference-accent":
+            raise ConfigError(
+                "--accent-voice implies --accent-mode reference-accent, so it "
+                f"cannot be combined with --accent-mode {args.accent_mode!r}. "
+                "Pick one."
+            )
+        from pipeline.voices import load_voice
+
+        assert voices_root is not None  # set whenever accent_voice_label is
+        accent_saved = load_voice(voices_root, accent_voice_label)
+        if not (accent_saved.ref_text or "").strip():
+            raise ConfigError(
+                f"Voice {accent_voice_label!r} has no transcript in "
+                f"{accent_saved.manifest_path}, so its speech codes cannot be "
+                "aligned. Add the transcript, or pass --accent-audio and "
+                "--accent-text instead."
+            )
+        target_language = normalize_language(args.target_language)
+        if accent_saved.language != target_language:
+            raise ConfigError(
+                f"--accent-voice {accent_voice_label!r} is a "
+                f"{accent_saved.language} voice, so it cannot supply a native "
+                f"{target_language} accent. Use a {target_language} voice, or "
+                "--accent-mode preserve to keep the speaker's own accent."
+            )
+        accent_audio = accent_saved.wav
+        accent_text = accent_saved.ref_text
+        accent_mode = "reference-accent"
 
     return JobConfig(
         video=args.video,
@@ -3083,8 +3155,8 @@ def job_config_from_args(
         room_tone_gain_db=args.room_tone_gain_db,
         accent_mode=accent_mode,
         accent_match=args.accent_match,
-        accent_audio=args.accent_audio,
-        accent_text=args.accent_text,
+        accent_audio=accent_audio,
+        accent_text=accent_text,
         accent_blend=args.accent_blend,
         blend_takes=args.blend_takes,
         blend_iters=args.blend_iters,
