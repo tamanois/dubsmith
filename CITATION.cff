@@ -5,7 +5,7 @@ abstract: "Dub video into another language while keeping each speaker's voice ti
 type: software
 license: Apache-2.0
 version: 0.2.0
-date-released: 2026-11-04
+date-released: 2026-11-09
 authors:
   - name: "The Dubsmith authors"
 repository-code: "https://github.com/tamanois/dubsmith"

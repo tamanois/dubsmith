@@ -8,6 +8,9 @@
 /.venv*/
 /.stretch_tmp/
 
+# Local staging for raw demo media; curated files live in docs/media/.
+/assets/
+
 # Saved voice prints: reference audio and transcripts are personal data.
 
 # Local configuration: may contain API keys

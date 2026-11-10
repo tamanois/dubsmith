@@ -1,7 +1,7 @@
 # Dubsmith documentation
 
 Start with the [README](../README.md) for the short version, then pick a guide:
-
+See the [before/after demo](media/README.md) for an 8-second English → French dub.
 | Guide | Read it when you want to… |
 |---|---|
 | [Setup](setup.md) | install from scratch, configure the LLM endpoint, download models, install optional backends |

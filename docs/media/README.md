@@ -1,21 +1,49 @@
 # Demo media
 
-This directory is for small, committed demo assets: a before/after clip, a
-screenshot of `report.json`, or a short GIF. Keep the total under a few MB and
-prefer a link to a GitHub Release or video host for anything larger.
+Small, curated before/after assets used by the README and docs. They are
+released under **CC BY 4.0** (see [`../LICENSE.md`](../LICENSE.md)) **only if the
+underlying source clip's rights allow redistribution**; confirm the provenance
+below before publishing.
 
-Only add media you have the right to redistribute:
+## Before / after
 
-- Use public-domain footage or your own recording.
-- For a real voice, get explicit consent from the speaker.
-- Include attribution and a license next to the asset.
-- Do not add private `input/`, `voices/`, or `output/` content.
+| File | What it is |
+|---|---|
+| `demo-before-after.gif` | 6 s side-by-side loop used in the README (720 px wide, 2.4 MB) |
+| `demo-poster.png` | 1280×640 social-preview image, also usable as a still |
+| `demo-before.mp4` | Full 8 s source excerpt, 1280×720, 24 fps |
+| `demo-after.mp4` | Same excerpt dubbed into French; includes a French subtitle track |
 
-The repository ignores `*.wav`, `*.mp3`, `*.mp4`, and similar files by default;
-`docs/media/**` is explicitly allowed by `.gitignore`.
+| | |
+|---|---|
+| Source clip | `speaking-corporate` sample supplied by the maintainer |
+| Permission | **Pending confirmation** — see the note below |
+| Excerpt | full 8 s |
+| Language pair | English → French |
+| Backend | Qwen default path |
+| Command | not recorded; regenerate with the default `python dub.py --video … --target fr` path |
+| Date | 2026-11-09 |
 
-Suggested demo:
+> **Publishing blocker.** Confirm that the source clip may be redistributed and
+> that the speaker consented to a cloned synthetic voice. If this is third-party
+> stock footage, record its license and attribution here before publishing, or
+> replace it with an own recording. Do not merge or release the media until this
+> is resolved.
 
-1. A 10–20 s source clip with one or two speakers.
-2. The same clip dubbed into the target language.
-3. A screenshot of `audit_qc.py` and the relevant `report.json` section.
+The dubbed excerpt contains a **synthetic voice** cloned from the speaker. It is
+included to demonstrate the tool, not to represent the speaker.
+
+## Regenerating the GIF and poster
+
+```bash
+scripts/make_demo.sh assets/speaking-corporate-original.mp4 \
+  assets/speaking-corporate-dubbed.mp4
+```
+
+The script writes the four files above into `docs/media/`.
+
+## GitHub social preview
+
+Upload `demo-poster.png` in **Settings → Social preview** after the provenance
+above is confirmed. GitHub does not render `<video>` or `<audio>` from a repo
+path, so the GIF is the README hero and the MP4s are links.

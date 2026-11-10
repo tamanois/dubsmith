@@ -28,10 +28,12 @@ All notable changes to this project are documented here. The format follows
   which aborts Qwen3-TTS synthesis with a `RuntimeError` about a written-to
   tensor sharing a memory location.
 
-## [0.2.0] - 2026-11-04
+## [0.2.0] - 2026-11-09
 
 ### Added
 
+- Before/after demo media in `docs/media/` (GIF, poster, source and dubbed
+  excerpts) plus `scripts/make_demo.sh` to regenerate it.
 - Expressive dubbing backends: `cosyvoice3`, `chatterbox`, and `fish`, selected
   with `--backend`; per-line delivery is planned from the translated text with
   `--prosody-plan auto|off|llm`.

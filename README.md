@@ -13,6 +13,13 @@ OpenAI-compatible LLM endpoint, which can be local or cloud.
 
 [Documentation](docs/README.md) · [Roadmap](PLAN.md) · [Contributing](CONTRIBUTING.md) · [Model licenses](docs/model-licenses.md) · [Engineering guidelines](docs/development/guidelines.md)
 
+![Before and after: the same speaker, dubbed from English into French with their own voice](docs/media/demo-before-after.gif)
+
+**Before / after** — same speaker and timing, English → French, voice cloned from
+the speaker's own audio.
+[Source clip](docs/media/demo-before.mp4) · [Dubbed clip](docs/media/demo-after.mp4) ·
+[How it was made](docs/media/README.md)
+
 ---
 
 ## What it does
@@ -337,6 +344,8 @@ models/                 downloaded weights (gitignored)
 voices/                 saved voices, cards and provenance (gitignored)
 output/                 job artifacts (gitignored)
 docs/                   user documentation, model licenses, development guidelines
+docs/media/             before/after demo GIF, poster and clips
+scripts/make_demo.sh    regenerate the demo GIF and poster with ffmpeg
 PLAN.md                 vision, roadmap and design decisions
 NOTICE                  Apache-2.0 attribution
 CONTRIBUTING.md         DCO, development setup, docs policy

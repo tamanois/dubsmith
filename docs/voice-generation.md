@@ -4,8 +4,9 @@
 library, expressive backends, and provenance records as a dub, so a voice you
 create here can be reused with `--voice` in a dubbing run.
 
-For the deep reference, see [Voices](voices.md), [Options → `say`](options.md),
-and [Setup → optional backends](setup.md).
+See the [before/after demo](media/README.md) for a dubbing example, then continue
+with the deep reference in [Voices](voices.md), [Options → `say`](options.md), and
+[Setup → optional backends](setup.md).
 
 ## Quick start
 
