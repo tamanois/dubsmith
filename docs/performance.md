@@ -6,14 +6,38 @@ what happens on a long video when memory is the constraint.
 ## Devices and precision
 
 ```bash
+python dub.py devices                  # every GPU, its VRAM and the exact flag
 python dub.py info                     # what would this machine use, and why?
 python dub.py --video talk.mp4 --target fr --device cpu    # force CPU
 python dub.py --video talk.mp4 --target fr --dtype fp16    # force a precision
 ```
 
+`dub.py devices` prints two lines per card. The first is the `--device` value to
+pin that card, the card name and its VRAM; `(ROCm)` marks an AMD card, which
+torch names `cuda` because ROCm answers to the CUDA API. The second line is
+`bf16`/`fp16` (whether each precision is usable on that card), `asr` (the device
+speech recognition would use — `cpu` on Intel XPU and Apple Metal, where only
+the TTS, separation and diarization stages use the GPU) and `tts` (the precision
+the TTS checkpoint would load with).
+
+Supported GPUs:
+
+| Family | What you need | Notes |
+|---|---|---|
+| NVIDIA | the CUDA build of PyTorch | the default `auto` choice when present |
+| AMD | the ROCm build of PyTorch | torch reports ROCm cards as `cuda`; `--device rocm:0` is accepted as an alias |
+| Intel Arc / integrated | the XPU build of PyTorch | `--device xpu`; ASR falls back to the CPU |
+| Apple Silicon | stock PyTorch | `--device mps`; ASR falls back to the CPU |
+| CPU | nothing | always works, much slower |
+
+**Vulkan is not a backend here.** Speech recognition runs on CTranslate2, which
+offers CUDA and CPU only, and the other stages run on PyTorch, which has no
+Vulkan device. `--device vulkan0` is rejected at startup with an explanation.
+
 `--device` accepts `auto` (the default), `cpu`, `cuda`, `cuda:N` for a specific
-GPU, and `mps` or `xpu` on Apple and Intel hardware. `--dtype` accepts `auto`
-(the default), `bf16`, `fp16` or `fp32`.
+GPU, `rocm`/`rocm:N` as an alias for the AMD path, and `mps` or `xpu` on Apple
+and Intel hardware. `--dtype` accepts `auto` (the default), `bf16`, `fp16` or
+`fp32`.
 
 The rules, and the reasoning behind them:
 

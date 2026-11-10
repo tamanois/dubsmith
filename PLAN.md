@@ -38,7 +38,7 @@
 | Expressive native accent (`--expressive-accent blend`) | ✅ | `pipeline/orchestrate.py`, `pipeline/cosyvoice.py`, `--expressive-accent` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1396 tests (all passed) | `tests/` |
+| Tests | ✅ 1453 tests (all passed) | `tests/` |
 
 Verification performed:
 

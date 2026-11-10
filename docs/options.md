@@ -152,9 +152,13 @@ Fixes a long translation by wording rather than by cutting audio.
 
 ## Models and hardware
 
+`python dub.py devices` lists every GPU torch can see, its VRAM, the precision it
+would run and the exact flag to select it. It is read-only: no model loads and no
+stage starts. Use it before pinning a card on unfamiliar hardware.
+
 | Option | Default | What it achieves |
 |---|---|---|
-| `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps`, or `xpu`. `cuda:1` pins a specific GPU. `cpu` is much slower but proves the GPU is not the problem. See [Devices and precision](performance.md#devices-and-precision) |
+| `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `rocm`/`rocm:N` (alias for `cuda`), `mps`, or `xpu`. `cuda:1` pins a specific GPU. `cpu` is much slower but proves the GPU is not the problem. Vulkan is not a backend; `--device vulkan0` is rejected at startup. See [Devices and precision](performance.md#devices-and-precision) |
 | `--devices DEV[,DEV...]` | unset | Spreads the blend and the synthesis over several devices, one worker process each: `--devices cuda:0,cuda:1`. A worker takes the next piece of work as it frees up, so the split is by work rather than by model. The first device carries the stages that cannot be split (ASR, diarization, separation, anchors). Repeating a name is allowed and is how the fan-out is tested on one machine. Unset leaves `--device` as the whole answer. See [Using more than one card](performance.md#using-more-than-one-card) |
 | `--dtype DTYPE` | `auto` | Precision for the voice-cloning checkpoint: `auto`, `bf16`, `fp16`, or `fp32`. `auto` reads the device's capability. An explicit value is honoured unless the device cannot run it |
 | `--whisper-model NAME` | `large-v3` | ASR model id. A smaller one is faster and less accurate — the main lever on a CPU-only machine. |

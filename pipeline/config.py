@@ -23,6 +23,7 @@ __all__ = [
     "DEFAULT_MIN_SPEAKER_S",
     "DEFAULT_BUDGET_SPEEDUP",
     "DEFAULT_MAX_OVERRUN",
+    "DEVICE_FAMILIES",
     "DTYPE_ALIASES",
     "DeviceInfo",
     "LANGUAGE_ALIASES",
@@ -30,6 +31,8 @@ __all__ = [
     "available_accelerators",
     "configure_allocator",
     "device_free_bytes",
+    "enumerate_devices",
+    "normalize_device_request",
     "normalize_dtype",
     "normalize_language",
     "normalize_loudness_policy",
@@ -43,6 +46,7 @@ __all__ = [
     "resolve_device",
     "supports_bf16",
     "supports_fp16",
+    "validate_device_request",
     "JobConfig",
     "Settings",
     "read_env_file",
@@ -856,6 +860,12 @@ class JobConfig(BaseModel):
                 f"Unknown prosody plan {value!r}. Use: off, llm or auto"
             ) from None
 
+    @field_validator("device")
+    @classmethod
+    def _check_device(cls, value: str) -> str:
+        """Reject unknown device names instead of failing mid-run in torch."""
+        return normalize_device_request(value)
+
     @field_validator("devices")
     @classmethod
     def _check_devices(cls, value: list[str] | None) -> list[str] | None:
@@ -869,7 +879,7 @@ class JobConfig(BaseModel):
         if value is None:
             return None
         cleaned = [str(item).strip() for item in value]
-        cleaned = [item for item in cleaned if item]
+        cleaned = [normalize_device_request(item) for item in cleaned if item]
         if not cleaned:
             raise ConfigError("--devices needs at least one device.")
         if "auto" in cleaned and len(cleaned) > 1:
@@ -1181,6 +1191,12 @@ class SubtitleJobConfig(BaseModel):
     def _check_target(cls, value: str) -> str:
         return normalize_language(value)
 
+    @field_validator("device")
+    @classmethod
+    def _check_device(cls, value: str) -> str:
+        """Reject unknown device names instead of failing mid-run in torch."""
+        return normalize_device_request(value)
+
     @field_validator("subtitles_mode")
     @classmethod
     def _check_subtitles_mode(cls, value: str) -> str:
@@ -1243,6 +1259,21 @@ _LOGGER = logging.getLogger(__name__)
 
 #: Accelerator families this pipeline can talk to.
 ACCELERATORS: tuple[str, ...] = ("cuda", "rocm", "xpu", "mps")
+
+#: Device families a user may name on the command line. ``rocm`` is accepted as
+#: a friendlier spelling of ``cuda`` and canonicalised to it, because torch has no
+#: ``rocm`` device; the hardware is still reported as ROCm by :func:`probe_device`.
+DEVICE_FAMILIES: tuple[str, ...] = ("cpu", "cuda", "rocm", "xpu", "mps")
+
+#: Shown when a user names a Vulkan device. Vulkan is not a backend here: ASR
+#: runs on CTranslate2, which offers CUDA and CPU only, and the other stages run
+#: on PyTorch, which has no Vulkan device.
+_VULKAN_HINT = (
+    "Vulkan is not a supported backend for this pipeline: speech recognition "
+    "runs on CTranslate2 (CUDA or CPU only) and the other stages run on "
+    "PyTorch, which has no Vulkan device. AMD cards are used through ROCm and "
+    "appear as 'cuda'."
+)
 
 #: Where bfloat16 starts being supported natively. Below these, float16 is the
 #: right choice and float32 the safe fallback: bfloat16 on a Pascal or Volta card
@@ -1425,6 +1456,74 @@ def available_accelerators() -> tuple[str, ...]:
     return tuple(found)
 
 
+def _device_count(module: Any) -> int:
+    """How many cards ``module`` (``torch.cuda`` or ``torch.xpu``) exposes.
+
+    Falls back to one when the counter is absent or broken: a backend that says
+    it is available but cannot be counted is still worth showing, and a probe
+    must never fail the diagnostics it feeds.
+    """
+    counter = getattr(module, "device_count", None)
+    if not callable(counter):
+        return 1
+    try:
+        return max(int(counter()), 0)
+    except Exception:  # a probe must never fail the command that shows it
+        _LOGGER.debug("Could not count devices; assuming one", exc_info=True)
+        return 1
+
+
+def enumerate_devices() -> list[DeviceInfo]:
+    """Every physical GPU the installed torch can see, in backend order.
+
+    One entry per card, not one per family: a two-card box reports ``cuda:0``
+    and ``cuda:1`` so ``--devices`` can be filled from the same names. Never
+    raises: a backend that fails to enumerate is skipped, because a broken
+    driver must not turn ``devices`` into a traceback.
+    """
+    torch = _import_torch()
+    if torch is None:
+        return []
+
+    found: list[DeviceInfo] = []
+
+    cuda = getattr(torch, "cuda", None)
+    if cuda is not None:
+        try:
+            available = bool(cuda.is_available())
+        except Exception:  # a probe must never fail the command that shows it
+            _LOGGER.debug("Could not query CUDA availability", exc_info=True)
+            available = False
+        if available:
+            hip = getattr(getattr(torch, "version", None), "hip", None)
+            kind = "rocm" if hip else "cuda"
+            for index in range(_device_count(cuda)):
+                found.append(_describe(torch, kind, index, f"{kind}:{index}"))
+
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None:
+        try:
+            available = bool(xpu.is_available())
+        except Exception:  # a probe must never fail the command that shows it
+            _LOGGER.debug("Could not query XPU availability", exc_info=True)
+            available = False
+        if available:
+            for index in range(_device_count(xpu)):
+                found.append(_describe(torch, "xpu", index, f"xpu:{index}"))
+
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None:
+        try:
+            available = bool(mps.is_available())
+        except Exception:  # a probe must never fail the command that shows it
+            _LOGGER.debug("Could not query Metal availability", exc_info=True)
+            available = False
+        if available:
+            found.append(_describe(torch, "mps", None, "mps"))
+
+    return found
+
+
 def supports_bf16(info: DeviceInfo) -> bool:
     """Whether the hardware does bfloat16 natively rather than emulated."""
     if info.kind == "xpu":
@@ -1466,6 +1565,47 @@ def normalize_dtype(value: str | None) -> str:
         raise ConfigError(
             f"Unknown dtype {value!r}. Use: auto, bf16, fp16 or fp32"
         ) from None
+
+
+def normalize_device_request(value: str | None) -> str:
+    """Canonicalise a ``--device`` spelling, raising ``ConfigError`` for nonsense.
+
+    Accepts ``auto``, ``cpu``, ``cuda``/``cuda:N``, ``rocm``/``rocm:N``,
+    ``xpu``/``xpu:N`` and ``mps``/``mps:N``. ``rocm`` is normalised to ``cuda``
+    because that is the only spelling torch accepts for an AMD card; the hardware
+    is still reported as ROCm by :func:`probe_device`.
+
+    A ``None`` or empty request means ``auto``, which is the default every parser
+    already passes.
+    """
+    text = str("auto" if value is None else value).strip().lower()
+    if not text:
+        text = "auto"
+    if text == "auto":
+        return "auto"
+
+    base, separator, suffix = text.partition(":")
+    if base not in DEVICE_FAMILIES:
+        hint = f" {_VULKAN_HINT}" if base.startswith("vulkan") else ""
+        raise ConfigError(
+            f"Unknown device {value!r}. Use: auto, cpu, cuda, cuda:N, rocm, "
+            f"rocm:N, xpu, xpu:N or mps.{hint}"
+        )
+
+    canonical = "cuda" if base == "rocm" else base
+    if not separator:
+        return canonical
+    if not suffix.isdigit():
+        raise ConfigError(
+            f"Unknown device {value!r}: the part after ':' must be a device "
+            "index, for example cuda:0."
+        )
+    return f"{canonical}:{int(suffix)}"
+
+
+def validate_device_request(value: str | None) -> None:
+    """Raise :class:`ConfigError` when ``value`` is not a usable device."""
+    normalize_device_request(value)
 
 
 def _dtype_usable(info: DeviceInfo, name: str) -> bool:

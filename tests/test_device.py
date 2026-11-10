@@ -11,6 +11,8 @@ at all must still run.
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -19,7 +21,11 @@ from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
     DTYPE_ALIASES,
     DeviceInfo,
+    JobConfig,
+    SubtitleJobConfig,
     available_accelerators,
+    enumerate_devices,
+    normalize_device_request,
     normalize_dtype,
     pick_dtype,
     preferred_dtype,
@@ -28,6 +34,7 @@ from pipeline.config import (
     resolve_device,
     supports_bf16,
     supports_fp16,
+    validate_device_request,
 )
 from pipeline.errors import ConfigError
 from pipeline.tts import resolve_dtype
@@ -311,3 +318,224 @@ class TestReleaseGpuMemory:
         # resident is what makes the next stage fail on a small machine.
         torch_profile(kind="mps")
         assert release_gpu_memory() is True
+
+
+# --------------------------------------------------------------------------- #
+# Device request parsing
+# --------------------------------------------------------------------------- #
+
+
+def _card(
+    name: str,
+    *,
+    memory: int = 12 * 1024**3,
+    capability: tuple[int, int] | None = (8, 6),
+) -> dict[str, Any]:
+    """One entry in the ``devices`` list a fake torch profile accepts."""
+    return {"name": name, "memory": memory, "capability": capability}
+
+
+class TestNormalizeDeviceRequest:
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            ("auto", "auto"),
+            ("AUTO", "auto"),
+            (" cpu ", "cpu"),
+            ("cuda", "cuda"),
+            ("cuda:0", "cuda:0"),
+            ("CUDA:12", "cuda:12"),
+            ("cuda:00", "cuda:0"),
+            ("rocm", "cuda"),
+            ("rocm:1", "cuda:1"),
+            ("xpu", "xpu"),
+            ("xpu:0", "xpu:0"),
+            ("mps", "mps"),
+            ("mps:0", "mps:0"),
+            ("cpu:0", "cpu:0"),
+            (None, "auto"),
+            ("", "auto"),
+        ],
+    )
+    def test_accepted_spellings_are_canonicalised(
+        self, given: str | None, expected: str
+    ) -> None:
+        assert normalize_device_request(given) == expected
+
+    @pytest.mark.parametrize(
+        "given",
+        [
+            "vulkan",
+            "vulkan0",
+            "VULKAN:1",
+            "gpu-ish",
+            "cuda:",
+            "cuda:x",
+            "cuda:-1",
+            "cuda: 0",
+            "cuda 0",
+            "auto:0",
+        ],
+    )
+    def test_unknown_spellings_are_rejected(self, given: str) -> None:
+        with pytest.raises(ConfigError, match="Unknown device"):
+            normalize_device_request(given)
+
+    def test_the_vulkan_message_explains_why(self) -> None:
+        with pytest.raises(ConfigError) as exc:
+            normalize_device_request("vulkan0")
+
+        message = str(exc.value)
+        assert "Vulkan is not a supported backend" in message
+        assert "ROCm" in message
+
+    def test_a_valid_request_validates(self) -> None:
+        assert validate_device_request("cuda:1") is None
+
+    def test_an_invalid_request_fails_validation(self) -> None:
+        with pytest.raises(ConfigError):
+            validate_device_request("vulkan0")
+
+
+class TestEnumerateDevices:
+    def test_two_cards_are_listed_in_index_order(
+        self, torch_profile: TorchProfile
+    ) -> None:
+        torch_profile(
+            kind="cuda",
+            devices=[_card("RTX 3060 A"), _card("RTX 3060 B", memory=8 * 1024**3)],
+        )
+        found = enumerate_devices()
+
+        assert [info.label for info in found] == ["cuda:0", "cuda:1"]
+        assert [info.name for info in found] == ["RTX 3060 A", "RTX 3060 B"]
+        assert found[0].total_memory == 12 * 1024**3
+        assert found[1].total_memory == 8 * 1024**3
+        assert all(info.kind == "cuda" for info in found)
+
+    def test_rocm_cards_keep_the_cuda_label(self, torch_profile: TorchProfile) -> None:
+        torch_profile(kind="rocm", devices=[_card("RX 7900 A"), _card("RX 7900 B")])
+        found = enumerate_devices()
+
+        assert [info.label for info in found] == ["cuda:0", "cuda:1"]
+        assert all(info.kind == "rocm" for info in found)
+
+    def test_xpu_cards_are_listed(self, torch_profile: TorchProfile) -> None:
+        torch_profile(kind="xpu", devices=[_card("Arc A"), _card("Arc B")])
+        found = enumerate_devices()
+
+        assert [info.label for info in found] == ["xpu:0", "xpu:1"]
+        assert all(info.kind == "xpu" for info in found)
+
+    def test_metal_is_one_card(self, torch_profile: TorchProfile) -> None:
+        torch_profile(kind="mps")
+        found = enumerate_devices()
+
+        assert len(found) == 1
+        assert found[0].label == "mps"
+        assert found[0].name == "Apple Silicon (Metal)"
+        assert found[0].supports_fp16 is True
+        assert found[0].supports_bf16 is False
+
+    def test_a_cpu_only_machine_lists_nothing(self, torch_profile: TorchProfile) -> None:
+        torch_profile(kind="cpu")
+        assert enumerate_devices() == []
+
+    def test_missing_torch_lists_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("pipeline.config._import_torch", lambda: None)
+        assert enumerate_devices() == []
+
+    def test_a_missing_counter_assumes_one_card(
+        self, torch_profile: TorchProfile
+    ) -> None:
+        module = torch_profile(kind="cuda")
+        del module.cuda.device_count
+        found = enumerate_devices()
+
+        assert len(found) == 1
+        assert found[0].label == "cuda:0"
+
+    def test_a_failing_availability_probe_is_skipped(
+        self, torch_profile: TorchProfile
+    ) -> None:
+        module = torch_profile(kind="cuda")
+
+        def explode() -> bool:
+            raise RuntimeError("driver exploded")
+
+        module.cuda.is_available = explode
+        assert enumerate_devices() == []
+
+    def test_a_failing_counter_assumes_one_card(
+        self, torch_profile: TorchProfile
+    ) -> None:
+        module = torch_profile(kind="cuda")
+
+        def explode() -> int:
+            raise RuntimeError("driver exploded")
+
+        module.cuda.device_count = explode
+        assert len(enumerate_devices()) == 1
+
+    def test_a_failing_description_keeps_the_card(
+        self, torch_profile: TorchProfile
+    ) -> None:
+        module = torch_profile(kind="cuda")
+
+        def explode(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("no properties")
+
+        module.cuda.get_device_name = explode
+        module.cuda.get_device_properties = explode
+        module.cuda.get_device_capability = explode
+        found = enumerate_devices()
+
+        assert len(found) == 1
+        assert found[0].label == "cuda:0"
+        assert found[0].name == ""
+        assert found[0].capability is None
+
+    def test_cuda_and_xpu_are_both_listed(self, torch_profile: TorchProfile) -> None:
+        module = torch_profile(kind="cuda")
+        module.xpu = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            get_device_name=lambda index=0: "Intel Arc",
+            get_device_properties=lambda index=0: SimpleNamespace(
+                total_memory=8 * 1024**3
+            ),
+            empty_cache=lambda: None,
+        )
+        found = enumerate_devices()
+
+        assert [info.label for info in found] == ["cuda:0", "xpu:0"]
+
+
+class TestJobConfigDeviceValidation:
+    def test_an_unknown_device_is_rejected_at_config_time(self) -> None:
+        with pytest.raises(ConfigError, match="Vulkan"):
+            JobConfig(audio=Path("a.wav"), device="vulkan0")
+
+    def test_rocm_is_canonicalised_to_cuda(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), device="rocm:1")
+        assert job.device == "cuda:1"
+
+    def test_a_device_list_is_canonicalised(self) -> None:
+        job = JobConfig(audio=Path("a.wav"), devices=["rocm:0", "rocm:1"])
+        assert job.resolved_devices == ["cuda:0", "cuda:1"]
+
+    def test_a_bad_entry_in_the_list_is_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Unknown device"):
+            JobConfig(audio=Path("a.wav"), devices=["cuda:0", "vulkan0"])
+
+    def test_subtitles_reject_vulkan_too(self) -> None:
+        with pytest.raises(ConfigError, match="Vulkan"):
+            SubtitleJobConfig(video=Path("a.mp4"), device="vulkan0")
+
+    def test_subtitles_canonicalise_rocm(self) -> None:
+        job = SubtitleJobConfig(video=Path("a.mp4"), device="ROCM")
+        assert job.device == "cuda"
+
+    def test_the_default_stays_auto(self) -> None:
+        assert JobConfig(audio=Path("a.wav")).device == "auto"
+        assert SubtitleJobConfig(video=Path("a.mp4")).device == "auto"

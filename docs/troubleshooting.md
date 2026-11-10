@@ -12,6 +12,8 @@ attempt yet.
 | `Could not read audio from … Format not recognised` | The file is a video container. Pass it with `--video`; `--audio` is for audio-only files (or extract the track first) |
 | `… contains no audio stream, so there is nothing to transcribe` | The file is video-only. Verify with `ffprobe -v error -show_entries stream=codec_type file.mp4`; mux an audio track in first |
 | `CUDA is unusable for speech recognition … libcublas.so.12` | Informational — ASR fell back to CPU. Install `nvidia-cublas-cu12 nvidia-cudnn-cu12` for GPU ASR (Setup §3) |
+| `argument --device: Unknown device 'vulkan0' …` | Vulkan is not a backend: ASR runs on CTranslate2 (CUDA or CPU only) and the other stages on PyTorch, which has no Vulkan device. NVIDIA: `--device cuda`; AMD: install the ROCm build of PyTorch, then `--device cuda` or `--device rocm:0`; Intel: `--device xpu`; otherwise `--device cpu`. Run `python dub.py devices` to see every card and the exact flag |
+| `dub.py devices` shows `none` on a machine with a GPU | torch is a CPU build, or the accelerator's PyTorch wheel is missing. Check the `torch` line of `dub info`: AMD needs a ROCm wheel, Intel an XPU wheel, NVIDIA a CUDA wheel. Install the matching build and re-run `dub devices` |
 | `No speech detected in the input` | No audible speech, or the wrong audio track. Check with `ffprobe` |
 | `Translation response was not valid JSON` | Lower `LLM_CHUNK_SIZE` in `.env`, or use a model better at JSON |
 | `Translation request to … failed` | The LLM server isn't reachable — check `LLM_BASE_URL` |

@@ -36,13 +36,17 @@ from pipeline.config import (
     DEFAULT_MAX_OVERRUN,
     DEFAULT_MIN_SPEAKER_S,
     SUPPORTED_LANGUAGES,
+    DeviceInfo,
     JobConfig,
     Settings,
     SubtitleJobConfig,
     available_accelerators,
+    enumerate_devices,
     language_code_for_name,
+    normalize_device_request,
     normalize_language,
     pick_dtype,
+    preferred_dtype,
     probe_device,
     release_gpu_memory,
 )
@@ -157,7 +161,12 @@ def build_anchors_parser() -> argparse.ArgumentParser:
             "supported language."
         ),
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help="auto, cpu, cuda:N, rocm[:N] (alias for cuda), xpu, or mps.",
+    )
     parser.add_argument(
         "--dtype",
         default="auto",
@@ -301,7 +310,12 @@ def build_voices_parser() -> argparse.ArgumentParser:
         default=None,
         help="Where --speak writes its WAV (default: output/say/<label>.wav).",
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help="auto, cpu, cuda:N, rocm[:N] (alias for cuda), xpu, or mps.",
+    )
     parser.add_argument(
         "--dtype",
         default="auto",
@@ -580,7 +594,12 @@ def build_say_parser() -> argparse.ArgumentParser:
             "voice later costs no encode."
         ),
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, cpu, ...")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help="auto, cpu, cuda:N, rocm[:N] (alias for cuda), xpu, or mps.",
+    )
     parser.add_argument(
         "--dtype",
         default="auto",
@@ -642,13 +661,36 @@ def build_say_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _device_arg(value: str) -> str:
+    """Canonicalise ``--device`` at parse time, so a bad name fails immediately.
+
+    ``argparse.ArgumentTypeError`` keeps the message we wrote instead of the
+    generic "invalid value" text, which is the difference between a user learning
+    what to type and a user guessing.
+    """
+    try:
+        return normalize_device_request(value)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _device_list(value: str) -> list[str]:
     """Parse the comma-separated device list ``--devices`` takes.
 
-    Cleaning and validation live in :class:`JobConfig`, so there is one rule for
-    what a device list may contain rather than two that can disagree.
+    Each entry is canonicalised here as well, so ``--devices rocm:0,rocm:1``
+    reaches :class:`JobConfig` as ``cuda:0,cuda:1``. Blank entries are dropped;
+    ``JobConfig`` still rejects a list that ends up empty.
     """
-    return [part.strip() for part in value.split(",")]
+    devices: list[str] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            devices.append(normalize_device_request(part))
+        except ConfigError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+    return devices
 
 
 def build_dub_parser() -> argparse.ArgumentParser:
@@ -706,7 +748,15 @@ def build_dub_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the saved-voice directory used by --voice (default: VOICES_DIR).",
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, cuda:1, mps, or cpu.")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help=(
+            "auto, cpu, cuda:N, rocm[:N] (alias for cuda), xpu, or mps. Run "
+            "'python dub.py devices' to list every card and the exact flag to use."
+        ),
+    )
     parser.add_argument(
         "--devices",
         type=_device_list,
@@ -1294,7 +1344,12 @@ def build_subtitles_parser() -> argparse.ArgumentParser:
     parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
     parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
-    parser.add_argument("--device", default="auto", help="auto, cuda:0, mps, or cpu.")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help="auto, cpu, cuda:N, rocm[:N] (alias for cuda), xpu, or mps.",
+    )
     parser.add_argument("--force", action="store_true", help="Ignore the cached transcript.")
     parser.add_argument(
         "--log-file",
@@ -1336,7 +1391,12 @@ def build_info_parser() -> argparse.ArgumentParser:
             "pipeline would pick, optional packages, system binaries and models."
         ),
     )
-    parser.add_argument("--device", default="auto", help="Device to report on.")
+    parser.add_argument(
+        "--device",
+        type=_device_arg,
+        default="auto",
+        help="Device to report on.",
+    )
     parser.add_argument(
         "--devices",
         type=_device_list,
@@ -1354,6 +1414,18 @@ def build_info_parser() -> argparse.ArgumentParser:
         "--models-dir", type=Path, default=None, help="Override the models directory."
     )
     return parser
+
+
+def build_devices_parser() -> argparse.ArgumentParser:
+    """Parser for the ``devices`` subcommand."""
+    return argparse.ArgumentParser(
+        prog=f"{_PROG} devices",
+        description=(
+            "List every GPU this machine can use, the precision each one would "
+            "run, and the exact flag to select it. Read-only: it loads no model "
+            "and starts no stage."
+        ),
+    )
 
 
 def _module_available(name: str) -> bool:
@@ -1455,6 +1527,7 @@ def render_environment(
         f"asr device       {asr_device(device)}  "
         f"(compute type {resolve_compute_type(asr_device(device))})"
     )
+    lines.append("all devices      python dub.py devices  (one line per card)")
 
     lines.append("")
     lines.append("optional packages")
@@ -1479,6 +1552,88 @@ def render_environment(
     return "\n".join(lines)
 
 
+def _format_memory(info: DeviceInfo) -> str:
+    """Human-readable VRAM, or ``-`` when torch could not report it."""
+    if not info.total_memory:
+        return "-"
+    return f"{info.total_memory / 1024 ** 3:.1f} GiB"
+
+
+#: One line per supported family, printed by ``dub.py devices``. The wording names
+#: the PyTorch build each family needs: "install a GPU" is not actionable, and
+#: "install the ROCm wheel" is.
+_SUPPORTED_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("cuda", "NVIDIA, with the CUDA build of PyTorch"),
+    ("rocm", "AMD, with the ROCm build of PyTorch (reported as cuda)"),
+    ("xpu", "Intel Arc / integrated, with the XPU build of PyTorch"),
+    ("mps", "Apple Silicon, via Metal"),
+    ("cpu", "always available; slower, and the fallback for every other GPU"),
+)
+
+
+def render_devices() -> str:
+    """The text printed by ``dub.py devices``.
+
+    Returned rather than printed so it is testable and can be pasted whole into a
+    bug report, the same contract as :func:`render_environment`.
+    """
+    devices = enumerate_devices()
+    lines = [f"torch            {_torch_version()}", "", "Supported backends"]
+    for name, description in _SUPPORTED_FAMILIES:
+        lines.append(f"  {name:<8}{description}")
+
+    lines.extend(
+        [
+            "",
+            "Note: Vulkan is not a backend here. Speech recognition runs on",
+            "      CTranslate2 (CUDA or CPU only) and the other stages on PyTorch,",
+            "      which has no Vulkan device. AMD cards use ROCm and appear as",
+            "      'cuda'; '--device vulkan0' is invalid.",
+            "",
+        ]
+    )
+
+    if not devices:
+        lines.append("Detected devices  none - everything will run on the CPU.")
+        lines.extend(
+            [
+                "",
+                "Suggested command",
+                "  python dub.py --video INPUT --target fr --device cpu",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.append("Detected devices")
+    for info in devices:
+        name = info.name or "unknown"
+        family = " (ROCm)" if info.kind == "rocm" else ""
+        lines.append(f"  {info.label:<9}{name:<32}{_format_memory(info):>9}{family}")
+        lines.append(
+            f"  {'':<9}bf16 {'yes' if info.supports_bf16 else 'no':<4}"
+            f"fp16 {'yes' if info.supports_fp16 else 'no':<4}"
+            f"asr {asr_device(info.label):<5} tts {preferred_dtype(info)}"
+        )
+
+    labels = [info.label for info in devices]
+    lines.extend(["", "Suggested command"])
+    lines.append(f"  python dub.py --video INPUT --target fr --device {labels[0]}")
+    if len(labels) > 1:
+        lines.append(
+            "  python dub.py --video INPUT --target fr --devices " + ",".join(labels)
+        )
+    if any(info.kind in {"xpu", "mps"} for info in devices):
+        lines.extend(
+            [
+                "",
+                "ASR stays on the CPU for xpu/mps: CTranslate2 has no XPU or",
+                "Metal backend, so only the TTS, separation and diarization",
+                "stages use the GPU.",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def cmd_info(argv: Sequence[str]) -> int:
     """Handle ``dub.py info``."""
     args = build_info_parser().parse_args(list(argv))
@@ -1489,6 +1644,13 @@ def cmd_info(argv: Sequence[str]) -> int:
             models_dir, device=args.device, dtype=args.dtype, devices=args.devices
         )
     )
+    return _STOP
+
+
+def cmd_devices(argv: Sequence[str]) -> int:
+    """Handle ``dub.py devices``."""
+    build_devices_parser().parse_args(list(argv))
+    print(render_devices())
     return _STOP
 
 
@@ -3277,6 +3439,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = args[1:]
     elif args and args[0] == "say":
         handler = cmd_say
+        payload = args[1:]
+    elif args and args[0] in {"devices", "list-devices"}:
+        handler = cmd_devices
         payload = args[1:]
     elif args and args[0] == "info":
         handler = cmd_info

@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `python dub.py devices` lists every GPU torch can see, its VRAM, the precision
+  it would run, whether ASR can use it, and the exact flag to select it. It is
+  read-only and loads no model, the same contract as `dub.py info`.
 - `--accent-voice LABEL` takes the reference accent's clip and its exact
   transcript from a saved voice, so `--accent-mode reference-accent` no longer
   needs `--accent-audio` and `--accent-text` repeated by hand. It implies the
@@ -15,6 +18,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Device names are validated when the command line is parsed: an unknown value
+  such as `vulkan0` fails immediately with an explanation instead of crashing
+  inside torch after the first stage. `rocm`/`rocm:N` is accepted as an alias for
+  `cuda`/`cuda:N`, because that is the only spelling torch uses for an AMD card.
 - `torch` and `torchaudio` are pinned to `2.5.1`, and the `torch` floor in the
   package metadata is raised to the same release. Below 2.5, transformers 4.57's
   sliding-window attention-mask builder writes in place onto an expanded tensor,

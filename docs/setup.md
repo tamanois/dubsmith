@@ -100,7 +100,8 @@ After installing, verify the CLI and the environment:
 
 ```bash
 dub --version
-dub info
+dub devices      # which GPU(s) are visible, and the flag to select each one
+dub info         # the device and precision a run would pick
 dub models --list
 ```
 
@@ -109,10 +110,13 @@ If a checkpoint is gated on Hugging Face, authenticate once with `hf auth login`
 `HF_HUB_OFFLINE=1`.
 
 **GPU is optional.** With CUDA or ROCm the pipeline runs there; without one
-everything still runs on CPU, just much slower. Speech recognition always uses
-CTranslate2, which offers CUDA and CPU only — so on Apple Silicon ASR runs on the
-CPU while the other stages can use Metal if you ask for it. See
-[Devices and precision](performance.md#devices-and-precision).
+everything still runs on CPU, just much slower. `dub devices` lists every GPU
+torch can see and the exact `--device` flag for each; `dub info` shows what a
+run would pick. The supported families are CUDA (NVIDIA), ROCm (AMD, reported
+as `cuda`), XPU (Intel) and Metal (Apple Silicon). Speech recognition always
+uses CTranslate2, which offers CUDA and CPU only — so on Apple Silicon and
+Intel XPU, ASR runs on the CPU while the other stages can use the GPU if you
+ask for it. See [Devices and precision](performance.md#devices-and-precision).
 
 Python packages installed by `requirements.txt`:
 

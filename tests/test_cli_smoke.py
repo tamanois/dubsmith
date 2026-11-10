@@ -23,6 +23,7 @@ from dub import (
     job_config_from_args,
     log_file_from,
     main,
+    render_devices,
     render_environment,
 )
 from pipeline import __version__
@@ -162,6 +163,114 @@ def test_dtype_and_device_default_to_auto() -> None:
 
     assert job.dtype == "auto"
     assert job.device == "auto"
+
+
+# --------------------------------------------------------------------------- #
+# Device listing and validation
+# --------------------------------------------------------------------------- #
+
+
+def test_devices_lists_the_supported_accelerators(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["devices"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Supported backends" in out
+    assert "Vulkan is not a backend" in out
+    assert "Detected devices" in out
+    assert "Suggested command" in out
+
+
+def test_devices_prints_one_row_per_card(torch_profile) -> None:
+    torch_profile(
+        kind="cuda",
+        devices=[
+            {"name": "RTX 3060 A", "memory": 12 * 1024**3, "capability": (8, 6)},
+            {"name": "RTX 3060 B", "memory": 8 * 1024**3, "capability": (7, 5)},
+        ],
+    )
+
+    text = render_devices()
+
+    assert "cuda:0" in text
+    assert "cuda:1" in text
+    assert "RTX 3060 A" in text
+    assert "RTX 3060 B" in text
+    # Each card gets its own row, and the fan-out suggestion names both.
+    assert "--devices cuda:0,cuda:1" in text
+    # Capability is per card: Ampere gets bf16, Turing does not.
+    assert "bf16 yes" in text
+    assert "bf16 no" in text
+    assert "tts fp16" in text
+
+
+def test_devices_marks_rocm_cards(torch_profile) -> None:
+    torch_profile(
+        kind="rocm",
+        devices=[
+            {"name": "RX 7900 XTX", "memory": 24 * 1024**3, "capability": (9, 4)}
+        ],
+    )
+
+    text = render_devices()
+
+    assert "cuda:0" in text
+    assert "(ROCm)" in text
+    assert "RX 7900 XTX" in text
+
+
+def test_devices_falls_back_to_cpu_when_no_gpu(torch_profile) -> None:
+    torch_profile(kind="cpu")
+
+    text = render_devices()
+
+    assert "none - everything will run on the CPU" in text
+    assert "--device cpu" in text
+
+
+def test_devices_explains_asr_fallback_for_metal(torch_profile) -> None:
+    torch_profile(kind="mps")
+
+    text = render_devices()
+
+    assert "mps" in text
+    assert "ASR stays on the CPU" in text
+
+
+def test_info_points_at_the_device_listing(tmp_path) -> None:
+    text = render_environment(tmp_path)
+
+    assert "python dub.py devices" in text
+
+
+@pytest.mark.parametrize("flag", ["--device", "--devices"])
+def test_the_cli_rejects_vulkan_before_any_stage_runs(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_dub_parser().parse_args(["--video", "in.mp4", flag, "vulkan0"])
+
+    assert exit_info.value.code == 2
+    assert "Vulkan is not a supported backend" in capsys.readouterr().err
+
+
+def test_devices_reject_vulkan_inside_a_list(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_dub_parser().parse_args(
+            ["--video", "in.mp4", "--devices", "cuda:0,vulkan0"]
+        )
+
+    assert exit_info.value.code == 2
+    assert "Vulkan is not a supported backend" in capsys.readouterr().err
+
+
+def test_the_rocm_alias_reaches_the_config_as_cuda() -> None:
+    args = build_dub_parser().parse_args(
+        ["--video", "in.mp4", "--device", "rocm:1"]
+    )
+
+    assert job_config_from_args(args).device == "cuda:1"
 
 
 # --------------------------------------------------------------------------- #

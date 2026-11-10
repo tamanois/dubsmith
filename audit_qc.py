@@ -31,7 +31,8 @@ import sys
 from pathlib import Path
 
 from pipeline.audit import QCThresholds, qc
-from pipeline.errors import DubbingError
+from pipeline.config import normalize_device_request
+from pipeline.errors import ConfigError, DubbingError
 
 #: Where the base checkpoint lives in this repo, for the timbre gate.
 DEFAULT_MODEL_DIR = Path("models/Qwen3-TTS-12Hz-1.7B-Base")
@@ -39,6 +40,14 @@ DEFAULT_MODEL_DIR = Path("models/Qwen3-TTS-12Hz-1.7B-Base")
 _EXIT_OK = 0
 _EXIT_FAILED = 1
 _EXIT_UNUSABLE = 2
+
+
+def _device_arg(value: str) -> str:
+    """Validate ``--device`` with the same rule as the main CLI."""
+    try:
+        return normalize_device_request(value)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device",
+        type=_device_arg,
         default="auto",
         help=(
             "Device for the timbre measurement. `auto` picks the GPU when one is "

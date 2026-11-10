@@ -118,6 +118,15 @@ docker run --rm --gpus all \
 
 CPU host: drop `--gpus all` (the pipeline picks CPU automatically).
 
+Verify the GPU is visible inside the container before a long run:
+
+```bash
+docker run --rm --gpus all dubsmith devices
+```
+
+If it prints `none - everything will run on the CPU`, the container cannot see
+the GPU: check `--gpus`, the NVIDIA Container Toolkit, and the host driver.
+
 Speech generation and inspection:
 
 ```bash

@@ -105,31 +105,46 @@ def make_fake_torch(
     capability: tuple[int, int] | None = (8, 6),
     name: str = "NVIDIA GeForce RTX 3060",
     memory: int = 12 * 1024**3,
+    devices: list[dict[str, Any]] | None = None,
 ) -> SimpleNamespace:
     """A stand-in for the ``torch`` module covering one hardware profile.
 
     ``kind`` is ``cpu``, ``cuda``, ``rocm``, ``xpu`` or ``mps``. Only the
     attributes the pipeline actually reads are provided, so a profile that lacks a
     capability raises rather than silently pretending to have it.
+
+    ``devices`` describes a multi-card machine: a list of dicts with ``name``,
+    ``memory`` and ``capability`` keys, one per card. Omit it for the single-card
+    profile the rest of the suite assumes.
     """
     if kind not in {"cpu", "cuda", "rocm", "xpu", "mps"}:
         raise ValueError(f"unknown profile {kind!r}")
+
+    cards: list[dict[str, Any]] = list(devices) if devices else [
+        {"name": name, "memory": memory, "capability": capability}
+    ]
+
+    def card(index: int = 0) -> dict[str, Any]:
+        return cards[index]
 
     torch = SimpleNamespace(
         bfloat16="bfloat16",
         float16="float16",
         float32="float32",
         version=SimpleNamespace(hip="5.7.1" if kind == "rocm" else None),
-        cuda=SimpleNamespace(is_available=lambda: False),
+        cuda=SimpleNamespace(is_available=lambda: False, device_count=lambda: 0),
         backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
     )
 
     if kind in {"cuda", "rocm"}:
         torch.cuda = SimpleNamespace(
             is_available=lambda: True,
-            get_device_name=lambda index=0: name,
-            get_device_properties=lambda index=0: SimpleNamespace(total_memory=memory),
-            get_device_capability=lambda index=0: capability,
+            device_count=lambda: len(cards),
+            get_device_name=lambda index=0: card(index)["name"],
+            get_device_properties=lambda index=0: SimpleNamespace(
+                total_memory=card(index)["memory"]
+            ),
+            get_device_capability=lambda index=0: card(index)["capability"],
             empty_cache=lambda: None,
             ipc_collect=lambda: None,
             # Half of the card free, a quarter ever reserved: enough for the
@@ -140,8 +155,11 @@ def make_fake_torch(
     elif kind == "xpu":
         torch.xpu = SimpleNamespace(
             is_available=lambda: True,
-            get_device_name=lambda index=0: name,
-            get_device_properties=lambda index=0: SimpleNamespace(total_memory=memory),
+            device_count=lambda: len(cards),
+            get_device_name=lambda index=0: card(index)["name"],
+            get_device_properties=lambda index=0: SimpleNamespace(
+                total_memory=card(index)["memory"]
+            ),
             empty_cache=lambda: None,
         )
     elif kind == "mps":

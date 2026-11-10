@@ -81,6 +81,7 @@ python dub.py models --download all
 **4. Check the machine**
 
 ```bash
+python dub.py devices      # every GPU, its VRAM and the exact flag to use
 python dub.py info          # device, precision, optional packages, models
 python dub.py models --list
 ```

@@ -53,12 +53,20 @@ import sys
 from pathlib import Path
 
 from pipeline.audit import audit_job
-from pipeline.config import configure_allocator
-from pipeline.errors import AuditError
+from pipeline.config import configure_allocator, normalize_device_request
+from pipeline.errors import AuditError, ConfigError
 from pipeline.tts import TTSEngine
 
 #: Where the base checkpoint lives in this repo.
 DEFAULT_MODEL_DIR = Path("models/Qwen3-TTS-12Hz-1.7B-Base")
+
+
+def _device_arg(value: str) -> str:
+    """Validate ``--device`` with the same rule as the main CLI."""
+    try:
+        return normalize_device_request(value)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def report(result: dict) -> None:
@@ -112,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--device",
+        type=_device_arg,
         default="auto",
         help=(
             "Device for the speaker encoder. `auto` picks the GPU when one is "
