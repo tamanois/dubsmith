@@ -288,7 +288,7 @@ python -m pytest
 ```
 
 ```text
-1356 tests (1353 passed, 3 skipped)
+1453 tests (all passing)
 ```
 
 Run one area while iterating:

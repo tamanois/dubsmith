@@ -1428,7 +1428,7 @@ never overwritten without `--force`. `dub.py say` writes `output/say/<name>.wav`
 
 **Verified.**
 
-- **The full suite passes** (1354 tests at the time of the public release): 36
+- **The full suite passes** (1453 tests at the time of the public release): 36
   cover the store and 24 the new CLI surface, all without a model or a GPU.
 - **Real voice design** on an RTX 3060: `voices --design` saved a 27.1 s French
   print; `say --voice` round-tripped through Whisper with the exact text.

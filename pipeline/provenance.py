@@ -369,8 +369,7 @@ def describe_transformations(
                     detail=f"{float(exaggeration):.3f}",
                 )
             )
-    elif channel == "customvoice":
-        if instruct:
-            items.append(Transformation(kind="instruct", detail=str(instruct)))
+    elif channel == "customvoice" and instruct:
+        items.append(Transformation(kind="instruct", detail=str(instruct)))
 
     return items

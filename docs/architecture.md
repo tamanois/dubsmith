@@ -76,7 +76,7 @@ pipeline/
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (1356 tests, no GPU or models needed)
+tests/                     pytest suite (1453 tests, no GPU or models needed)
 models/                    downloaded weights (gitignored)
 voices/                    saved voices: clip, manifest, encoding and provenance (gitignored)
 output/                    job artifacts (gitignored)
