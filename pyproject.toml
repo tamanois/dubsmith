@@ -40,7 +40,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy==1.26.4",
+    "numpy==2.2.6",
     "typing_extensions",
     # Floor, not a pin: see the torch note in requirements.txt. Below 2.5 the
     # Qwen3-TTS decode path dies in transformers' sliding-window mask builder.
