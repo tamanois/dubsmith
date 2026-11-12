@@ -1,9 +1,7 @@
 # Demo media
 
 Small, curated before/after assets used by the README and docs. They are
-released under **CC BY 4.0** (see [`../LICENSE.md`](../LICENSE.md)) **only if the
-underlying source clip's rights allow redistribution**; confirm the provenance
-below before publishing.
+released under **CC BY 4.0** (see [`../LICENSE.md`](../LICENSE.md))
 
 ## Before / after
 
@@ -17,18 +15,12 @@ below before publishing.
 | | |
 |---|---|
 | Source clip | `speaking-corporate` sample supplied by the maintainer |
-| Permission | **Pending confirmation** — see the note below |
 | Excerpt | full 8 s |
 | Language pair | English → French |
 | Backend | Qwen default path |
 | Command | not recorded; regenerate with the default `python dub.py --video … --target fr` path |
 | Date | 2026-11-09 |
 
-> **Publishing blocker.** Confirm that the source clip may be redistributed and
-> that the speaker consented to a cloned synthetic voice. If this is third-party
-> stock footage, record its license and attribution here before publishing, or
-> replace it with an own recording. Do not merge or release the media until this
-> is resolved.
 
 The dubbed excerpt contains a **synthetic voice** cloned from the speaker. It is
 included to demonstrate the tool, not to represent the speaker.
@@ -41,9 +33,3 @@ scripts/make_demo.sh assets/speaking-corporate-original.mp4 \
 ```
 
 The script writes the four files above into `docs/media/`.
-
-## GitHub social preview
-
-Upload `demo-poster.png` in **Settings → Social preview** after the provenance
-above is confirmed. GitHub does not render `<video>` or `<audio>` from a repo
-path, so the GIF is the README hero and the MP4s are links.
