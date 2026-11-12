@@ -31,6 +31,10 @@ python -m pytest -k accent -q                  # everything accent-related
 python -m pytest tests/test_voices.py -q       # saved voices and cards
 python -m pytest tests/test_provenance.py -q   # prosody/provenance records
 python -m pytest tests/test_server.py -q       # API, job state machine, uploads
+
+# Frontend behavior (Vitest + Testing Library), from web/
+npm test
+npm run build
 ```
 
 ## Real dubs against the local checkpoints

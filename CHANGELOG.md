@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format follows
   `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
   structured device/environment reports and an optional stage-event hook on the
   dubbing and subtitles pipelines.
+- Frontend regression tests (Vitest + Testing Library) cover the subtitles-only
+  device selector and the completed/cancelled/failed job-panel messages.
 - `python dub.py devices` lists every GPU torch can see, its VRAM, the precision
   it would run, whether ASR can use it, and the exact flag to select it. It is
   read-only and loads no model, the same contract as `dub.py info`.

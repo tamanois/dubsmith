@@ -318,6 +318,32 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
               <Field label="Whisper model">
                 <Input value={whisperModel} onChange={(event) => setWhisperModel(event.target.value)} />
               </Field>
+              <Field label="Device">
+                <Select
+                  value={device}
+                  onChange={(event) => setDevice(event.target.value)}
+                  options={[
+                    { value: "auto", label: "Auto" },
+                    { value: "cpu", label: "CPU" },
+                    ...availableDevices.map((item) => ({
+                      value: item.label,
+                      label: `${item.label} — ${item.name}`,
+                    })),
+                  ]}
+                />
+              </Field>
+              <Field label="Precision">
+                <Select
+                  value={dtype}
+                  onChange={(event) => setDtype(event.target.value)}
+                  options={[
+                    { value: "auto", label: "Auto" },
+                    { value: "bf16", label: "bfloat16" },
+                    { value: "fp16", label: "float16" },
+                    { value: "fp32", label: "float32" },
+                  ]}
+                />
+              </Field>
             </div>
           ) : null}
 

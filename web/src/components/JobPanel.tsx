@@ -95,7 +95,10 @@ export function JobPanel({
           </div>
         ) : null}
         {job?.error ? <ErrorNote message={job.error} /> : null}
-        {terminal && !job?.error ? (
+        {terminal && !job?.error && job?.state === "CANCELLED" ? (
+          <div className="text-sm text-amber-300">Cancelled.</div>
+        ) : null}
+        {terminal && !job?.error && job?.state === "COMPLETED" ? (
           <div className="text-sm text-emerald-300">Finished successfully.</div>
         ) : null}
         {resultPaths.length ? (

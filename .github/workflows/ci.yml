@@ -72,6 +72,27 @@ jobs:
           --cov=pipeline --cov=server --cov=dub --cov=audit_qc --cov=audit_timbre
           --cov-report=term-missing
 
+  web:
+    name: web (tests + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
   package:
     name: package
     runs-on: ubuntu-latest

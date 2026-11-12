@@ -130,4 +130,15 @@ models or ffmpeg:
 python -m pytest tests/test_server.py
 ```
 
-The frontend is checked with `npm run build` (TypeScript + Vite).
+The frontend is checked with Vitest and Testing Library, then type-checked and
+built:
+
+```bash
+cd web
+npm test
+npm run build
+```
+
+`test/DubPage.test.tsx` covers the subtitles-only device selector;
+`test/JobPanel.test.tsx` covers the terminal messages for completed, cancelled
+and failed jobs.
