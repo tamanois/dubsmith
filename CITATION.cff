@@ -7,8 +7,13 @@ license: Apache-2.0
 version: 0.2.0
 date-released: 2026-11-09
 authors:
-  - name: "The Dubsmith authors"
+  - given-names: "Joel"
+    family-names: "Chinda"
+    alias: "tamanois"
+    website: "https://github.com/tamanois"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"  # add if you have one
 repository-code: "https://github.com/tamanois/dubsmith"
+url: "https://github.com/tamanois/dubsmith"
 keywords:
   - dubbing
   - text-to-speech
