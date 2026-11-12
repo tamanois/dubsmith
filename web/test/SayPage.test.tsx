@@ -13,6 +13,12 @@ vi.mock("../src/api", () => ({
     voices: (...args: unknown[]) => voices(...args),
     settings: (...args: unknown[]) => settings(...args),
     submitSay: (...args: unknown[]) => submitSay(...args),
+    files: async () => ({ files: [], total: 0, page: 1, page_size: 20 }),
+    favorites: async () => ({ favorites: [] }),
+    addFavorite: async () => ({ favorite: { path: "", kind: "input" } }),
+    presets: async () => ({ presets: [] }),
+    createPreset: vi.fn(),
+    deletePreset: vi.fn(),
   },
 }));
 

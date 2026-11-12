@@ -18,11 +18,28 @@ All notable changes to this project are documented here. The format follows
   `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
   structured device/environment reports and an optional stage-event hook on the
   dubbing and subtitles pipelines.
-- Frontend regression tests (Vitest + Testing Library, 125 tests) cover the API
-  wrapper and SSE handling, the UI primitives, uploads, live job logs and
-  cancellation, activity polling, every management page (models, devices, files,
-  settings, voices), the full dub and speech payload builders, and app
-  navigation. They run without a GPU, network, or built assets.
+- Frontend regression tests (Vitest + Testing Library, 163 tests) cover the API
+  wrapper and SSE reconnect, the UI primitives, uploads, live job logs,
+  cancellation, retry/edit/compare and filtering, pagination and bulk actions on
+  every list, model deletion, playback, presets, recent/favorite inputs, settings
+  export/import, theme and defaults, and app navigation. They run without a GPU,
+  network, or built assets.
+- Actionable activity: finished jobs can be retried (a fresh run folder, the
+  original untouched) or opened for editing with every stored option prefilled.
+  The panel expands, and a completed dub can be compared against its source.
+- Activity filtering and search, server-side pagination (20 per page by default)
+  and bulk clearing of finished job records.
+- A header defaults bar for the default device and precision, persisted with the
+  other settings, plus a System / Light / Dark theme switch.
+- Inline audio and video playback for uploads, outputs and saved voices, with
+  path copy buttons; bulk deletion on Files.
+- Model deletion from the Models page behind a danger confirmation, reporting the
+  freed space; the endpoint refuses package-backed models and paths outside the
+  models directory.
+- Saved presets for the dub and speech forms, and recent/favorite input chips so a
+  previously used clip is one click away.
+- Disk usage in the UI, JSON settings export/import, completion toasts for
+  background jobs, and a dismissible first-run getting-started card.
 - `python dub.py devices` lists every GPU torch can see, its VRAM, the precision
   it would run, whether ASR can use it, and the exact flag to select it. It is
   read-only and loads no model, the same contract as `dub.py info`.
@@ -43,13 +60,43 @@ All notable changes to this project are documented here. The format follows
   which aborts Qwen3-TTS synthesis with a `RuntimeError` about a written-to
   tensor sharing a memory location.
 
+### Changed
+
+- `GET /api/outputs` now returns one entry per run folder with that run's main
+  artifact and a file count, instead of every intermediate artifact. The full
+  list for one run is available from `GET /api/outputs/files?job_dir=…`, which
+  the Files page exposes behind a Details toggle. A run that produced no
+  deliverable (only stage files) is not listed.
+
 ### Fixed
 
+- The job panel's Cancel button now keeps working after the live SSE connection
+  drops. Cancelling reflects the row the HTTP endpoint returns, and the stream
+  reconnects with backoff, resuming from the last event id so no log line or
+  stage change is lost. A regression test covers the dropped-stream path.
+- Pagination no longer renders `NaN`: the API always returns a numeric `total`
+  and the component refuses a non-finite one, so a stale server or partial
+  response cannot break the pager.
+- The Devices page loads devices, packages and storage independently; one failing
+  optional endpoint no longer blanks the whole page.
+- Playback controls only appear for files a browser can actually play. JSON,
+  SRT and other artifacts list Download and Delete only.
+- The header defaults are labelled "Device" and "Precision" instead of a single
+  ambiguous "Default".
 - The job panel now keeps exactly the latest 300 log lines instead of 301; the
   cap test caught the off-by-one in the live log buffer.
 - The upload field's file input, disclosure buttons and toggles expose accessible
   names and expanded state, so keyboard and screen-reader users can identify
   them and the UI tests can target them reliably.
+- The activity list and the completion watcher only refresh quickly while a job
+  is running, drop to one request every 15 s when everything is finished, and
+  stop entirely while the tab is hidden, so an idle browser no longer polls the
+  API every 2.5 s. Returning to the tab refreshes immediately.
+- `pip install .` (non-editable) made `dub-server` import a frozen snapshot from
+  `site-packages`, so source changes never reached the running server and the UI
+  hit 404s on `/api/usage` and `/api/presets` while showing `NaN` pagination.
+  The install is now editable and `docs/web-ui.md` tells you to rebuild and
+  restart after a backend change.
 
 ## [0.2.0] - 2026-11-09
 

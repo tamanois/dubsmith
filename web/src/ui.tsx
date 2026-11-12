@@ -235,10 +235,17 @@ export function Badge({ state }: { state: string }) {
   );
 }
 
-export function Empty({ text }: { text: string }) {
+export function Empty({
+  text,
+  action,
+}: {
+  text: string;
+  action?: React.ReactNode;
+}) {
   return (
-    <div className="rounded-xl border border-dashed border-white/10 px-6 py-10 text-center text-sm text-slate-500">
-      {text}
+    <div className="rounded-xl border border-dashed border-white/10 px-6 py-10 text-center">
+      <p className="text-sm text-slate-500">{text}</p>
+      {action ? <div className="mt-4 flex justify-center">{action}</div> : null}
     </div>
   );
 }
@@ -248,6 +255,175 @@ export function ErrorNote({ message }: { message: string }) {
     <div className="rounded-lg border border-rose-500/25 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
       {message}
     </div>
+  );
+}
+
+export function ConfirmDialog({
+  open,
+  title,
+  message,
+  confirmLabel = "Delete",
+  danger = false,
+  busy = false,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  if (!open) return null;
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+    >
+      <div className="w-full max-w-md rounded-2xl border border-white/10 bg-ink-900 p-5 shadow-glow">
+        <h3 className="text-base font-semibold text-white">{title}</h3>
+        <p className="mt-2 text-sm text-slate-400">{message}</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="ghost" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            variant={danger ? "danger" : "primary"}
+            onClick={onConfirm}
+            disabled={busy}
+          >
+            {busy ? <Spinner /> : null}
+            {confirmLabel}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function Pagination({
+  page,
+  pageSize,
+  total,
+  onPage,
+}: {
+  page: number;
+  pageSize: number;
+  total: number;
+  onPage: (page: number) => void;
+}) {
+  const safeTotal = Number.isFinite(total) ? Math.max(0, total) : 0;
+  const size = Math.max(1, pageSize);
+  const pages = Math.max(1, Math.ceil(safeTotal / size));
+  if (safeTotal <= size) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs text-slate-500">
+      <span>
+        {safeTotal} item{safeTotal === 1 ? "" : "s"}
+      </span>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="ghost"
+          className="px-2 py-1 text-xs"
+          disabled={page <= 1}
+          onClick={() => onPage(page - 1)}
+        >
+          Previous
+        </Button>
+        <span>
+          Page {page} of {pages}
+        </span>
+        <Button
+          variant="ghost"
+          className="px-2 py-1 text-xs"
+          disabled={page >= pages}
+          onClick={() => onPage(page + 1)}
+        >
+          Next
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function CopyButton({
+  value,
+  label = "Copy path",
+}: {
+  value: string;
+  label?: string;
+}) {
+  const [copied, setCopied] = React.useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard is unavailable (e.g. insecure origin); do nothing */
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      aria-label={label}
+      className="rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-400 transition hover:border-white/20 hover:text-slate-200"
+    >
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+const _VIDEO_EXTENSIONS = [".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"];
+const _AUDIO_EXTENSIONS = [
+  ".mp3",
+  ".wav",
+  ".flac",
+  ".m4a",
+  ".aac",
+  ".ogg",
+  ".opus",
+];
+
+export function isVideoFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  return _VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+/** True when a browser can actually play this file inline. */
+export function isPlayable(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    isVideoFile(name) || _AUDIO_EXTENSIONS.some((ext) => lower.endsWith(ext))
+  );
+}
+
+export function MediaPreview({ src, name }: { src: string; name: string }) {
+  if (isVideoFile(name)) {
+    return (
+      <video
+        controls
+        preload="metadata"
+        src={src}
+        aria-label={`Play ${name}`}
+        className="max-h-64 w-full rounded-lg border border-white/10 bg-black/30"
+      />
+    );
+  }
+  return (
+    <audio
+      controls
+      preload="metadata"
+      src={src}
+      aria-label={`Play ${name}`}
+      className="w-full"
+    />
   );
 }
 

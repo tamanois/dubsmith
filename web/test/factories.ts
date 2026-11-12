@@ -108,6 +108,7 @@ export function makeSettings(overrides: Partial<SettingsInfo> = {}): SettingsInf
     llm_api_key_set: false,
     default_device: "auto",
     default_dtype: "auto",
+    theme: "system",
     editable: [],
     ...overrides,
   };

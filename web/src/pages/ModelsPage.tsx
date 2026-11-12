@@ -5,16 +5,21 @@ import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
   Empty,
   ErrorNote,
   Section,
   Spinner,
+  formatBytes,
 } from "../ui";
 
 export function ModelsPage({ onJobStarted }: { onJobStarted: (id: string) => void }) {
   const [models, setModels] = React.useState<ModelInfo[]>([]);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [notice, setNotice] = React.useState<string | null>(null);
+  const [pending, setPending] = React.useState<ModelInfo | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
 
   const refresh = React.useCallback(() => {
     api
@@ -40,6 +45,26 @@ export function ModelsPage({ onJobStarted }: { onJobStarted: (id: string) => voi
     }
   }
 
+  async function remove() {
+    if (!pending) return;
+    setDeleting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await api.deleteModel(pending.name);
+      setNotice(
+        `Deleted ${pending.name}; freed ${formatBytes(result.freed_bytes)}.` +
+          (result.warning ? ` ${result.warning}` : ""),
+      );
+      setPending(null);
+      refresh();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Could not delete the model");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   const present = models.filter((model) => model.present).length;
 
   return (
@@ -58,7 +83,21 @@ export function ModelsPage({ onJobStarted }: { onJobStarted: (id: string) => voi
     >
       <div className="space-y-4">
         {error ? <ErrorNote message={error} /> : null}
-        {models.length === 0 ? <Empty text="No models reported yet." /> : null}
+        {notice ? (
+          <div className="rounded-lg border border-emerald-400/25 bg-emerald-400/10 px-3 py-2 text-sm text-emerald-200">
+            {notice}
+          </div>
+        ) : null}
+        {models.length === 0 ? (
+          <Empty
+            text="No models reported yet."
+            action={
+              <Button variant="ghost" onClick={refresh}>
+                Reload models
+              </Button>
+            }
+          />
+        ) : null}
         <div className="grid gap-3 lg:grid-cols-2">
           {models.map((model) => (
             <Card key={model.name} className="p-4">
@@ -77,15 +116,27 @@ export function ModelsPage({ onJobStarted }: { onJobStarted: (id: string) => voi
                   <div className="mt-1 break-all text-xs text-slate-500">{model.repo_id}</div>
                   <div className="mt-1 text-xs text-slate-500">License: {model.license}</div>
                 </div>
-                <Button
-                  variant="ghost"
-                  className="px-3 py-1 text-xs"
-                  disabled={busy !== null}
-                  onClick={() => download([model.name])}
-                >
-                  {busy === model.name ? <Spinner /> : null}
-                  {model.present ? "Re-download" : "Download"}
-                </Button>
+                <div className="flex flex-col items-end gap-2">
+                  <Button
+                    variant="ghost"
+                    className="px-3 py-1 text-xs"
+                    disabled={busy !== null || deleting}
+                    onClick={() => download([model.name])}
+                  >
+                    {busy === model.name ? <Spinner /> : null}
+                    {model.present ? "Re-download" : "Download"}
+                  </Button>
+                  {model.present ? (
+                    <Button
+                      variant="danger"
+                      className="px-3 py-1 text-xs"
+                      disabled={busy !== null || deleting}
+                      onClick={() => setPending(model)}
+                    >
+                      Delete
+                    </Button>
+                  ) : null}
+                </div>
               </div>
             </Card>
           ))}
@@ -97,6 +148,21 @@ export function ModelsPage({ onJobStarted }: { onJobStarted: (id: string) => voi
           </Button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={pending !== null}
+        title={`Delete ${pending?.name ?? "model"}`}
+        message={
+          `This removes the checkpoint from disk and frees its space. It can be ` +
+          `downloaded again later.` +
+          (pending?.required ? " This model is required by the MVP." : "")
+        }
+        confirmLabel="Delete model"
+        danger
+        busy={deleting}
+        onConfirm={remove}
+        onCancel={() => setPending(null)}
+      />
     </Section>
   );
 }

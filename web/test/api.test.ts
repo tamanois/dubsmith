@@ -13,6 +13,7 @@ function jsonResponse(payload: unknown, status = 200) {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   FakeEventSource.reset();
 });
 
@@ -118,16 +119,25 @@ describe("subscribeJob", () => {
     expect(onEvent).not.toHaveBeenCalled();
   });
 
-  it("reports a stream error and closes", () => {
+  it("reports a stream error and reconnects from the last event id", () => {
+    vi.useFakeTimers();
     vi.stubGlobal("EventSource", FakeEventSource);
     const onError = vi.fn();
-    subscribeJob("job-1", vi.fn(), vi.fn(), onError);
+    const unsubscribe = subscribeJob("job-1", vi.fn(), vi.fn(), onError);
     const source = FakeEventSource.instances[0];
+    source.emit("log", { id: 7, kind: "log", message: "hello" });
     source.fail();
+
     expect(onError).toHaveBeenCalledWith(
       "Lost the live connection; the job may still be running.",
     );
     expect(source.close).toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(FakeEventSource.instances[1].url).toContain("after=7");
+    unsubscribe();
+    expect(FakeEventSource.instances[1].close).toHaveBeenCalled();
   });
 
   it("closes the stream when unsubscribed", () => {

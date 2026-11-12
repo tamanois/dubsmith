@@ -16,6 +16,7 @@ vi.mock("../src/api", () => ({
     cloneVoice: (...args: unknown[]) => cloneVoice(...args),
     addVoice: (...args: unknown[]) => addVoice(...args),
     deleteVoice: (...args: unknown[]) => deleteVoice(...args),
+    voiceAudioUrl: (label: string) => `/api/voices/${label}/audio`,
   },
 }));
 
@@ -45,7 +46,7 @@ beforeEach(() => {
   cloneVoice.mockReset();
   addVoice.mockReset();
   deleteVoice.mockReset();
-  voices.mockResolvedValue({ voices: [] });
+  voices.mockResolvedValue({ voices: [], total: 0, page: 1, page_size: 20 });
   for (const action of [designVoice, cloneVoice, addVoice]) {
     action.mockResolvedValue({ job_id: "job-voice", state: "QUEUED" });
   }
@@ -68,6 +69,9 @@ describe("VoicesPage library", () => {
         makeVoice({ label: "warm-fr", instruct: "warm and slow" }),
         makeVoice({ label: "plain-en", has_transcript: false, instruct: null }),
       ],
+      total: 2,
+      page: 1,
+      page_size: 20,
     });
     render(<VoicesPage onJobStarted={vi.fn()} />);
 
@@ -82,30 +86,72 @@ describe("VoicesPage library", () => {
   });
 
   it("deletes a voice after confirmation and refreshes", async () => {
-    voices.mockResolvedValue({ voices: [makeVoice()] });
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    voices.mockResolvedValue({
+      voices: [makeVoice()],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    });
     render(<VoicesPage onJobStarted={vi.fn()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    expect(screen.getByRole("dialog", { name: "Delete warm-fr" })).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("button", { name: "Delete voice" }));
     await waitFor(() => expect(deleteVoice).toHaveBeenCalledWith("warm-fr"));
-    expect(confirm).toHaveBeenCalledWith('Delete voice "warm-fr"?');
     await waitFor(() => expect(voices).toHaveBeenCalledTimes(2));
   });
 
   it("keeps a voice when confirmation is cancelled", async () => {
-    voices.mockResolvedValue({ voices: [makeVoice()] });
-    vi.spyOn(window, "confirm").mockReturnValue(false);
+    voices.mockResolvedValue({
+      voices: [makeVoice()],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    });
     render(<VoicesPage onJobStarted={vi.fn()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(deleteVoice).not.toHaveBeenCalled();
   });
 
+  it("auditions a voice", async () => {
+    voices.mockResolvedValue({
+      voices: [makeVoice()],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    });
+    render(<VoicesPage onJobStarted={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Play" }));
+    expect(await screen.findByLabelText("Play warm-fr")).toBeInTheDocument();
+  });
+
+  it("paginates the library", async () => {
+    voices.mockResolvedValue({
+      voices: [makeVoice()],
+      total: 45,
+      page: 1,
+      page_size: 20,
+    });
+    render(<VoicesPage onJobStarted={vi.fn()} />);
+    expect(await screen.findByText("Page 1 of 3")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await waitFor(() =>
+      expect(voices).toHaveBeenLastCalledWith({ page: 2, pageSize: 20 }),
+    );
+  });
+
   it("shows a delete failure and a load error", async () => {
-    voices.mockResolvedValueOnce({ voices: [makeVoice()] });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    voices.mockResolvedValueOnce({
+      voices: [makeVoice()],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    });
     deleteVoice.mockRejectedValueOnce(new Error("voice in use"));
     const { unmount } = render(<VoicesPage onJobStarted={vi.fn()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete voice" }));
     expect(await screen.findByText("voice in use")).toBeInTheDocument();
     unmount();
 

@@ -5,17 +5,20 @@ import { makeModel } from "./factories";
 
 const models = vi.fn();
 const downloadModels = vi.fn();
+const deleteModel = vi.fn();
 
 vi.mock("../src/api", () => ({
   api: {
     models: (...args: unknown[]) => models(...args),
     downloadModels: (...args: unknown[]) => downloadModels(...args),
+    deleteModel: (...args: unknown[]) => deleteModel(...args),
   },
 }));
 
 beforeEach(() => {
   models.mockReset();
   downloadModels.mockReset();
+  deleteModel.mockReset();
   models.mockResolvedValue({
     models: [
       makeModel({ name: "tts_base", required: true, present: true }),
@@ -51,6 +54,23 @@ describe("ModelsPage", () => {
     await waitFor(() =>
       expect(downloadModels).toHaveBeenCalledWith(["tts_base"]),
     );
+  });
+
+  it("deletes a present model after a danger confirmation", async () => {
+    deleteModel.mockResolvedValue({
+      name: "tts_base",
+      freed_bytes: 2048,
+      warning: null,
+    });
+    render(<ModelsPage onJobStarted={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    expect(
+      screen.getByRole("dialog", { name: "Delete tts_base" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    await waitFor(() => expect(deleteModel).toHaveBeenCalledWith("tts_base"));
+    expect(await screen.findByText(/freed 2\.0 KiB/)).toBeInTheDocument();
   });
 
   it("downloads the MVP set and everything", async () => {

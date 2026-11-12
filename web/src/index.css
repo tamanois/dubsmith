@@ -4,6 +4,22 @@
 
 :root {
   color-scheme: dark;
+  /* Surface palette as RGB channels, so Tailwind's `bg-ink-*` utilities follow
+     the theme through one variable flip (see tailwind.config.js). */
+  --ink-950: 8 11 18;
+  --ink-900: 13 18 32;
+  --ink-850: 17 24 39;
+  --ink-800: 22 31 49;
+  --ink-700: 31 42 61;
+}
+
+html.light {
+  color-scheme: light;
+  --ink-950: 246 247 251;
+  --ink-900: 255 255 255;
+  --ink-850: 243 245 249;
+  --ink-800: 255 255 255;
+  --ink-700: 232 236 243;
 }
 
 html,
@@ -28,6 +44,10 @@ body {
   scrollbar-color: #2a3650 transparent;
 }
 
+html.light * {
+  scrollbar-color: #c7cfdd transparent;
+}
+
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -36,4 +56,112 @@ body {
 *::-webkit-scrollbar-thumb {
   background: #2a3650;
   border-radius: 999px;
+}
+
+html.light *::-webkit-scrollbar-thumb {
+  background: #c7cfdd;
+}
+
+/*
+ * Light theme overrides.
+ *
+ * The components were written for a dark surface and use Tailwind's white/slate
+ * scales directly. Rather than rewrite hundreds of class names, the palette is
+ * remapped once here: surfaces flip through the `ink` variables above, and the
+ * text/border/divide utilities resolve to a readable dark-on-light scale.
+ */
+html.light body {
+  background-image:
+    radial-gradient(900px 500px at 15% -10%, rgba(109, 127, 245, 0.10), transparent 60%),
+    radial-gradient(700px 450px at 100% 0%, rgba(56, 189, 248, 0.07), transparent 55%);
+}
+
+html.light .text-white,
+html.light .text-slate-100,
+html.light .text-slate-200 {
+  color: #0f172a;
+}
+
+html.light .text-slate-300 {
+  color: #334155;
+}
+
+html.light .text-slate-400 {
+  color: #475569;
+}
+
+html.light .text-slate-500 {
+  color: #64748b;
+}
+
+html.light .text-slate-600 {
+  color: #94a3b8;
+}
+
+html.light .text-emerald-300 {
+  color: #047857;
+}
+
+html.light .text-amber-300,
+html.light .text-amber-200 {
+  color: #b45309;
+}
+
+html.light .text-rose-300,
+html.light .text-rose-200 {
+  color: #be123c;
+}
+
+html.light .text-sky-300 {
+  color: #0369a1;
+}
+
+html.light .text-accent-300,
+html.light .text-accent-400 {
+  color: #4338ca;
+}
+
+html.light .border-white\/5 {
+  border-color: rgba(15, 23, 42, 0.06);
+}
+
+html.light .border-white\/10 {
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+html.light .border-white\/15 {
+  border-color: rgba(15, 23, 42, 0.14);
+}
+
+html.light .border-white\/20 {
+  border-color: rgba(15, 23, 42, 0.16);
+}
+
+html.light .divide-white\/5 > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgba(15, 23, 42, 0.06);
+}
+
+html.light .bg-white\/5,
+html.light .bg-white\/\[0\.03\],
+html.light .bg-white\/\[0\.04\] {
+  background-color: rgba(15, 23, 42, 0.04);
+}
+
+html.light .hover\:bg-white\/\[0\.04\]:hover,
+html.light .hover\:bg-white\/5:hover {
+  background-color: rgba(15, 23, 42, 0.06);
+}
+
+html.light .bg-black\/30 {
+  background-color: rgba(15, 23, 42, 0.04);
+}
+
+html.light .shadow-glow {
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.06), 0 18px 40px rgba(15, 23, 42, 0.08);
+}
+
+html.light input,
+html.light textarea,
+html.light select {
+  color-scheme: light;
 }

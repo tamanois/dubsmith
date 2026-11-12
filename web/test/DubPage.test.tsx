@@ -17,6 +17,12 @@ vi.mock("../src/api", () => ({
     settings: (...args: unknown[]) => settings(...args),
     submitDub: (...args: unknown[]) => submitDub(...args),
     submitSubtitles: (...args: unknown[]) => submitSubtitles(...args),
+    files: async () => ({ files: [], total: 0, page: 1, page_size: 20 }),
+    favorites: async () => ({ favorites: [] }),
+    addFavorite: async () => ({ favorite: { path: "", kind: "input" } }),
+    presets: async () => ({ presets: [] }),
+    createPreset: vi.fn(),
+    deletePreset: vi.fn(),
   },
 }));
 

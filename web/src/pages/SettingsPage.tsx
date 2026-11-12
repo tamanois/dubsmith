@@ -56,11 +56,58 @@ export function SettingsPage() {
         log_json: settings.log_json,
         default_device: settings.default_device,
         default_dtype: settings.default_dtype,
+        theme: settings.theme,
       };
       setSettings(await api.patchSettings(values));
       setSaved(true);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Could not save settings");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const fileInput = React.useRef<HTMLInputElement>(null);
+
+  async function exportSettings() {
+    setError(null);
+    try {
+      const payload = await api.exportSettings();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "dubsmith-settings.json";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Could not export settings");
+    }
+  }
+
+  async function importSettings(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const parsed = JSON.parse(await file.text()) as {
+        version?: number;
+        settings?: Record<string, unknown>;
+      };
+      if (!parsed.settings) throw new Error("That file has no settings object.");
+      setSettings(
+        await api.importSettings({
+          version: parsed.version ?? 1,
+          settings: parsed.settings,
+        }),
+      );
+      setSaved(true);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Could not import settings");
     } finally {
       setBusy(false);
     }
@@ -79,8 +126,26 @@ export function SettingsPage() {
       title="Settings"
       subtitle="Non-secret defaults. API keys stay in the environment and are never written to SQLite."
       right={
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {saved ? <span className="text-xs text-emerald-300">Saved</span> : null}
+          <Button variant="ghost" onClick={exportSettings} disabled={busy}>
+            Export
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => fileInput.current?.click()}
+            disabled={busy}
+          >
+            Import
+          </Button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept="application/json,.json"
+            aria-label="Import settings file"
+            className="hidden"
+            onChange={importSettings}
+          />
           <Button onClick={save} disabled={busy}>
             {busy ? <Spinner /> : null}
             Save settings

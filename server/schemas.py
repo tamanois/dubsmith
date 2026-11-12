@@ -121,6 +121,51 @@ class SettingsPatch(BaseModel):
     values: dict[str, Any]
 
 
+class SettingsImport(BaseModel):
+    """A settings export file, re-applied by the import endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    settings: dict[str, Any]
+
+
+class IdListRequest(BaseModel):
+    """A batch of identifiers, for bulk delete and clearing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1)
+
+
+class PathListRequest(BaseModel):
+    """A batch of output paths, for bulk delete."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1)
+
+
+class PresetRequest(BaseModel):
+    """A saved form configuration (a template for Dub or Say)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    payload: dict[str, Any]
+
+
+class FavoriteRequest(BaseModel):
+    """An input path the user wants to keep within reach."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    label: str | None = None
+    kind: str = "input"
+
+
 class JobSubmitResponse(BaseModel):
     job_id: str
     state: str

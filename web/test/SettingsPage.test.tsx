@@ -5,17 +5,23 @@ import { makeSettings } from "./factories";
 
 const settings = vi.fn();
 const patchSettings = vi.fn();
+const exportSettings = vi.fn();
+const importSettings = vi.fn();
 
 vi.mock("../src/api", () => ({
   api: {
     settings: (...args: unknown[]) => settings(...args),
     patchSettings: (...args: unknown[]) => patchSettings(...args),
+    exportSettings: (...args: unknown[]) => exportSettings(...args),
+    importSettings: (...args: unknown[]) => importSettings(...args),
   },
 }));
 
 beforeEach(() => {
   settings.mockReset();
   patchSettings.mockReset();
+  exportSettings.mockReset();
+  importSettings.mockReset();
   settings.mockResolvedValue(makeSettings());
   patchSettings.mockImplementation(async (values: Record<string, unknown>) =>
     makeSettings(values),
@@ -23,6 +29,35 @@ beforeEach(() => {
 });
 
 describe("SettingsPage", () => {
+  it("exports settings as a download", async () => {
+    exportSettings.mockResolvedValue({ version: 1, settings: { duck_db: 6 } });
+    const createObjectURL = vi.fn(() => "blob:settings");
+    const revokeObjectURL = vi.fn();
+    Object.assign(URL, { createObjectURL, revokeObjectURL });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(<SettingsPage />);
+    await screen.findByDisplayValue("local-model");
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() => expect(exportSettings).toHaveBeenCalled());
+    expect(createObjectURL).toHaveBeenCalled();
+    expect(click).toHaveBeenCalled();
+  });
+
+  it("opens a file picker to import settings", async () => {
+    const click = vi
+      .spyOn(HTMLInputElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(<SettingsPage />);
+    await screen.findByDisplayValue("local-model");
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    expect(click).toHaveBeenCalled();
+  });
+
   it("loads current settings", async () => {
     render(<SettingsPage />);
     expect(await screen.findByDisplayValue("http://127.0.0.1:8080/v1")).toBeInTheDocument();

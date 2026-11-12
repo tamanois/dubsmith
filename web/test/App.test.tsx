@@ -1,6 +1,23 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
+import { makeDeviceReport, makeJob, makeSettings } from "./factories";
+
+const apiMock = vi.hoisted(() => ({
+  settings: vi.fn(),
+  devices: vi.fn(),
+  patchSettings: vi.fn(),
+  jobs: vi.fn(),
+}));
+
+vi.mock("../src/api", () => ({
+  api: apiMock,
+  subscribeJob: vi.fn(() => () => undefined),
+}));
+
+vi.mock("../src/components/Onboarding", () => ({
+  Onboarding: () => null,
+}));
 
 vi.mock("../src/components/JobPanel", () => ({
   JobPanel: ({ jobId, onClose }: { jobId: string; onClose: () => void }) => (
@@ -66,9 +83,33 @@ vi.mock("../src/pages/SettingsPage", () => ({
   SettingsPage: () => <div>Settings page</div>,
 }));
 
+beforeEach(() => {
+  apiMock.settings.mockReset();
+  apiMock.devices.mockReset();
+  apiMock.patchSettings.mockReset();
+  apiMock.jobs.mockReset();
+  apiMock.settings.mockResolvedValue(makeSettings());
+  apiMock.devices.mockResolvedValue(makeDeviceReport());
+  apiMock.patchSettings.mockImplementation(async (patch: Record<string, unknown>) => ({
+    ...makeSettings(),
+    ...patch,
+  }));
+  apiMock.jobs.mockResolvedValue({
+    jobs: [],
+    total: 0,
+    page: 1,
+    page_size: 50,
+  });
+});
+
 afterEach(() => {
   vi.useRealTimers();
+  setDocumentHidden(false);
 });
+
+function setDocumentHidden(hidden: boolean) {
+  Object.defineProperty(document, "hidden", { configurable: true, value: hidden });
+}
 
 describe("App navigation", () => {
   it("opens on Activity with no job panel", () => {
@@ -98,7 +139,7 @@ describe("App navigation", () => {
 
   it("navigates with the compact page selector", () => {
     render(<App />);
-    fireEvent.change(screen.getByRole("combobox"), {
+    fireEvent.change(screen.getByRole("combobox", { name: "Page" }), {
       target: { value: "settings" },
     });
     expect(screen.getByText("Settings page")).toBeInTheDocument();
@@ -146,5 +187,100 @@ describe("App job flow", () => {
     fireEvent.click(screen.getByRole("button", { name: "close panel" }));
     expect(screen.queryByText(/Job panel/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "current job" })).not.toBeInTheDocument();
+  });
+});
+
+describe("App preferences and notifications", () => {
+  it("persists a theme change and applies the light class", async () => {
+    render(<App />);
+    await waitFor(() => expect(apiMock.settings).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Light" }));
+
+    await waitFor(() =>
+      expect(apiMock.patchSettings).toHaveBeenCalledWith({ theme: "light" }),
+    );
+    expect(document.documentElement.classList.contains("light")).toBe(true);
+  });
+
+  it("persists the default device from the header", async () => {
+    render(<App />);
+    await waitFor(() => expect(apiMock.devices).toHaveBeenCalled());
+
+    const select = await screen.findByRole("combobox", { name: "Default device" });
+    fireEvent.change(select, { target: { value: "cpu" } });
+
+    await waitFor(() =>
+      expect(apiMock.patchSettings).toHaveBeenCalledWith({ default_device: "cpu" }),
+    );
+  });
+
+  it("announces a job finishing in the background", async () => {
+    vi.useFakeTimers();
+    apiMock.jobs.mockResolvedValueOnce({
+      jobs: [makeJob({ id: "job-9", state: "PROCESSING", title: "Dub video" })],
+      total: 1,
+      page: 1,
+      page_size: 50,
+    });
+    render(<App />);
+    await act(async () => undefined);
+
+    apiMock.jobs.mockResolvedValue({
+      jobs: [makeJob({ id: "job-9", state: "COMPLETED", title: "Dub video" })],
+      total: 1,
+      page: 1,
+      page_size: 50,
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(2500);
+    });
+
+    expect(screen.getByText("Dub video finished.")).toBeInTheDocument();
+  });
+
+  it("slows the completion watcher down when nothing is running", async () => {
+    vi.useFakeTimers();
+    apiMock.jobs.mockResolvedValue({
+      jobs: [makeJob({ id: "job-1", state: "COMPLETED", title: "Dub video" })],
+      total: 1,
+      page: 1,
+      page_size: 50,
+    });
+    render(<App />);
+    await act(async () => undefined);
+    expect(apiMock.jobs).toHaveBeenCalledTimes(1);
+
+    // No active job, so the fast tick must not fire.
+    await act(async () => {
+      vi.advanceTimersByTime(2500);
+    });
+    expect(apiMock.jobs).toHaveBeenCalledTimes(1);
+
+    // The idle tick still refreshes the view of finished jobs.
+    await act(async () => {
+      vi.advanceTimersByTime(12500);
+    });
+    expect(apiMock.jobs).toHaveBeenCalledTimes(2);
+  });
+
+  it("pauses the completion watcher while the tab is hidden", async () => {
+    vi.useFakeTimers();
+    apiMock.jobs.mockResolvedValue({ jobs: [], total: 0, page: 1, page_size: 50 });
+    render(<App />);
+    await act(async () => undefined);
+    expect(apiMock.jobs).toHaveBeenCalledTimes(1);
+
+    setDocumentHidden(true);
+    await act(async () => {
+      vi.advanceTimersByTime(15000);
+    });
+    expect(apiMock.jobs).toHaveBeenCalledTimes(1);
+
+    setDocumentHidden(false);
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(apiMock.jobs).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,6 +1,6 @@
 import React from "react";
 import { api } from "../api";
-import type { VoiceInfo } from "../types";
+import type { Job, VoiceInfo } from "../types";
 import {
   Button,
   Card,
@@ -17,6 +17,8 @@ import {
   num,
 } from "../ui";
 import { UploadField } from "../components/UploadField";
+import { PresetPanel } from "../components/PresetPanel";
+import { RecentInputs } from "../components/RecentInputs";
 
 const LANGUAGES = [
   "French",
@@ -39,7 +41,21 @@ function perLine(value: string): string[] | undefined {
   return lines.length ? lines : undefined;
 }
 
-export function SayPage({ onJobStarted }: { onJobStarted: (id: string) => void }) {
+function asText(value: unknown, fallback = ""): string {
+  return value === undefined || value === null ? fallback : String(value);
+}
+
+function joined(value: unknown, separator: string): string {
+  return Array.isArray(value) ? value.map(String).join(separator) : "";
+}
+
+export function SayPage({
+  onJobStarted,
+  initialJob,
+}: {
+  onJobStarted: (id: string) => void;
+  initialJob?: Job | null;
+}) {
   const [text, setText] = React.useState("");
   const [backend, setBackend] = React.useState("qwen");
   const [source, setSource] = React.useState<"voice" | "design" | "clone" | "speaker">("voice");
@@ -74,7 +90,7 @@ export function SayPage({ onJobStarted }: { onJobStarted: (id: string) => void }
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    api.voices().then((data) => setVoices(data.voices)).catch(() => undefined);
+    api.voices({ pageSize: 200 }).then((data) => setVoices(data.voices)).catch(() => undefined);
     api
       .settings()
       .then((data) => {
@@ -84,47 +100,111 @@ export function SayPage({ onJobStarted }: { onJobStarted: (id: string) => void }
       .catch(() => undefined);
   }, []);
 
+  const applySpec = React.useCallback((spec: Record<string, unknown>) => {
+    setText(asText(spec.text));
+    setBackend(asText(spec.backend, "qwen"));
+    setLanguage(asText(spec.language, "French"));
+    setSaveAs(asText(spec.save_as));
+    setDevice(asText(spec.device, "auto"));
+    setDtype(asText(spec.dtype, "auto"));
+    setForce(Boolean(spec.force));
+    setProvenance(spec.provenance === undefined ? true : Boolean(spec.provenance));
+    setProsody(joined(spec.prosody, "\n"));
+    setEmotions(joined(spec.emotions, ", "));
+    setProsodyPlan(asText(spec.prosody_plan, "off"));
+    setStyleInstructs(joined(spec.style_instructs, "\n"));
+    setStylePlan(asText(spec.style_plan, "off"));
+    setStylePlanScope(asText(spec.style_plan_scope, "per-line"));
+    setPlanChunk(asText(spec.plan_chunk));
+    setChatterboxExaggeration(asText(spec.chatterbox_exaggeration));
+    setChatterboxCfg(asText(spec.chatterbox_cfg_weight));
+    setChatterboxTemp(asText(spec.chatterbox_temperature));
+    setFishTemp(asText(spec.fish_temperature));
+    setFishTopP(asText(spec.fish_top_p));
+    setFishQuantize(asText(spec.fish_quantize, "int8"));
+    setFishTagMode(asText(spec.fish_tag_mode, "keep"));
+
+    if (spec.speaker) {
+      setSource("speaker");
+      setSpeaker(asText(spec.speaker));
+    } else if (spec.design) {
+      setSource("design");
+      setDesign(asText(spec.design));
+    } else if (spec.clone) {
+      setSource("clone");
+      setClone(asText(spec.clone));
+      setCloneName(asText(spec.clone).split(/[\\/]/).pop() ?? "");
+      setCloneText(asText(spec.clone_text));
+    } else {
+      setSource("voice");
+      setVoice(asText(spec.voice));
+    }
+  }, []);
+
+  // Prefill from a past job so "Edit" opens the same options, not a blank form.
+  React.useEffect(() => {
+    if (!initialJob) return;
+    applySpec((initialJob.params?.spec ?? {}) as Record<string, unknown>);
+  }, [initialJob, applySpec]);
+
   React.useEffect(() => {
     if (backend === "customvoice") setSource("speaker");
     else if (source === "speaker") setSource("voice");
   }, [backend]);
 
+  function buildSpec(): Record<string, unknown> {
+    const spec: Record<string, unknown> = {
+      text,
+      backend,
+      language: language || undefined,
+      save_as: saveAs || undefined,
+      device,
+      dtype,
+      force,
+      provenance,
+      prosody: perLine(prosody),
+      emotions: list(emotions),
+      prosody_plan: prosodyPlan,
+      style_instructs: perLine(styleInstructs),
+      style_plan: stylePlan,
+      style_plan_scope: stylePlanScope,
+      plan_chunk: num(planChunk),
+      chatterbox_exaggeration: num(chatterboxExaggeration),
+      chatterbox_cfg_weight: num(chatterboxCfg),
+      chatterbox_temperature: num(chatterboxTemp),
+      fish_temperature: num(fishTemp),
+      fish_top_p: num(fishTopP),
+      fish_quantize: backend === "fish" ? fishQuantize : undefined,
+      fish_tag_mode: fishTagMode,
+    };
+    if (source === "voice") spec.voice = voice || undefined;
+    if (source === "design") spec.design = design || undefined;
+    if (source === "clone") {
+      spec.clone = clone || undefined;
+      spec.clone_text = cloneText || undefined;
+    }
+    if (source === "speaker") spec.speaker = speaker || undefined;
+    return spec;
+  }
+
+  function buildPresetPayload(): Record<string, unknown> {
+    const spec = { ...buildSpec() };
+    // The spoken text and the donated clip are content, not reusable options.
+    delete spec.text;
+    delete spec.clone;
+    return spec;
+  }
+
+  function applyPreset(payload: Record<string, unknown>) {
+    // Keep whatever the user has typed; a preset only changes the options.
+    applySpec({ ...payload, text });
+  }
+
   async function submit() {
     setBusy(true);
     setError(null);
     try {
-      const spec: Record<string, unknown> = {
-        text,
-        backend,
-        language: language || undefined,
-        save_as: saveAs || undefined,
-        device,
-        dtype,
-        force,
-        provenance,
-        prosody: perLine(prosody),
-        emotions: list(emotions),
-        prosody_plan: prosodyPlan,
-        style_instructs: perLine(styleInstructs),
-        style_plan: stylePlan,
-        style_plan_scope: stylePlanScope,
-        plan_chunk: num(planChunk),
-        chatterbox_exaggeration: num(chatterboxExaggeration),
-        chatterbox_cfg_weight: num(chatterboxCfg),
-        chatterbox_temperature: num(chatterboxTemp),
-        fish_temperature: num(fishTemp),
-        fish_top_p: num(fishTopP),
-        fish_quantize: backend === "fish" ? fishQuantize : undefined,
-        fish_tag_mode: fishTagMode,
-      };
-      if (source === "voice") spec.voice = voice || undefined;
-      if (source === "design") spec.design = design || undefined;
-      if (source === "clone") {
-        spec.clone = clone || undefined;
-        spec.clone_text = cloneText || undefined;
-      }
-      if (source === "speaker") spec.speaker = speaker || undefined;
-      const job = await api.submitSay(spec);
+      const job = await api.submitSay(buildSpec());
       onJobStarted(job.job_id);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Could not start the job");
@@ -146,6 +226,10 @@ export function SayPage({ onJobStarted }: { onJobStarted: (id: string) => void }
             placeholder={"Bonsoir.\nVoici une seconde ligne, plus calme."}
           />
         </Field>
+
+        <Disclosure title="Presets" hint="Save and reuse these options">
+          <PresetPanel kind="say" buildPayload={buildPresetPayload} onApply={applyPreset} />
+        </Disclosure>
 
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Backend">
@@ -221,6 +305,15 @@ export function SayPage({ onJobStarted }: { onJobStarted: (id: string) => void }
                   <Input value={cloneText} onChange={(event) => setCloneText(event.target.value)} />
                 </Field>
               </div>
+            ) : null}
+            {source === "clone" ? (
+              <RecentInputs
+                onPick={(path, name) => {
+                  setClone(path);
+                  setCloneName(name);
+                }}
+                current={clone ? { path: clone, name: cloneName || clone } : null}
+              />
             ) : null}
           </div>
         ) : (

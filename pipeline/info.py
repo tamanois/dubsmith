@@ -28,6 +28,7 @@ __all__ = [
     "SYSTEM_BINARIES",
     "device_report",
     "environment_report",
+    "usage_report",
     "torch_version",
 ]
 
@@ -185,3 +186,47 @@ def device_report(
     return environment_report(
         models_dir, device=device, dtype=dtype, devices=devices
     )
+
+
+def _tree_bytes(root: Path) -> int:
+    """Bytes under ``root``; ``0`` when it does not exist or cannot be walked."""
+    try:
+        if not root.is_dir():
+            return 0
+        return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    except OSError:
+        return 0
+
+
+def usage_report(
+    *,
+    models_dir: Path | str = "models",
+    voices_dir: Path | str = "voices",
+    output_root: Path | str = "output",
+    uploads_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """How much disk the local data occupies, for the UI's storage indicator.
+
+    Every root is measured the same way and reported as absolute bytes, so the
+    frontend only needs one formatter. The filesystem's free/total space is read
+    from the models directory's device (the disk the weights land on), which is
+    almost always the same device the jobs write to.
+    """
+    roots = {
+        "models_dir": Path(models_dir),
+        "voices_dir": Path(voices_dir),
+        "output": Path(output_root),
+        "uploads": Path(uploads_dir) if uploads_dir else Path("uploads"),
+    }
+    sizes = {key: _tree_bytes(root) for key, root in roots.items()}
+    try:
+        disk = shutil.disk_usage(str(Path(models_dir)))
+        disk_free, disk_total = disk.free, disk.total
+    except OSError:
+        disk_free = disk_total = 0
+    return {
+        "sizes": sizes,
+        "total": sum(sizes.values()),
+        "disk_free": disk_free,
+        "disk_total": disk_total,
+    }

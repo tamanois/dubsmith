@@ -5,6 +5,7 @@ import { makeJob, makeJobEvent } from "./factories";
 
 const job = vi.fn();
 const cancelJob = vi.fn();
+const retryJob = vi.fn();
 const subscribeJob = vi.fn();
 const unsubscribe = vi.fn();
 let onEvent: ((event: ReturnType<typeof makeJobEvent>) => void) | undefined;
@@ -15,6 +16,10 @@ vi.mock("../src/api", () => ({
   api: {
     job: (...args: unknown[]) => job(...args),
     cancelJob: (...args: unknown[]) => cancelJob(...args),
+    retryJob: (...args: unknown[]) => retryJob(...args),
+    jobInputUrl: (id: string) => `/api/jobs/${id}/input`,
+    outputUrl: (path: string) =>
+      `/api/outputs/download?path=${encodeURIComponent(path)}`,
   },
   subscribeJob: (...args: unknown[]) => subscribeJob(...args),
 }));
@@ -28,6 +33,7 @@ function renderPanel(overrides: Partial<Parameters<typeof JobPanel>[0]> = {}) {
 beforeEach(() => {
   job.mockReset();
   cancelJob.mockReset();
+  retryJob.mockReset();
   subscribeJob.mockReset();
   unsubscribe.mockReset();
   onEvent = undefined;
@@ -161,6 +167,21 @@ describe("JobPanel cancellation and completion", () => {
     expect(await screen.findByText("cannot cancel")).toBeInTheDocument();
   });
 
+  it("keeps cancel working after the live stream drops", async () => {
+    job.mockResolvedValue(makeJob({ state: "PROCESSING" }));
+    cancelJob.mockResolvedValue(makeJob({ state: "CANCELLED" }));
+    renderPanel();
+    await screen.findByText("Working…");
+
+    act(() => onError?.("connection dropped"));
+    expect(await screen.findByText("connection dropped")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText("Cancelled.")).toBeInTheDocument();
+    expect(screen.queryByText("Working…")).not.toBeInTheDocument();
+  });
+
   it("updates when the terminal job event arrives", async () => {
     job.mockResolvedValue(makeJob({ state: "PROCESSING" }));
     renderPanel();
@@ -201,5 +222,94 @@ describe("JobPanel results and lifecycle", () => {
 
     unmount();
     expect(unsubscribe).toHaveBeenCalled();
+  });
+});
+
+describe("JobPanel actions and labels", () => {
+  it("shows a human title and the input and output labels", async () => {
+    job.mockResolvedValue(
+      makeJob({
+        state: "COMPLETED",
+        kind: "say",
+        title: "Generate speech",
+        input_label: "Bonjour le monde",
+        output_label: "out.wav",
+      }),
+    );
+    renderPanel();
+
+    expect(await screen.findByText("Generate speech")).toBeInTheDocument();
+    expect(screen.getByText(/Bonjour le monde/)).toBeInTheDocument();
+    expect(screen.getByText(/→ out\.wav/)).toBeInTheDocument();
+  });
+
+  it("expands and shrinks the panel", async () => {
+    job.mockResolvedValue(makeJob({ state: "COMPLETED" }));
+    renderPanel();
+
+    const expand = await screen.findByRole("button", { name: "Expand job panel" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(expand);
+
+    const shrink = screen.getByRole("button", { name: "Shrink job panel" });
+    expect(shrink).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("retries a finished job and hands the new id to the app", async () => {
+    job.mockResolvedValue(makeJob({ state: "FAILED", error: "boom" }));
+    retryJob.mockResolvedValue({ job_id: "job-2", state: "QUEUED" });
+    const onJobStarted = vi.fn();
+    renderPanel({ onJobStarted });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(retryJob).toHaveBeenCalledWith("job-1"));
+    await waitFor(() => expect(onJobStarted).toHaveBeenCalledWith("job-2"));
+  });
+
+  it("shows a retry failure", async () => {
+    job.mockResolvedValue(makeJob({ state: "FAILED", error: "boom" }));
+    retryJob.mockRejectedValue(new Error("cannot retry"));
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("cannot retry")).toBeInTheDocument();
+  });
+
+  it("offers edit only when the app can receive the job", async () => {
+    job.mockResolvedValue(makeJob({ state: "FAILED", kind: "dub", error: "boom" }));
+    const onEdit = vi.fn();
+    renderPanel({ onEdit });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    expect(onEdit).toHaveBeenCalledWith("dub", expect.objectContaining({ id: "job-1" }));
+  });
+
+  it("does not offer actions while the job is still running", async () => {
+    job.mockResolvedValue(makeJob({ state: "PROCESSING" }));
+    const onEdit = vi.fn();
+    renderPanel({ onEdit });
+    await screen.findByText("Working…");
+
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+  });
+
+  it("opens the compare view for a completed dub", async () => {
+    job.mockResolvedValue(
+      makeJob({
+        state: "COMPLETED",
+        input_label: "talk.mp4",
+        result: { dubbed_video: "/output/run/video_dubbed.mp4" },
+      }),
+    );
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Compare" }));
+    expect(
+      screen.getByRole("dialog", { name: "Compare original and dub" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Play talk.mp4")).toBeInTheDocument();
+    expect(screen.getByLabelText("Play video_dubbed.mp4")).toBeInTheDocument();
   });
 });

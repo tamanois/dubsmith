@@ -1,5 +1,9 @@
 import React from "react";
+import { api } from "./api";
+import { DefaultsBar } from "./components/DefaultsBar";
 import { JobPanel } from "./components/JobPanel";
+import { Onboarding } from "./components/Onboarding";
+import { ThemeToggle } from "./components/ThemeToggle";
 import { DubPage } from "./pages/DubPage";
 import { DevicesPage } from "./pages/DevicesPage";
 import { FilesPage } from "./pages/FilesPage";
@@ -8,6 +12,7 @@ import { ModelsPage } from "./pages/ModelsPage";
 import { SayPage } from "./pages/SayPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { VoicesPage } from "./pages/VoicesPage";
+import type { Device, Job, SettingsInfo } from "./types";
 import { cn } from "./ui";
 
 type Page =
@@ -31,10 +36,33 @@ const NAV: { id: Page; label: string; glyph: string; hint: string }[] = [
   { id: "settings", label: "Settings", glyph: "⚙", hint: "Defaults" },
 ];
 
+type Toast = { message: string; tone: "info" | "success" | "error" };
+
+function resolveTheme(theme: string): "light" | "dark" {
+  if (theme === "light" || theme === "dark") return theme;
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia("(prefers-color-scheme: light)").matches
+      ? "light"
+      : "dark";
+  }
+  return "dark";
+}
+
+// The completion watcher runs fast only while something is running; a fully
+// idle app (or a background tab) must not keep querying the API.
+const ACTIVE_POLL_MS = 2500;
+const IDLE_POLL_MS = 15000;
+
 export default function App() {
   const [page, setPage] = React.useState<Page>("activity");
   const [activeJobId, setActiveJobId] = React.useState<string | null>(null);
-  const [toast, setToast] = React.useState<string | null>(null);
+  const [toast, setToast] = React.useState<Toast | null>(null);
+  const [settings, setSettings] = React.useState<SettingsInfo | null>(null);
+  const [devices, setDevices] = React.useState<Device[]>([]);
+  const [theme, setTheme] = React.useState<string>("system");
+  const [editJob, setEditJob] = React.useState<Job | null>(null);
+  // Previous state per job, so a completion is announced exactly once.
+  const seen = React.useRef<Map<string, string>>(new Map());
 
   React.useEffect(() => {
     if (!toast) return;
@@ -42,10 +70,133 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  React.useEffect(() => {
+    api
+      .settings()
+      .then((data) => {
+        setSettings(data);
+        setTheme(data.theme || "system");
+      })
+      .catch(() => undefined);
+    api
+      .devices()
+      .then((data) => setDevices(data.devices ?? []))
+      .catch(() => undefined);
+  }, []);
+
+  // Apply the theme to <html>; "system" follows the OS preference live.
+  React.useEffect(() => {
+    const root = document.documentElement;
+    const apply = () => root.classList.toggle("light", resolveTheme(theme) === "light");
+    apply();
+    if (theme !== "system" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    media.addEventListener?.("change", apply);
+    return () => media.removeEventListener?.("change", apply);
+  }, [theme]);
+
+  // Announce background jobs finishing, wherever the user is in the app.
+  React.useEffect(() => {
+    let alive = true;
+    let inFlight = false;
+    let timer: number | undefined;
+
+    const schedule = (delay: number) => {
+      if (!alive) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void check(), delay);
+    };
+
+    const check = async () => {
+      if (!alive || inFlight) return;
+      if (document.hidden) {
+        schedule(IDLE_POLL_MS);
+        return;
+      }
+      inFlight = true;
+      let active = false;
+      try {
+        const data = await api.jobs({ pageSize: 50 });
+        if (!alive) return;
+        for (const job of data.jobs) {
+          const before = seen.current.get(job.id);
+          const terminal =
+            job.state === "COMPLETED" ||
+            job.state === "FAILED" ||
+            job.state === "CANCELLED";
+          if (!terminal) active = true;
+          if (before && before !== job.state && terminal) {
+            const label = job.title ?? job.kind;
+            setToast(
+              job.state === "COMPLETED"
+                ? { message: `${label} finished.`, tone: "success" }
+                : { message: `${label} ${job.state.toLowerCase()}.`, tone: "error" },
+            );
+          }
+          seen.current.set(job.id, job.state);
+        }
+      } catch {
+        /* a polling failure must never break the UI */
+      } finally {
+        inFlight = false;
+      }
+      schedule(active ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+    };
+
+    // Returning to the tab refreshes immediately instead of waiting for the idle
+    // tick, so a job that finished in the background is announced right away.
+    const onVisible = () => {
+      if (!document.hidden) void check();
+    };
+
+    check();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  function updateSettings(patch: Record<string, unknown>) {
+    setSettings((current) => (current ? { ...current, ...patch } : current));
+    api
+      .patchSettings(patch)
+      .then((data) => setSettings(data))
+      .catch((exc: unknown) =>
+        setToast({
+          message: exc instanceof Error ? exc.message : "Could not save the default",
+          tone: "error",
+        }),
+      );
+  }
+
+  function changeTheme(next: string) {
+    setTheme(next);
+    updateSettings({ theme: next });
+  }
+
   function startJob(id: string) {
+    setEditJob(null);
     setActiveJobId(id);
     setPage("activity");
-    setToast("Job accepted. Live progress is shown in the activity panel.");
+    setToast({
+      message: "Job accepted. Live progress is shown in the activity panel.",
+      tone: "info",
+    });
+  }
+
+  function editJobFrom(kind: string, job: Job) {
+    setEditJob(job);
+    setActiveJobId(null);
+    setPage(
+      kind === "dub" || kind === "subtitles"
+        ? "dub"
+        : kind === "say"
+          ? "say"
+          : "voices",
+    );
+    setToast({ message: "Loaded the job's options for editing.", tone: "info" });
   }
 
   const current = NAV.find((item) => item.id === page);
@@ -62,7 +213,10 @@ export default function App() {
             <button
               key={item.id}
               type="button"
-              onClick={() => setPage(item.id)}
+              onClick={() => {
+                setPage(item.id);
+                setEditJob(null);
+              }}
               className={cn(
                 "flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm transition",
                 page === item.id
@@ -99,8 +253,12 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2 lg:hidden">
                 <select
+                  aria-label="Page"
                   value={page}
-                  onChange={(event) => setPage(event.target.value as Page)}
+                  onChange={(event) => {
+                    setPage(event.target.value as Page);
+                    setEditJob(null);
+                  }}
                   className="rounded-lg border border-white/10 bg-ink-800 px-2 py-1 text-sm text-slate-200"
                 >
                   {NAV.map((item) => (
@@ -115,7 +273,14 @@ export default function App() {
               </h1>
               <p className="mt-0.5 text-xs text-slate-500">{current?.hint}</p>
             </div>
-            <div className="flex items-center gap-2 text-xs text-slate-500">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <DefaultsBar
+                devices={devices}
+                device={settings?.default_device ?? "auto"}
+                dtype={settings?.default_dtype ?? "auto"}
+                onChange={updateSettings}
+              />
+              <ThemeToggle theme={theme} onChange={changeTheme} />
               <span className="hidden rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1 text-emerald-300 sm:inline">
                 local
               </span>
@@ -137,8 +302,12 @@ export default function App() {
             {page === "activity" ? (
               <JobsPage onOpenJob={setActiveJobId} activeJobId={activeJobId} />
             ) : null}
-            {page === "dub" ? <DubPage onJobStarted={startJob} /> : null}
-            {page === "say" ? <SayPage onJobStarted={startJob} /> : null}
+            {page === "dub" ? (
+              <DubPage onJobStarted={startJob} initialJob={editJob} />
+            ) : null}
+            {page === "say" ? (
+              <SayPage onJobStarted={startJob} initialJob={editJob} />
+            ) : null}
             {page === "voices" ? <VoicesPage onJobStarted={startJob} /> : null}
             {page === "models" ? <ModelsPage onJobStarted={startJob} /> : null}
             {page === "devices" ? <DevicesPage /> : null}
@@ -149,14 +318,30 @@ export default function App() {
       </div>
 
       {activeJobId ? (
-        <JobPanel jobId={activeJobId} onClose={() => setActiveJobId(null)} />
+        <JobPanel
+          jobId={activeJobId}
+          onClose={() => setActiveJobId(null)}
+          onJobStarted={startJob}
+          onEdit={editJobFrom}
+        />
       ) : null}
 
       {toast ? (
-        <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-full border border-accent-500/30 bg-ink-850 px-4 py-2 text-sm text-slate-200 shadow-glow">
-          {toast}
+        <div
+          className={cn(
+            "fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-full border px-4 py-2 text-sm shadow-glow",
+            toast.tone === "success"
+              ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+              : toast.tone === "error"
+                ? "border-rose-400/30 bg-rose-400/10 text-rose-200"
+                : "border-accent-500/30 bg-ink-850 text-slate-200",
+          )}
+        >
+          {toast.message}
         </div>
       ) : null}
+
+      <Onboarding />
     </div>
   );
 }

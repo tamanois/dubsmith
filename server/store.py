@@ -8,6 +8,7 @@ the whole data model.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -22,6 +23,19 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "COMPLETED": set(),
     "FAILED": set(),
     "CANCELLED": set(),
+}
+
+#: Human-readable description for each job kind, so the activity list never shows
+#: a raw operation name.
+_KIND_TITLES: dict[str, str] = {
+    "dub": "Dub video",
+    "subtitles": "Generate subtitles",
+    "say": "Generate speech",
+    "voice_design": "Design voice",
+    "voice_clone": "Clone voice",
+    "voice_add": "Register voice",
+    "model_download": "Download models",
+    "anchor_generate": "Generate anchors",
 }
 
 _SCHEMA = """
@@ -66,7 +80,62 @@ CREATE TABLE IF NOT EXISTS files (
     created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_files_created ON files(created DESC);
+CREATE TABLE IF NOT EXISTS presets (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_presets_kind ON presets(kind, created DESC);
+CREATE TABLE IF NOT EXISTS favorites (
+    path TEXT PRIMARY KEY,
+    label TEXT,
+    kind TEXT NOT NULL,
+    created REAL NOT NULL
+);
 """
+
+
+def _clip(value: str, limit: int = 60) -> str:
+    text = str(value).strip().replace("\n", " ")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _input_label(row: dict[str, Any]) -> str | None:
+    """What the job operated on: a file name, a spoken line, or a description."""
+    path = row.get("input_path")
+    if path:
+        name = Path(path).name
+        # Uploads are stored as "<uuid>__<original>"; show the original name.
+        return re.sub(r"^[0-9a-f]{32}__", "", name)
+    params = row.get("params") or {}
+    if not isinstance(params, dict):
+        return None
+    spec = params.get("spec")
+    if isinstance(spec, dict) and spec.get("text"):
+        return _clip(str(spec["text"]))
+    nested = params.get("params")
+    if isinstance(nested, dict):
+        for key in ("audio", "prompt", "label"):
+            value = nested.get(key)
+            if value:
+                return Path(str(value)).name if key == "audio" else _clip(str(value))
+    return None
+
+
+def _output_label(result: Any) -> str | None:
+    """The primary artifact a completed job produced, as a file name."""
+    if not isinstance(result, dict):
+        return None
+    for key in ("dubbed_video", "output_video", "dub_track", "target_srt", "output"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            name = Path(value).name
+            if name:
+                return name
+    return None
+
 
 class Store:
     """Thread-safe SQLite access shared by request handlers and the job worker."""
@@ -157,12 +226,62 @@ class Store:
             ).fetchone()
         return self._job_row(row) if row else None
 
-    def list_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_jobs(
+        self,
+        limit: int = 50,
+        *,
+        offset: int = 0,
+        state: str | None = None,
+        q: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        if q:
+            clauses.append("(input_path LIKE ? OR id LIKE ? OR kind LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM jobs ORDER BY created DESC LIMIT ?", (limit,)
+                f"SELECT * FROM jobs{where} ORDER BY created DESC LIMIT ? OFFSET ?",  # noqa: S608
+                (*params, limit, offset),
             ).fetchall()
         return [self._job_row(row) for row in rows]
+
+    def count_jobs(self, state: str | None = None, q: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        if q:
+            clauses.append("(input_path LIKE ? OR id LIKE ? OR kind LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM jobs{where}", params  # noqa: S608
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_jobs(self, job_ids: list[str]) -> int:
+        """Delete terminal jobs and their events; active jobs are left untouched."""
+        removed = 0
+        with self._lock:
+            for job_id in job_ids:
+                row = self._conn.execute(
+                    "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if row is None or row["state"] in ("QUEUED", "PROCESSING"):
+                    continue
+                self._conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
+                self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                removed += 1
+        return removed
 
     def count_active_jobs(self) -> int:
         with self._lock:
@@ -179,6 +298,9 @@ class Store:
                     payload[key] = json.loads(payload[key])
                 except (TypeError, json.JSONDecodeError):
                     pass
+        payload["title"] = _KIND_TITLES.get(str(payload.get("kind")), payload.get("kind"))
+        payload["input_label"] = _input_label(payload)
+        payload["output_label"] = _output_label(payload.get("result"))
         return payload
 
     # -- events ------------------------------------------------------------ #
@@ -294,12 +416,30 @@ class Store:
                 ),
             )
 
-    def list_files(self) -> list[dict[str, Any]]:
+    def list_files(self, limit: int = 100, *, offset: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM files ORDER BY created DESC"
+                "SELECT * FROM files ORDER BY created DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_files(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM files").fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_files(self, file_ids: list[str]) -> list[dict[str, Any]]:
+        """Remove file rows, returning them so the caller can unlink their bytes."""
+        removed: list[dict[str, Any]] = []
+        with self._lock:
+            for file_id in file_ids:
+                item = self.get_file(file_id)
+                if item is None:
+                    continue
+                self._conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                removed.append(item)
+        return removed
 
     def get_file(self, file_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -315,6 +455,85 @@ class Store:
         with self._lock:
             self._conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         return item
+
+    # -- presets ----------------------------------------------------------- #
+
+    def list_presets(self, kind: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if kind:
+                rows = self._conn.execute(
+                    "SELECT * FROM presets WHERE kind = ? ORDER BY created DESC",
+                    (kind,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM presets ORDER BY created DESC"
+                ).fetchall()
+        return [self._preset_row(row) for row in rows]
+
+    def get_preset(self, preset_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM presets WHERE id = ?", (preset_id,)
+            ).fetchone()
+        return self._preset_row(row) if row else None
+
+    def add_preset(
+        self, preset_id: str, kind: str, name: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO presets (id, kind, name, payload, created)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (preset_id, kind, name, json.dumps(payload, default=str), time.time()),
+            )
+        row = self.get_preset(preset_id)
+        assert row is not None
+        return row
+
+    def delete_preset(self, preset_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM presets WHERE id = ?", (preset_id,)
+            )
+        return cursor.rowcount > 0
+
+    def _preset_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        try:
+            payload["payload"] = json.loads(payload["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload["payload"] = {}
+        return payload
+
+    # -- favorites --------------------------------------------------------- #
+
+    def list_favorites(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM favorites ORDER BY created DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_favorite(self, path: str, label: str | None, kind: str) -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO favorites (path, label, kind, created) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(path) DO UPDATE SET label = excluded.label,"
+                " kind = excluded.kind",
+                (path, label, kind, time.time()),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM favorites WHERE path = ?", (path,)
+            ).fetchone()
+        return dict(row) if row else {"path": path, "label": label, "kind": kind}
+
+    def delete_favorite(self, path: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM favorites WHERE path = ?", (path,)
+            )
+        return cursor.rowcount > 0
 
     def close(self) -> None:
         with self._lock:

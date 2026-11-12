@@ -1,6 +1,6 @@
 import React from "react";
 import { api } from "../api";
-import type { Device, VoiceInfo } from "../types";
+import type { Device, Job, VoiceInfo } from "../types";
 import {
   Badge,
   Button,
@@ -16,6 +16,8 @@ import {
   num,
 } from "../ui";
 import { UploadField } from "../components/UploadField";
+import { PresetPanel } from "../components/PresetPanel";
+import { RecentInputs } from "../components/RecentInputs";
 
 const LANGUAGES = [
   "French",
@@ -32,7 +34,21 @@ const LANGUAGES = [
 
 const VIDEO_EXT = [".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"];
 
-export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }) {
+function text(value: unknown, fallback = ""): string {
+  return value === undefined || value === null ? fallback : String(value);
+}
+
+function flag(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+export function DubPage({
+  onJobStarted,
+  initialJob,
+}: {
+  onJobStarted: (id: string) => void;
+  initialJob?: Job | null;
+}) {
   const [mode, setMode] = React.useState<"dub" | "subtitles">("dub");
   const [inputPath, setInputPath] = React.useState("");
   const [inputName, setInputName] = React.useState("");
@@ -101,7 +117,7 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    api.voices().then((data) => setSavedVoices(data.voices)).catch(() => undefined);
+    api.voices({ pageSize: 200 }).then((data) => setSavedVoices(data.voices)).catch(() => undefined);
     api.devices().then((data) => setAvailableDevices(data.devices)).catch(() => undefined);
     api
       .settings()
@@ -112,6 +128,81 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
       .catch(() => undefined);
   }, []);
 
+  const applyConfig = React.useCallback((config: Record<string, unknown>) => {
+    const input = config.video ?? config.audio;
+    if (typeof input === "string") {
+      setInputPath(input);
+      setInputName(input.split(/[\\/]/).pop() ?? input);
+    }
+    setTarget(text(config.target_language, "French"));
+    setSource(text(config.source_language));
+    setDevice(text(config.device, "auto"));
+    setDtype(text(config.dtype, "auto"));
+    setDevices(
+      Array.isArray(config.devices) ? (config.devices as string[]).join(",") : "",
+    );
+    setWhisperModel(text(config.whisper_model, "large-v3"));
+    setLlmModel(text(config.llm_model));
+    setTtsBatch(text(config.tts_batch, "8"));
+    setBackend(text(config.tts_backend, "qwen"));
+    setProsodyPlan(text(config.prosody_plan, "auto"));
+    setChatterboxExaggeration(text(config.chatterbox_exaggeration));
+    setChatterboxCfg(text(config.chatterbox_cfg_weight));
+    setChatterboxTemp(text(config.chatterbox_temperature));
+    setFishTemp(text(config.fish_temperature));
+    setFishTopP(text(config.fish_top_p));
+    setFishQuantize(text(config.fish_quantize, "int8"));
+    setMinStretch(text(config.min_stretch, "0.75"));
+    setMaxStretch(text(config.max_stretch, "1.18"));
+    setMaxOverrun(text(config.max_overrun, "0.25"));
+    setLoudness(text(config.loudness_target, "match-source"));
+    setLufs(text(config.target_lufs, "-16"));
+    setKeepBackground(flag(config.keep_background, true));
+    setSeparator(text(config.separator, "auto"));
+    setDuckDb(text(config.duck_db, "6"));
+    setBackgroundGain(text(config.background_gain_db, "0"));
+    setRoom(text(config.room, "off"));
+    setRoomRt60(text(config.room_rt60));
+    setRoomWetDb(text(config.room_wet_db, "0"));
+    setRoomDuckDb(text(config.room_duck_db, "3"));
+    setRoomToneDb(text(config.room_tone_gain_db, "-30"));
+    setAccentMode(text(config.accent_mode, "native"));
+    setAccentMatch(text(config.accent_match, "off"));
+    setAccentBlend(text(config.accent_blend));
+    setBlendTakes(text(config.blend_takes));
+    setBlendIters(text(config.blend_iters));
+    setBlendRatio(text(config.blend_ratio));
+    setAccentAudio(text(config.accent_audio));
+    setAccentText(text(config.accent_text));
+    setExpressiveAccent(text(config.expressive_accent, "donor"));
+    setDiarizer(text(config.diarizer, "auto"));
+    setSpeakerThreshold(text(config.speaker_threshold));
+    setMinSpeakerSeconds(text(config.min_speaker_seconds, "20"));
+    setOverlap(text(config.overlap_mode, "dominant"));
+    setOverlapSeparator(text(config.overlap_separator, "auto"));
+    setRefine(flag(config.refine, true));
+    setRefineMaxPasses(text(config.refine_max_passes, "1"));
+    setRefineThreshold(text(config.refine_threshold, "0.05"));
+    setLengthBudget(text(config.length_budget, "words"));
+    setBudgetSpeedup(text(config.budget_speedup, "0.85"));
+    setNoSpeechThreshold(text(config.no_speech_threshold, "0.6"));
+    setKeepSubtitles(flag(config.keep_subtitles, true));
+    setSubtitlesMode(text(config.subtitles_mode, "soft"));
+    setMaxChars(text(config.max_chars, "42"));
+    setForce(flag(config.force, false));
+    setProvenance(flag(config.provenance, true));
+    setRefAudio(text(config.ref_audio));
+    setRefText(text(config.ref_text));
+  }, []);
+
+  // Load a past job's options for editing. Every field the form submits is read
+  // back from the stored config, so Edit is a true prefill rather than a guess.
+  React.useEffect(() => {
+    if (!initialJob) return;
+    setMode(initialJob.kind === "subtitles" ? "subtitles" : "dub");
+    applyConfig((initialJob.params?.config ?? {}) as Record<string, unknown>);
+  }, [initialJob, applyConfig]);
+
   function chooseInput(path: string, name: string) {
     setInputPath(path);
     setInputName(name);
@@ -119,6 +210,113 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
 
   function isVideo(name: string): boolean {
     return VIDEO_EXT.some((ext) => name.toLowerCase().endsWith(ext));
+  }
+
+  function buildDubConfig(): Record<string, unknown> {
+    const config: Record<string, unknown> = {
+      target_language: target,
+      source_language: source || undefined,
+      output_dir: "output",
+      device,
+      devices: devices
+        ? devices.split(",").map((item) => item.trim()).filter(Boolean)
+        : undefined,
+      dtype,
+      whisper_model: whisperModel,
+      llm_model: llmModel || undefined,
+      tts_batch: num(ttsBatch),
+      tts_backend: backend,
+      prosody_plan: prosodyPlan,
+      chatterbox_exaggeration: num(chatterboxExaggeration),
+      chatterbox_cfg_weight: num(chatterboxCfg),
+      chatterbox_temperature: num(chatterboxTemp),
+      fish_temperature: num(fishTemp),
+      fish_top_p: num(fishTopP),
+      fish_quantize: backend === "fish" ? fishQuantize : undefined,
+      min_stretch: num(minStretch),
+      max_stretch: num(maxStretch),
+      max_overrun: num(maxOverrun),
+      loudness_target: loudness,
+      target_lufs: loudness === "lufs" ? num(lufs) : undefined,
+      keep_background: keepBackground,
+      separator,
+      duck_db: num(duckDb),
+      background_gain_db: num(backgroundGain),
+      room: keepBackground ? room : "off",
+      room_rt60: room === "match" ? num(roomRt60) : undefined,
+      room_wet_db: room === "match" ? num(roomWetDb) : undefined,
+      room_duck_db: room === "match" ? num(roomDuckDb) : undefined,
+      room_tone_gain_db: room === "match" ? num(roomToneDb) : undefined,
+      accent_mode: accentMode,
+      accent_match: accentMode === "native" ? accentMatch : "off",
+      accent_blend:
+        accentMode === "native" || accentMode === "reference-accent"
+          ? accentBlend || undefined
+          : undefined,
+      blend_takes:
+        accentMode === "native" || accentMode === "reference-accent"
+          ? num(blendTakes)
+          : undefined,
+      blend_iters:
+        accentMode === "native" || accentMode === "reference-accent"
+          ? num(blendIters)
+          : undefined,
+      blend_ratio:
+        accentMode === "native" || accentMode === "reference-accent"
+          ? num(blendRatio)
+          : undefined,
+      accent_audio:
+        accentMode === "reference-accent" && !accentVoice
+          ? accentAudio || undefined
+          : undefined,
+      accent_text:
+        accentMode === "reference-accent" && !accentVoice
+          ? accentText || undefined
+          : undefined,
+      expressive_accent: backend === "qwen" ? "donor" : expressiveAccent,
+      diarizer,
+      speaker_threshold: num(speakerThreshold),
+      min_speaker_seconds: num(minSpeakerSeconds),
+      overlap_mode: overlap,
+      overlap_separator: overlapSeparator,
+      refine,
+      refine_max_passes: num(refineMaxPasses),
+      refine_threshold: num(refineThreshold),
+      length_budget: lengthBudget,
+      budget_speedup: num(budgetSpeedup),
+      no_speech_threshold: num(noSpeechThreshold),
+      keep_subtitles: keepSubtitles,
+      subtitles_mode: keepSubtitles ? subtitlesMode : "off",
+      force,
+      provenance,
+    };
+    if (isVideo(inputName)) config.video = inputPath;
+    else config.audio = inputPath;
+    if (refAudio && !voice) config.ref_audio = refAudio;
+    if (refText && !voice) config.ref_text = refText;
+    return config;
+  }
+
+  function buildPresetPayload(): Record<string, unknown> {
+    const config = { ...buildDubConfig() };
+    // A preset carries the options, not the input file it happened to use.
+    delete config.video;
+    delete config.audio;
+    return {
+      config,
+      voice: voice || undefined,
+      accent_voice: accentVoice || undefined,
+    };
+  }
+
+  function applyPreset(payload: Record<string, unknown>) {
+    setMode("dub");
+    const config = payload.config;
+    if (config && typeof config === "object") {
+      applyConfig(config as Record<string, unknown>);
+    }
+    setVoice(text(payload.voice));
+    setAccentVoice(text(payload.accent_voice));
   }
 
   async function submit() {
@@ -146,89 +344,12 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
         const job = await api.submitSubtitles(config);
         onJobStarted(job.job_id);
       } else {
-        const config: Record<string, unknown> = {
-          target_language: target,
-          source_language: source || undefined,
-          output_dir: "output",
-          device,
-          devices: devices
-            ? devices.split(",").map((item) => item.trim()).filter(Boolean)
-            : undefined,
-          dtype,
-          whisper_model: whisperModel,
-          llm_model: llmModel || undefined,
-          tts_batch: num(ttsBatch),
-          tts_backend: backend,
-          prosody_plan: prosodyPlan,
-          chatterbox_exaggeration: num(chatterboxExaggeration),
-          chatterbox_cfg_weight: num(chatterboxCfg),
-          chatterbox_temperature: num(chatterboxTemp),
-          fish_temperature: num(fishTemp),
-          fish_top_p: num(fishTopP),
-          fish_quantize: backend === "fish" ? fishQuantize : undefined,
-          min_stretch: num(minStretch),
-          max_stretch: num(maxStretch),
-          max_overrun: num(maxOverrun),
-          loudness_target: loudness,
-          target_lufs: loudness === "lufs" ? num(lufs) : undefined,
-          keep_background: keepBackground,
-          separator,
-          duck_db: num(duckDb),
-          background_gain_db: num(backgroundGain),
-          room: keepBackground ? room : "off",
-          room_rt60: room === "match" ? num(roomRt60) : undefined,
-          room_wet_db: room === "match" ? num(roomWetDb) : undefined,
-          room_duck_db: room === "match" ? num(roomDuckDb) : undefined,
-          room_tone_gain_db: room === "match" ? num(roomToneDb) : undefined,
-          accent_mode: accentMode,
-          accent_match: accentMode === "native" ? accentMatch : "off",
-          accent_blend:
-            accentMode === "native" || accentMode === "reference-accent"
-              ? accentBlend || undefined
-              : undefined,
-          blend_takes:
-            accentMode === "native" || accentMode === "reference-accent"
-              ? num(blendTakes)
-              : undefined,
-          blend_iters:
-            accentMode === "native" || accentMode === "reference-accent"
-              ? num(blendIters)
-              : undefined,
-          blend_ratio:
-            accentMode === "native" || accentMode === "reference-accent"
-              ? num(blendRatio)
-              : undefined,
-          accent_audio:
-            accentMode === "reference-accent" && !accentVoice
-              ? accentAudio || undefined
-              : undefined,
-          accent_text:
-            accentMode === "reference-accent" && !accentVoice
-              ? accentText || undefined
-              : undefined,
-          expressive_accent: backend === "qwen" ? "donor" : expressiveAccent,
-          diarizer,
-          speaker_threshold: num(speakerThreshold),
-          min_speaker_seconds: num(minSpeakerSeconds),
-          overlap_mode: overlap,
-          overlap_separator: overlapSeparator,
-          refine,
-          refine_max_passes: num(refineMaxPasses),
-          refine_threshold: num(refineThreshold),
-          length_budget: lengthBudget,
-          budget_speedup: num(budgetSpeedup),
-          no_speech_threshold: num(noSpeechThreshold),
-          keep_subtitles: keepSubtitles,
-          subtitles_mode: keepSubtitles ? subtitlesMode : "off",
-          force,
-          provenance,
-        };
-        if (isVideo(inputName)) config.video = inputPath;
-        else config.audio = inputPath;
-        if (refAudio && !voice) config.ref_audio = refAudio;
-        if (refText && !voice) config.ref_text = refText;
         const job = await api.submitDub(
-          { config, voice: voice || undefined, accent_voice: accentVoice || undefined },
+          {
+            config: buildDubConfig(),
+            voice: voice || undefined,
+            accent_voice: accentVoice || undefined,
+          },
           "auto",
         );
         onJobStarted(job.job_id);
@@ -298,6 +419,21 @@ export function DubPage({ onJobStarted }: { onJobStarted: (id: string) => void }
               </Field>
             </div>
           </div>
+
+          <RecentInputs
+            onPick={chooseInput}
+            current={inputPath ? { path: inputPath, name: inputName } : null}
+          />
+
+          {mode === "dub" ? (
+            <Disclosure title="Presets" hint="Save and reuse these options">
+              <PresetPanel
+                kind="dub"
+                buildPayload={buildPresetPayload}
+                onApply={applyPreset}
+              />
+            </Disclosure>
+          ) : null}
 
           {mode === "subtitles" ? (
             <div className="grid gap-4 md:grid-cols-3">

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.errors import ModelNotFoundError
+from pipeline.errors import ConfigError, ModelNotFoundError
 from pipeline.models import (
     MVP_REQUIRED,
     REGISTRY,
@@ -14,6 +14,7 @@ from pipeline.models import (
     download_model,
     is_available,
     registry_status,
+    remove_model,
     resolve_model,
 )
 
@@ -110,3 +111,40 @@ class TestDownload:
     def test_unknown_model_raises_before_network(self, tmp_path: Path) -> None:
         with pytest.raises(ModelNotFoundError, match="Unknown model"):
             download_model("nope", tmp_path)
+
+
+class TestRemoveModel:
+    def test_deletes_a_present_model_and_reports_freed_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        _populate(tmp_path, "tts_custom_voice")
+        (tmp_path / REGISTRY["tts_custom_voice"].dir_name / "model.safetensors").write_bytes(
+            b"x" * 16
+        )
+
+        result = remove_model("tts_custom_voice", tmp_path)
+
+        assert result["freed_bytes"] >= 16
+        assert not (tmp_path / REGISTRY["tts_custom_voice"].dir_name).exists()
+        assert result["warning"] is None
+
+    def test_warns_when_removing_a_required_model(self, tmp_path: Path) -> None:
+        _populate(tmp_path, "tts_base")
+        result = remove_model("tts_base", tmp_path)
+
+        assert result["warning"] is not None
+        assert "re-download" in result["warning"]
+        assert is_available("tts_base", tmp_path) is False
+
+    def test_missing_model_frees_nothing(self, tmp_path: Path) -> None:
+        result = remove_model("tts_fish", tmp_path)
+        assert result["freed_bytes"] == 0
+        assert result["warning"] is None
+
+    def test_package_backed_model_cannot_be_deleted(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="package-backed"):
+            remove_model("demucs", tmp_path)
+
+    def test_unknown_model_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ModelNotFoundError, match="Unknown model"):
+            remove_model("nope", tmp_path)

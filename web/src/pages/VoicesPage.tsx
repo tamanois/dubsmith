@@ -4,11 +4,14 @@ import type { VoiceInfo } from "../types";
 import {
   Button,
   Card,
+  ConfirmDialog,
   Disclosure,
   Empty,
   ErrorNote,
   Field,
   Input,
+  MediaPreview,
+  Pagination,
   Section,
   Select,
   Spinner,
@@ -28,10 +31,17 @@ const LANGUAGES = [
   "Russian",
 ];
 
+const PAGE_SIZE = 20;
+
 export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => void }) {
   const [voices, setVoices] = React.useState<VoiceInfo[]>([]);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [preview, setPreview] = React.useState<string | null>(null);
+  const [pending, setPending] = React.useState<VoiceInfo | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
 
   const [prompt, setPrompt] = React.useState("");
   const [language, setLanguage] = React.useState("French");
@@ -47,12 +57,15 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
 
   const refresh = React.useCallback(() => {
     api
-      .voices()
-      .then((data) => setVoices(data.voices))
+      .voices({ page, pageSize: PAGE_SIZE })
+      .then((data) => {
+        setVoices(data.voices);
+        setTotal(Number(data.total) || 0);
+      })
       .catch((exc: unknown) =>
         setError(exc instanceof Error ? exc.message : "Could not load voices"),
       );
-  }, []);
+  }, [page]);
 
   React.useEffect(refresh, [refresh]);
 
@@ -74,14 +87,18 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
     }
   }
 
-  async function remove(item: VoiceInfo) {
-    if (!window.confirm(`Delete voice "${item.label}"?`)) return;
+  async function remove() {
+    if (!pending) return;
+    setDeleting(true);
     setError(null);
     try {
-      await api.deleteVoice(item.label);
+      await api.deleteVoice(pending.label);
+      setPending(null);
       refresh();
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Could not delete the voice");
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -94,7 +111,14 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
       <div className="space-y-4">
         {error ? <ErrorNote message={error} /> : null}
         {voices.length === 0 ? (
-          <Empty text="No voices yet. Design one from a description, clone a clip, or register an existing recording." />
+          <Empty
+            text="No voices yet. Design one from a description, clone a clip, or register an existing recording."
+            action={
+              <Button variant="ghost" onClick={refresh}>
+                Reload voices
+              </Button>
+            }
+          />
         ) : (
           <div className="grid gap-3 md:grid-cols-2">
             {voices.map((item) => (
@@ -116,14 +140,33 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
                       </div>
                     ) : null}
                   </div>
-                  <Button variant="danger" className="px-2 py-1 text-xs" onClick={() => remove(item)}>
-                    Delete
-                  </Button>
+                  <div className="flex flex-col items-end gap-2">
+                    <Button
+                      variant="ghost"
+                      className="px-2 py-1 text-xs"
+                      onClick={() =>
+                        setPreview((current) =>
+                          current === item.label ? null : item.label,
+                        )
+                      }
+                    >
+                      {preview === item.label ? "Hide" : "Play"}
+                    </Button>
+                    <Button variant="danger" className="px-2 py-1 text-xs" onClick={() => setPending(item)}>
+                      Delete
+                    </Button>
+                  </div>
                 </div>
+                {preview === item.label ? (
+                  <div className="mt-3">
+                    <MediaPreview src={api.voiceAudioUrl(item.label)} name={item.label} />
+                  </div>
+                ) : null}
               </Card>
             ))}
           </div>
         )}
+        <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPage={setPage} />
 
         <Disclosure title="Design a voice" hint="From a text description">
           <div className="grid gap-4 md:grid-cols-2">
@@ -324,6 +367,17 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
           </Button>
         </Disclosure>
       </div>
+
+      <ConfirmDialog
+        open={pending !== null}
+        title={`Delete ${pending?.label ?? "voice"}`}
+        message="This removes the voice's clip, manifest and cached encodings from disk. It cannot be undone."
+        confirmLabel="Delete voice"
+        danger
+        busy={deleting}
+        onConfirm={remove}
+        onCancel={() => setPending(null)}
+      />
     </Section>
   );
 }

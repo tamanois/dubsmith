@@ -28,13 +28,14 @@ from pipeline.config import (
     SubtitleJobConfig,
     normalize_device_request,
 )
-from pipeline.errors import ConfigError, DubbingError
-from pipeline.info import devices_report, environment_report
+from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError
+from pipeline.info import devices_report, environment_report, usage_report
 from pipeline.models import (
     MVP_REQUIRED,
     REGISTRY,
     anchors_dir,
     registry_status,
+    remove_model,
 )
 from pipeline.voice_ops import list_voice_summaries, remove_voice
 
@@ -42,9 +43,14 @@ from .jobs import JobManager, QueueFullError
 from .schemas import (
     AnchorGenerateRequest,
     DubRequest,
+    FavoriteRequest,
+    IdListRequest,
     JobSubmitResponse,
     ModelDownloadRequest,
+    PathListRequest,
+    PresetRequest,
     SayRequest,
+    SettingsImport,
     SettingsPatch,
     VoiceAddRequest,
     VoiceCloneRequest,
@@ -72,8 +78,9 @@ _ALLOWED_EXTENSIONS = {
 _MAX_UPLOAD_BYTES = 8 * 1024**3
 
 #: UI-only preferences that are not part of pipeline ``Settings``.
-_UI_FIELDS = {"default_device", "default_dtype"}
+_UI_FIELDS = {"default_device", "default_dtype", "theme"}
 _DTYPES = {"auto", "bf16", "fp16", "fp32"}
+_THEMES = {"system", "light", "dark"}
 
 
 def _slug(value: str, limit: int = 60) -> str:
@@ -292,13 +299,49 @@ def create_app(
         )
         return JobSubmitResponse(job_id=job_id, state="QUEUED")
 
+    @app.delete("/api/models/{name}")
+    def delete_model(request: Request, name: str) -> dict[str, Any]:
+        settings = effective_settings(state(request).store)
+        if name not in REGISTRY:
+            raise HTTPException(status_code=404, detail=f"Unknown model {name!r}")
+        try:
+            return remove_model(name, settings.models_dir)
+        except (ConfigError, ModelNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # -- usage ------------------------------------------------------------- #
+
+    @app.get("/api/usage")
+    def usage(request: Request) -> dict[str, Any]:
+        settings = effective_settings(state(request).store)
+        app_state = state(request)
+        return usage_report(
+            models_dir=settings.models_dir,
+            voices_dir=settings.voices_dir,
+            output_root=app_state.output_root,
+            uploads_dir=app_state.uploads_dir,
+        )
+
     # -- voices ------------------------------------------------------------ #
 
     @app.get("/api/voices")
-    def voices(request: Request) -> dict[str, Any]:
+    def voices(
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
         settings = effective_settings(state(request).store)
         root = Path(settings.voices_dir)
-        return {"voices_dir": str(root.resolve()), "voices": list_voice_summaries(root)}
+        all_voices = list_voice_summaries(root)
+        total = len(all_voices)
+        offset = (page - 1) * page_size
+        return {
+            "voices_dir": str(root.resolve()),
+            "voices": all_voices[offset : offset + page_size],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     @app.post("/api/voices/design", response_model=JobSubmitResponse)
     def voice_design(
@@ -344,6 +387,17 @@ def create_app(
         settings = effective_settings(state(request).store)
         removed = remove_voice(Path(settings.voices_dir), label)
         return {"removed": label, "path": str(removed)}
+
+    @app.get("/api/voices/{label}/audio")
+    def voice_audio(request: Request, label: str) -> FileResponse:
+        settings = effective_settings(state(request).store)
+        root = Path(settings.voices_dir).expanduser().resolve()
+        path = (root / label / "voice.wav").resolve()
+        if not _is_under(path, root) or not path.is_file():
+            raise HTTPException(status_code=404, detail="Voice audio not found")
+        return FileResponse(
+            path, media_type="audio/wav", content_disposition_type="inline"
+        )
 
     # -- anchors ----------------------------------------------------------- #
 
@@ -454,8 +508,30 @@ def create_app(
         return JobSubmitResponse(job_id=job_id, state="QUEUED")
 
     @app.get("/api/jobs")
-    def list_jobs(request: Request, limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
-        return {"jobs": state(request).store.list_jobs(limit)}
+    def list_jobs(
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        state: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        # ``state`` here is the query parameter, so reach the app state directly
+        # rather than through the same-named helper above.
+        store_ref = request.app.state.store
+        offset = (page - 1) * page_size
+        return {
+            "jobs": store_ref.list_jobs(
+                page_size, offset=offset, state=state, q=q
+            ),
+            "total": store_ref.count_jobs(state=state, q=q),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @app.post("/api/jobs/clear")
+    def clear_jobs(request: Request, body: IdListRequest) -> dict[str, Any]:
+        removed = state(request).store.delete_jobs(body.ids)
+        return {"removed": removed}
 
     @app.get("/api/jobs/{job_id}")
     def get_job(request: Request, job_id: str) -> dict[str, Any]:
@@ -468,6 +544,125 @@ def create_app(
         job_or_404(request, job_id)
         row = state(request).manager.cancel(job_id)
         return row or {}
+
+    @app.post("/api/jobs/{job_id}/retry", response_model=JobSubmitResponse)
+    def retry_job(request: Request, job_id: str) -> JobSubmitResponse:
+        """Re-run a finished job's stored configuration as a new job.
+
+        The original row and folder are never touched: a retry gets its own run
+        directory, so history stays immutable and nothing is overwritten. The
+        original inputs are re-validated, because an upload may have been deleted
+        since the first attempt.
+        """
+        row = job_or_404(request, job_id)
+        kind = str(row["kind"])
+        raw = row.get("params") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = {}
+        payload: dict[str, Any] = json.loads(json.dumps(raw)) if isinstance(raw, dict) else {}
+        folder_tokens = {
+            "voice_design": "voice-design",
+            "voice_clone": "voice-clone",
+            "voice_add": "voice-add",
+        }
+
+        if kind in {"dub", "subtitles"}:
+            config = payload.setdefault("config", {})
+            source = config.get("video") or config.get("audio") or row.get("input_path")
+            if not source:
+                raise HTTPException(
+                    status_code=400, detail="This job has no input to retry."
+                )
+            source = validate_input(request, source)
+            if config.get("ref_audio"):
+                config["ref_audio"] = str(validate_input(request, config["ref_audio"]))
+            if config.get("accent_audio"):
+                config["accent_audio"] = str(
+                    validate_input(request, config["accent_audio"])
+                )
+            folder = run_dir(
+                request, source.stem, kind, str(config.get("target_language") or "")
+            )
+            config["job_dir_override"] = str(folder)
+            new_id = state(request).manager.enqueue(
+                kind, payload, input_path=str(source), job_dir=str(folder)
+            )
+        elif kind == "say":
+            spec = payload.setdefault("spec", {})
+            if spec.get("clone"):
+                spec["clone"] = str(validate_input(request, spec["clone"]))
+            folder = run_dir(
+                request,
+                str(spec.get("voice") or spec.get("save_as") or "say"),
+                "say",
+                str(spec.get("backend") or "qwen"),
+            )
+            spec["output_root"] = str(folder)
+            spec["output"] = None
+            new_id = state(request).manager.enqueue(
+                "say", payload, job_dir=str(folder)
+            )
+        elif kind in folder_tokens:
+            params = payload.setdefault("params", {})
+            if params.get("audio"):
+                params["audio"] = str(validate_input(request, params["audio"]))
+            folder = run_dir(
+                request, str(params.get("label") or "voice"), folder_tokens[kind]
+            )
+            if kind in {"voice_design", "voice_clone"}:
+                params["output_root"] = str(folder)
+                params["output"] = None
+            new_id = state(request).manager.enqueue(
+                kind, payload, job_dir=str(folder)
+            )
+        elif kind == "model_download":
+            new_id = state(request).manager.enqueue(
+                "model_download",
+                {
+                    "names": payload.get("names") or [],
+                    "force": bool(payload.get("force")),
+                },
+                job_dir=str(state(request).data_dir / "downloads"),
+            )
+        elif kind == "anchor_generate":
+            folder = run_dir(request, "anchors", "anchors")
+            new_id = state(request).manager.enqueue(
+                "anchor_generate",
+                {
+                    "languages": payload.get("languages") or [],
+                    "device": payload.get("device") or "auto",
+                    "dtype": payload.get("dtype") or "auto",
+                    "force": bool(payload.get("force")),
+                },
+                job_dir=str(folder),
+            )
+        else:
+            raise HTTPException(
+                status_code=400, detail=f"Cannot retry job kind {kind!r}"
+            )
+
+        return JobSubmitResponse(job_id=new_id, state="QUEUED")
+
+    @app.get("/api/jobs/{job_id}/input")
+    def job_input(request: Request, job_id: str) -> FileResponse:
+        """Stream the file a job operated on, for the compare view."""
+        row = job_or_404(request, job_id)
+        raw = row.get("input_path")
+        if not raw:
+            raise HTTPException(
+                status_code=404, detail="This job has no input file"
+            )
+        path = validate_input(request, raw)
+        return FileResponse(
+            path,
+            filename=path.name,
+            media_type=mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream",
+            content_disposition_type="inline",
+        )
 
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(
@@ -510,8 +705,34 @@ def create_app(
     # -- files ------------------------------------------------------------- #
 
     @app.get("/api/files")
-    def files(request: Request) -> dict[str, Any]:
-        return {"files": state(request).store.list_files()}
+    def files(
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
+        store_ref = state(request).store
+        offset = (page - 1) * page_size
+        return {
+            "files": store_ref.list_files(page_size, offset=offset),
+            "total": store_ref.count_files(),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @app.post("/api/files/delete")
+    def delete_files(request: Request, body: IdListRequest) -> dict[str, Any]:
+        roots = [
+            state(request).uploads_dir,
+            state(request).output_root,
+            state(request).data_dir,
+        ]
+        removed: list[str] = []
+        for item in state(request).store.delete_files(body.ids):
+            path = Path(item["path"])
+            if any(_is_under(path, root) for root in roots) and path.is_file():
+                path.unlink()
+            removed.append(item["id"])
+        return {"removed": removed}
 
     @app.post("/api/files/upload")
     def upload(
@@ -556,34 +777,209 @@ def create_app(
             "size": size,
         }
 
+    #: Filenames the pipeline treats as a run's main deliverable.
+    _PRIMARY_NAMES = (
+        "video_dubbed.mp4",
+        "video_burned.mp4",
+        "video_subtitled.mp4",
+        "dubbed_video.mp4",
+        "dub.wav",
+        "subs_target.srt",
+    )
+    _MEDIA_SUFFIXES = {
+        ".wav",
+        ".mp3",
+        ".flac",
+        ".m4a",
+        ".aac",
+        ".ogg",
+        ".opus",
+        ".mp4",
+        ".mkv",
+        ".mov",
+        ".webm",
+        ".srt",
+    }
+
+    def _primary_from_result(result: dict[str, Any]) -> Path | None:
+        """The main artifact a job reported, in preference order."""
+        for key in (
+            "dubbed_video",
+            "burned_video",
+            "output_video",
+            "dub_track",
+            "target_srt",
+            "output",
+        ):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                candidate = Path(value)
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    def _visible_files(folder: Path) -> list[Path]:
+        return [
+            path
+            for path in folder.rglob("*")
+            if path.is_file()
+            and not any(
+                part.startswith(".") for part in path.relative_to(folder).parts
+            )
+        ]
+
+    def _pick_primary(
+        folder: Path, files: list[Path], known: Path | None
+    ) -> Path | None:
+        """Choose the one file a run should show in the output list.
+
+        A finished job's own ``result`` is authoritative. Older or orphaned run
+        folders fall back to the pipeline's well-known artifact names, then to the
+        largest top-level media file. Intermediate artifacts (``01_audio.wav``,
+        ``04_dubbed/…``) are never promoted: a run that produced no deliverable is
+        hidden rather than listed with a stage file.
+        """
+        if known is not None and known.is_file():
+            return known
+
+        def internal(name: str) -> bool:
+            return bool(re.match(r"^\d+[a-z]?_", name))
+
+        top = [
+            path
+            for path in files
+            if path.parent == folder and not internal(path.name)
+        ]
+        by_name = {path.name: path for path in top}
+        for name in _PRIMARY_NAMES:
+            if name in by_name:
+                return by_name[name]
+        media = sorted(
+            (
+                path
+                for path in top
+                if path.suffix.lower() in _MEDIA_SUFFIXES
+            ),
+            key=lambda path: path.stat().st_size,
+            reverse=True,
+        )
+        return media[0] if media else None
+
     @app.get("/api/outputs")
-    def outputs(request: Request) -> dict[str, Any]:
+    def outputs(
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
+        """List one entry per run, with its main artifact.
+
+        Scanning every file made the list unusable: a single dub writes dozens of
+        intermediate artifacts. Each run therefore reports its primary output and
+        a file count; the full list is available from ``/api/outputs/files``.
+        """
         root = state(request).output_root
-        files: list[dict[str, Any]] = []
+        store_ref = state(request).store
+        known: dict[str, Path] = {}
+        meta: dict[str, dict[str, Any]] = {}
+        for row in store_ref.list_jobs(limit=5000):
+            job_dir = row.get("job_dir")
+            if not job_dir:
+                continue
+            key = str(Path(job_dir).resolve())
+            meta.setdefault(key, row)
+            result = row.get("result") or {}
+            if isinstance(result, dict):
+                primary = _primary_from_result(result)
+                if primary is not None:
+                    known[key] = primary
+
+        runs: list[dict[str, Any]] = []
         if root.is_dir():
-            for path in root.rglob("*"):
-                if not path.is_file():
+            for entry in root.iterdir():
+                if entry.name.startswith("."):
                     continue
-                if any(part.startswith(".") for part in path.relative_to(root).parts):
+                if entry.is_dir():
+                    folder, files = entry, _visible_files(entry)
+                elif entry.is_file():
+                    folder, files = entry, [entry]
+                else:
+                    continue
+                if not files:
+                    continue
+                key = str(folder.resolve())
+                primary = _pick_primary(folder, files, known.get(key))
+                if primary is None:
                     continue
                 try:
-                    stat = path.stat()
+                    stat = primary.stat()
                 except OSError:
                     continue
-                files.append(
+                row = meta.get(key) or {}
+                runs.append(
                     {
-                        "path": str(path),
-                        "relative": str(path.relative_to(root)),
-                        "name": path.name,
-                        "size": stat.st_size,
+                        "job_dir": str(folder),
+                        "job_id": row.get("id"),
+                        "title": row.get("title") or folder.name,
+                        "input_label": row.get("input_label"),
                         "created": stat.st_mtime,
+                        "primary": {
+                            "path": str(primary),
+                            "name": primary.name,
+                            "size": stat.st_size,
+                            "created": stat.st_mtime,
+                        },
+                        "file_count": len(files),
                     }
                 )
-        files.sort(key=lambda item: item["created"], reverse=True)
-        return {"output_root": str(root), "files": files[:1000]}
+        runs.sort(key=lambda item: item["created"], reverse=True)
+        total = len(runs)
+        offset = (page - 1) * page_size
+        return {
+            "output_root": str(root),
+            "runs": runs[offset : offset + page_size],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @app.get("/api/outputs/files")
+    def output_files(request: Request, job_dir: str) -> dict[str, Any]:
+        """Every artifact in one run folder, for the details view."""
+        folder = validate_output(request, job_dir)
+        if not folder.is_dir():
+            raise HTTPException(status_code=404, detail="Run folder not found")
+        files: list[dict[str, Any]] = []
+        for path in _visible_files(folder):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files.append(
+                {
+                    "path": str(path),
+                    "relative": str(path.relative_to(folder)),
+                    "name": path.name,
+                    "size": stat.st_size,
+                    "created": stat.st_mtime,
+                }
+            )
+        files.sort(key=lambda item: item["relative"])
+        return {"job_dir": str(folder), "files": files}
+
+    @app.post("/api/outputs/delete")
+    def delete_outputs(request: Request, body: PathListRequest) -> dict[str, Any]:
+        removed: list[str] = []
+        for value in body.paths:
+            target = validate_output(request, value)
+            if target.is_file():
+                target.unlink()
+                removed.append(str(target))
+        return {"removed": removed}
 
     @app.get("/api/outputs/download")
-    def download_output(request: Request, path: str) -> FileResponse:
+    def download_output(
+        request: Request, path: str, inline: bool = False
+    ) -> FileResponse:
         target = validate_output(request, path)
         if not target.is_file():
             raise HTTPException(status_code=404, detail="Output not found")
@@ -592,6 +988,7 @@ def create_app(
             filename=target.name,
             media_type=mimetypes.guess_type(target.name)[0]
             or "application/octet-stream",
+            content_disposition_type="inline" if inline else "attachment",
         )
 
     @app.delete("/api/outputs")
@@ -603,7 +1000,7 @@ def create_app(
         return {"deleted": str(target)}
 
     @app.get("/api/files/{file_id}/download")
-    def download(request: Request, file_id: str) -> FileResponse:
+    def download(request: Request, file_id: str, inline: bool = False) -> FileResponse:
         item = state(request).store.get_file(file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="File not found")
@@ -615,6 +1012,7 @@ def create_app(
             filename=item["original_name"],
             media_type=mimetypes.guess_type(item["original_name"])[0]
             or "application/octet-stream",
+            content_disposition_type="inline" if inline else "attachment",
         )
 
     @app.delete("/api/files/{file_id}")
@@ -637,37 +1035,28 @@ def create_app(
 
     # -- settings ---------------------------------------------------------- #
 
-    @app.get("/api/settings")
-    def get_settings(request: Request) -> dict[str, Any]:
-        payload = settings_payload(effective_settings(state(request).store))
-        stored = state(request).store.get_settings()
-        payload["default_device"] = stored.get("default_device", "auto")
-        payload["default_dtype"] = stored.get("default_dtype", "auto")
-        return payload
-
-    @app.patch("/api/settings")
-    def patch_settings(request: Request, body: SettingsPatch) -> dict[str, Any]:
-        unknown = sorted(set(body.values) - set(EDITABLE_FIELDS) - _UI_FIELDS)
+    def apply_settings(request: Request, values: dict[str, Any]) -> None:
+        """Validate a settings patch and persist it, or reject it wholesale."""
+        unknown = sorted(set(values) - set(EDITABLE_FIELDS) - _UI_FIELDS)
         if unknown:
             raise HTTPException(
                 status_code=400,
                 detail=f"Settings not editable: {', '.join(unknown)}",
             )
         pipeline_values = {
-            key: value for key, value in body.values.items() if key not in _UI_FIELDS
+            key: value for key, value in values.items() if key not in _UI_FIELDS
         }
         current = effective_settings(state(request).store).model_dump()
         try:
             from pipeline.config import Settings
 
             Settings.model_validate({**current, **pipeline_values})
-            if "default_device" in body.values:
-                normalize_device_request(str(body.values["default_device"]))
-            if (
-                "default_dtype" in body.values
-                and body.values["default_dtype"] not in _DTYPES
-            ):
+            if "default_device" in values:
+                normalize_device_request(str(values["default_device"]))
+            if "default_dtype" in values and values["default_dtype"] not in _DTYPES:
                 raise ValueError("default_dtype must be auto, bf16, fp16 or fp32")
+            if "theme" in values and values["theme"] not in _THEMES:
+                raise ValueError("theme must be system, light or dark")
         except (ValidationError, ConfigError, ValueError) as exc:
             message = (
                 exc.errors()[0]["msg"] if isinstance(exc, ValidationError) else str(exc)
@@ -675,8 +1064,69 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail=f"Invalid setting: {message}"
             ) from None
-        state(request).store.patch_settings(body.values)
+        state(request).store.patch_settings(values)
+
+    @app.get("/api/settings")
+    def get_settings(request: Request) -> dict[str, Any]:
+        payload = settings_payload(effective_settings(state(request).store))
+        stored = state(request).store.get_settings()
+        payload["default_device"] = stored.get("default_device", "auto")
+        payload["default_dtype"] = stored.get("default_dtype", "auto")
+        payload["theme"] = stored.get("theme", "system")
+        return payload
+
+    @app.patch("/api/settings")
+    def patch_settings(request: Request, body: SettingsPatch) -> dict[str, Any]:
+        apply_settings(request, body.values)
         return get_settings(request)
+
+    @app.get("/api/settings/export")
+    def export_settings(request: Request) -> dict[str, Any]:
+        payload = get_settings(request)
+        keys = [*EDITABLE_FIELDS, *_UI_FIELDS]
+        return {
+            "version": 1,
+            "settings": {key: payload[key] for key in keys if key in payload},
+        }
+
+    @app.post("/api/settings/import")
+    def import_settings(request: Request, body: SettingsImport) -> dict[str, Any]:
+        apply_settings(request, body.settings)
+        return get_settings(request)
+
+    # -- presets and favorites --------------------------------------------- #
+
+    @app.get("/api/presets")
+    def presets(request: Request, kind: str | None = None) -> dict[str, Any]:
+        return {"presets": state(request).store.list_presets(kind)}
+
+    @app.post("/api/presets")
+    def create_preset(request: Request, body: PresetRequest) -> dict[str, Any]:
+        preset = state(request).store.add_preset(
+            uuid.uuid4().hex, body.kind, body.name, body.payload
+        )
+        return {"preset": preset}
+
+    @app.delete("/api/presets/{preset_id}")
+    def remove_preset(request: Request, preset_id: str) -> dict[str, Any]:
+        if not state(request).store.delete_preset(preset_id):
+            raise HTTPException(status_code=404, detail="Preset not found")
+        return {"deleted": preset_id}
+
+    @app.get("/api/favorites")
+    def favorites(request: Request) -> dict[str, Any]:
+        return {"favorites": state(request).store.list_favorites()}
+
+    @app.post("/api/favorites")
+    def add_favorite(request: Request, body: FavoriteRequest) -> dict[str, Any]:
+        item = state(request).store.add_favorite(body.path, body.label, body.kind)
+        return {"favorite": item}
+
+    @app.delete("/api/favorites")
+    def remove_favorite(request: Request, path: str) -> dict[str, Any]:
+        if not state(request).store.delete_favorite(path):
+            raise HTTPException(status_code=404, detail="Favorite not found")
+        return {"deleted": path}
 
     # -- static frontend --------------------------------------------------- #
 
