@@ -15,7 +15,7 @@ python -m pytest
 ```
 
 ```
-1453 tests (all passing)
+1466 tests (all passing)
 ```
 
 Run a single area while iterating:
@@ -30,6 +30,7 @@ python -m pytest tests/test_mixing.py -q       # ducking, room matching
 python -m pytest -k accent -q                  # everything accent-related
 python -m pytest tests/test_voices.py -q       # saved voices and cards
 python -m pytest tests/test_provenance.py -q   # prosody/provenance records
+python -m pytest tests/test_server.py -q       # API, job state machine, uploads
 ```
 
 ## Real dubs against the local checkpoints

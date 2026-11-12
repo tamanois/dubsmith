@@ -18,6 +18,7 @@
 | Area | Status | Where |
 |---|---|---|
 | CLI + model download | ✅ | `dub.py` (`models --list/--download`, `--video/--audio`) |
+| Local browser UI + HTTP API | ✅ | `server/` (FastAPI, SQLite jobs, SSE), `web/` (React), `docs/web-ui.md` |
 | Config, env, languages | ✅ | `pipeline/config.py` |
 | Model registry / resolution | ✅ | `pipeline/models.py` |
 | Media (ffmpeg, loudness, SRT) | ✅ | `pipeline/media.py`, `pipeline/subtitles.py` |
@@ -38,7 +39,7 @@
 | Expressive native accent (`--expressive-accent blend`) | ✅ | `pipeline/orchestrate.py`, `pipeline/cosyvoice.py`, `--expressive-accent` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1453 tests (all passed) | `tests/` |
+| Tests | ✅ 1466 tests (all passed) | `tests/` |
 
 Verification performed:
 

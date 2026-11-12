@@ -896,6 +896,7 @@ class TestDevices:
         job = JobConfig(audio=Path("a.wav"), device="cpu")
         payload = job.model_dump(mode="json")
         payload.pop("output_dir", None)
+        payload.pop("job_dir_override", None)
         payload.pop("force", None)
         payload.pop("devices")
         # The soft default is treated as absent by the fingerprint, for the same

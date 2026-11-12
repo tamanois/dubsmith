@@ -1794,6 +1794,108 @@ def _anchor_text(language: str) -> str:
 
 def cmd_voices(argv: Sequence[str]) -> int:
     """Handle ``dub.py voices``: create, list and remove saved voice prints."""
+    from pipeline import voice_ops
+    from pipeline.voice_ops import (
+        clone_voice,
+        design_voice,
+        register_voice,
+        remove_voice,
+    )
+    from pipeline.voices import list_voices
+
+    # See cmd_say: the CLI supplies its resolver to the shared operation.
+    voice_ops.resolve_model = resolve_model
+    args = build_voices_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    root = _voices_root(args, settings)
+
+    if args.remove:
+        removed = remove_voice(root, args.remove)
+        print(f"Removed {args.remove!r} from {removed}")
+        return _STOP
+
+    if args.list or not (args.design or args.clone or args.add is not None):
+        saved = list_voices(root)
+        print(f"Saved voices: {root.resolve()}\n")
+        if not saved:
+            print(
+                "  (none yet - create one with "
+                '\'python dub.py voices --design --prompt "..." --lang fr\')'
+            )
+            return _STOP
+        for item in saved:
+            print(f"  {item.summary()}")
+        return _STOP
+
+    if args.add is not None:
+        if args.speak:
+            raise ConfigError(
+                "--speak needs a synthesiser, which --add does not load. Register "
+                "the voice first, then speak it with 'python dub.py say --voice ...'."
+            )
+        result = register_voice(
+            root,
+            models_dir,
+            audio=Path(args.add),
+            clone_text=args.clone_text,
+            transcribe=args.transcribe,
+            verify=args.verify,
+            language=args.lang,
+            label=args.label,
+            force=args.force,
+            device=args.device,
+        )
+    elif args.design:
+        result = design_voice(
+            root,
+            models_dir,
+            prompt=args.prompt or "",
+            language=args.lang or "fr",
+            label=args.label,
+            speak=args.speak,
+            output=args.output,
+            force=args.force,
+            device=args.device,
+            dtype=args.dtype,
+        )
+    else:
+        if args.audio is None:
+            raise ConfigError(
+                "--clone requires --audio (a clip of the voice to clone)."
+            )
+        result = clone_voice(
+            root,
+            models_dir,
+            audio=args.audio,
+            clone_text=args.clone_text,
+            transcribe=args.transcribe,
+            verify=args.verify,
+            language=args.lang,
+            label=args.label,
+            speak=args.speak,
+            output=args.output,
+            force=args.force,
+            device=args.device,
+            dtype=args.dtype,
+        )
+
+    if result.output is not None:
+        print(f"Wrote {result.output}")
+    encoded = f" + {result.cards} card(s)" if result.cards else ""
+    verb = "Registered" if result.source == "import" else "Saved"
+    print(
+        f"{verb} voice {result.label!r} "
+        f"({result.language}, {result.seconds:.1f}s{encoded}) to {result.directory}"
+    )
+    for warning in result.warnings:
+        print(warning)
+    print(f'Use it with: python dub.py say --voice {result.label} --text "..."')
+    return _STOP
+
+
+def _cmd_voices_legacy(argv: Sequence[str]) -> int:
+    """Handle ``dub.py voices``: create, list and remove saved voice prints."""
     from pipeline.tts import TTSEngine, VoiceDesignEngine
     from pipeline.voices import (
         default_label,
@@ -2941,6 +3043,63 @@ def _install_saved_prompt(
 
 
 def cmd_say(argv: Sequence[str]) -> int:
+    """Handle ``dub.py say``: speak a text with a saved, designed or cloned voice."""
+    from pipeline import say as say_module
+    from pipeline.say import SaySpec, render_speech
+
+    # Share this module's resolver, so a caller that monkeypatches (or wraps)
+    # ``dub.resolve_model`` changes what the shared operation uses too.
+    say_module.resolve_model = resolve_model
+    args = build_say_parser().parse_args(list(argv))
+    settings = Settings.from_env()
+    models_dir = args.models_dir or settings.models_dir
+    root = _voices_root(args, settings)
+    say_name = _say_name(args)
+    setup_logging(
+        "DEBUG" if args.verbose else settings.log_level,
+        settings.log_json,
+        log_file=_say_log_file(args, settings, say_name),
+        max_bytes=args.log_max_bytes,
+    )
+    log = job_logger("dub.say", f"say-{say_name}")
+    spec = SaySpec(
+        text=args.text,
+        backend=args.backend,
+        voice=args.voice,
+        design=args.design,
+        clone=args.clone,
+        clone_text=args.clone_text,
+        speaker=args.speaker,
+        language=args.lang,
+        save_as=args.save_as,
+        output=args.output,
+        device=args.device,
+        dtype=args.dtype,
+        force=args.force,
+        provenance=not args.no_provenance,
+        prosody=args.prosody,
+        emotions=args.emotions,
+        prosody_plan=args.prosody_plan,
+        style_instructs=args.style_instructs,
+        style_plan=args.style_plan,
+        style_plan_scope=args.style_plan_scope,
+        plan_chunk=args.plan_chunk,
+        chatterbox_exaggeration=args.chatterbox_exaggeration,
+        chatterbox_cfg_weight=args.chatterbox_cfg_weight,
+        chatterbox_temperature=args.chatterbox_temperature,
+        fish_temperature=args.fish_temperature,
+        fish_top_p=args.fish_top_p,
+        fish_quantize=args.fish_quantize,
+        fish_tag_mode=args.fish_tag_mode,
+    )
+    result = render_speech(
+        spec, settings, models_dir=models_dir, voices_root=root, log=log
+    )
+    print(result.summary())
+    return _STOP
+
+
+def _cmd_say_legacy(argv: Sequence[str]) -> int:
     """Handle ``dub.py say``: speak a text with a saved, designed or cloned voice."""
     from pipeline.tts import TTSEngine, VoiceDesignEngine
     from pipeline.voices import load_voice, save_voice

@@ -61,13 +61,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install "pytest>=8.0" pytest-cov
+          # The local web API tests import FastAPI and Starlette's TestClient.
+          pip install fastapi "uvicorn[standard]" python-multipart httpx
 
       # `-o addopts=""` clears the `-q` in pyproject.toml, but must not clear
       # `--strict-markers`; pass it explicitly.
       - name: Run the test suite
         run: >
           pytest -o addopts="" --strict-markers
-          --cov=pipeline --cov=dub --cov=audit_qc --cov=audit_timbre
+          --cov=pipeline --cov=server --cov=dub --cov=audit_qc --cov=audit_timbre
           --cov-report=term-missing
 
   package:

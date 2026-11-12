@@ -7,6 +7,7 @@ See the [before/after demo](media/README.md) for an 8-second English → French 
 | [Setup](setup.md) | install from scratch, configure the LLM endpoint, download models, install optional backends |
 | [Docker](docker.md) | build a portable image with all dependencies (model weights excluded) |
 | [Usage](usage.md) | choose a command, see worked examples, iterate quickly |
+| [Web UI and API](web-ui.md) | run the browser interface, use the local HTTP API, understand jobs and SSE |
 | [Options](options.md) | look up a flag, default, or environment variable |
 | [Voices](voices.md) | design, clone, or import a saved voice; understand accent modes and cards |
 | [Voice generation](voice-generation.md) | use `dub say`, expressive backends, and per-line emotion |

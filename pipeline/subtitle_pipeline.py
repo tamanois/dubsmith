@@ -18,6 +18,7 @@ overwrite a dub's artifacts.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -94,9 +95,11 @@ class SubtitlesPipeline:
         *,
         transcriber: Transcriber | None = None,
         translator: Translator | None = None,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.job = job
         self.settings = settings or Settings.from_env()
+        self._event = event
         self.input_path = job.input_path
         self.job_dir = job.job_dir
         self.job_id = f"{self.input_path.stem}-subtitles-{job.fingerprint()}"
@@ -114,17 +117,27 @@ class SubtitlesPipeline:
         self.job_dir.mkdir(parents=True, exist_ok=True)
         self.log.info("Starting subtitle job for %s", self.input_path.name)
 
-        audio_path = self._audio_path()
-        transcript = self._transcribe(audio_path)
-        texts, translated = self._texts(transcript)
-        cues = subtitles.cues_from_segments(
-            transcript.segments, texts, max_chars=self.job.max_chars
+        audio_path = self._stage("audio", lambda: self._audio_path())
+        transcript = self._stage(
+            "transcribe", lambda: self._transcribe(audio_path)
         )
-        target_srt = subtitles.write_srt(cues, self.job_dir / _SUBTITLE_NAME)
+        texts, translated = self._stage(
+            "translate", lambda: self._texts(transcript)
+        )
+
+        def write_subtitles() -> tuple[list[Any], Path]:
+            cues = subtitles.cues_from_segments(
+                transcript.segments, texts, max_chars=self.job.max_chars
+            )
+            return cues, subtitles.write_srt(cues, self.job_dir / _SUBTITLE_NAME)
+
+        cues, target_srt = self._stage("subtitles", write_subtitles)
 
         output_video = None
         if self.job.is_video and self.job.subtitles_mode != "off":
-            output_video = self._embed(target_srt)
+            output_video = self._stage(
+                "embed", lambda: self._embed(target_srt)
+            )
 
         report = {
             "mode": "subtitles",
@@ -152,6 +165,35 @@ class SubtitlesPipeline:
         )
 
     # -- stages ------------------------------------------------------------ #
+
+    def _emit(self, kind: str, **payload: Any) -> None:
+        """Notify the optional observer, never letting it break the run."""
+        if self._event is None:
+            return
+        try:
+            self._event(kind, payload)
+        except Exception:  # noqa: BLE001 - an observer must not fail a job
+            self.log.debug("Stage observer failed for %s", kind, exc_info=True)
+
+    def _stage(self, name: str, func: Callable[[], Any]) -> Any:
+        """Run one stage, emitting its measured start/end and duration."""
+        self._emit("stage_start", stage=name)
+        started = time.perf_counter()
+        try:
+            result = func()
+        except BaseException:
+            self._emit(
+                "stage_failed",
+                stage=name,
+                seconds=round(time.perf_counter() - started, 3),
+            )
+            raise
+        self._emit(
+            "stage_end",
+            stage=name,
+            seconds=round(time.perf_counter() - started, 3),
+        )
+        return result
 
     def _audio_path(self) -> Path:
         """Audio to recognise: the input itself, or an extracted mono WAV."""

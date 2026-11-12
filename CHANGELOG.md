@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Local browser UI and HTTP API (`server/`, `web/`): FastAPI + SQLite jobs,
+  one heavy job at a time in a spawned process, SSE stage/log streaming, and a
+  React + Vite + Tailwind interface covering dubbing, subtitles, speech
+  generation, voices, models, devices, files and settings. Every job writes to a
+  unique `<stem>__<operation>__<language>__<run-id>` folder, so outputs never
+  overwrite. See `docs/web-ui.md`.
+- Shared pipeline operations for the CLI and API: `pipeline/say.py`,
+  `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
+  structured device/environment reports and an optional stage-event hook on the
+  dubbing and subtitles pipelines.
 - `python dub.py devices` lists every GPU torch can see, its VRAM, the precision
   it would run, whether ASR can use it, and the exact flag to select it. It is
   read-only and loads no model, the same contract as `dub.py info`.

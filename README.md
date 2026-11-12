@@ -62,6 +62,7 @@ Optional extras (each degrades gracefully when absent):
 
 ```bash
 pip install ".[full]"     # Demucs background separation, funasr diarization, SpeechBrain overlap
+pip install ".[web]"      # FastAPI + uvicorn for the local browser UI
 ```
 
 **2. Point the translator at a model**
@@ -118,6 +119,21 @@ optional backends, macOS notes, `MODELS_DIR` — see [docs/setup.md](docs/setup.
 
 Prefer containers? The repository ships an optional `Dockerfile` with every
 dependency (models excluded); see [docs/docker.md](docs/docker.md).
+
+### Browser UI
+
+The same pipeline is available in a local, single-user browser app:
+
+```bash
+pip install ".[web]"
+cd web && npm install && npm run build && cd ..
+dub-server          # http://127.0.0.1:8000
+```
+
+It covers dubbing, subtitles, speech generation, the voice library, models,
+devices, files and settings, with live stage progress and an expandable log.
+Outputs go into unique per-run folders so they never overwrite each other. See
+[docs/web-ui.md](docs/web-ui.md).
 
 ---
 

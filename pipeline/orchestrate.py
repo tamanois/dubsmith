@@ -359,9 +359,13 @@ class Pipeline:
         speaker_separator: Any | None = None,
         stream_transcriber: Callable[[Path], Transcript] | None = None,
         stretcher_preference: str = "auto",
+        event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.job = job
         self.settings = settings or Settings.from_env()
+        #: Optional observer for stage transitions. The API uses it to stream
+        #: progress; the CLI leaves it ``None`` and nothing changes.
+        self._event = event
         self.input_path = job.input_path
         self.stem = self.input_path.stem
         self.job_dir = job.job_dir
@@ -587,13 +591,24 @@ class Pipeline:
 
     # -- stage plumbing ---------------------------------------------------- #
 
+    def _emit(self, kind: str, **payload: Any) -> None:
+        """Notify the optional observer, never letting it break the run."""
+        if self._event is None:
+            return
+        try:
+            self._event(kind, payload)
+        except Exception:  # noqa: BLE001 - an observer must not fail a job
+            self.log.debug("Stage observer failed for %s", kind, exc_info=True)
+
     def _stage(self, name: str, outputs: Sequence[Path], func: Callable[[], Any]) -> Any:
         """Run a stage unless it is already cached; record timing either way."""
         if self.manifest.is_done(name, outputs) and not self.job.force:
             self.log.info("Stage %s: cached", name, extra={"stage": name})
+            self._emit("stage_cached", stage=name)
             return None
 
         self.log.info("Stage %s: running", name, extra={"stage": name})
+        self._emit("stage_start", stage=name)
         started = time.perf_counter()
         try:
             result = func()
@@ -605,6 +620,7 @@ class Pipeline:
                 elapsed,
                 extra={"stage": name, "seconds": round(elapsed, 3)},
             )
+            self._emit("stage_failed", stage=name, seconds=round(elapsed, 3))
             raise
         elapsed = time.perf_counter() - started
         self._stage_seconds[name] = elapsed
@@ -615,6 +631,7 @@ class Pipeline:
             elapsed,
             extra={"stage": name, "seconds": round(elapsed, 3)},
         )
+        self._emit("stage_end", stage=name, seconds=round(elapsed, 3))
         return result
 
     def _resolve_stretcher(self, tmp_dir: Path) -> Any:

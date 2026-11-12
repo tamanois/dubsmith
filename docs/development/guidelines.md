@@ -6,10 +6,18 @@ architecture that this project does not use.
 
 ## Architecture
 
-- The project is a **local CLI**, not a web service. There is no API layer,
-  database, Celery/Redis queue, or Docker requirement.
 - The importable core is the flat `pipeline/` package. `dub.py` is the CLI and
-  maps flags to `JobConfig`/`Settings`; it should not accumulate model logic.
+  maps flags to `JobConfig`/`Settings`; `server/` is the local HTTP API and
+  `web/` is the React single-page app. The CLI and the API both call `pipeline/`
+  and must never duplicate media, TTS or translation logic.
+- The API is single-user and local by design: SQLite under `data/` (gitignored)
+  stores jobs, settings and file metadata, one heavy job runs at a time in a
+  spawned process, and stage events plus log lines stream to the browser over
+  SSE. Long work never blocks request handling.
+- Multi-user, remote workers and URL inputs are future additions behind three
+  seams that already exist: a `user_id` column on owned rows, the
+  `server/executor.py::JobExecutor` protocol, and the single input-path
+  validator in `server/app.py`. Do not close those doors.
 - Heavy stages live behind small engine/protocol boundaries:
   - `pipeline/tts.py` for Qwen Base cloning and CustomVoice
   - `pipeline/backends.py` for CosyVoice3, Chatterbox and Fish
@@ -54,6 +62,8 @@ architecture that this project does not use.
 
 - Pytest is the only test runner. The default suite must not need a GPU,
   downloaded models, or ffmpeg; fake the heavy pieces.
+- Server tests use `create_app(data_dir=tmp_path, executor=FakeExecutor)` so the
+  state machine, uploads, settings and SSE plumbing run without spawning models.
 - Optional backends are exercised through fakes and `pytest.importorskip`.
 - Add tests for failure paths and edge cases, not only the happy path.
 - Keep tests deterministic; no network calls.
@@ -66,7 +76,8 @@ architecture that this project does not use.
   documented module. Update it in the same change as the behavior.
 - Update `docs/voices.md` / `docs/voice-generation.md` for backend or emotion
   changes; `docs/outputs-and-caching.md` for new artifacts or report fields;
-  `docs/troubleshooting.md` for new error messages.
+  `docs/troubleshooting.md` for new error messages; `docs/web-ui.md` for the
+  browser UI or API surface.
 - Keep `PLAN.md` status and test counts current.
 
 ## Style
