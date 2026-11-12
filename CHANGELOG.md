@@ -18,8 +18,11 @@ All notable changes to this project are documented here. The format follows
   `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
   structured device/environment reports and an optional stage-event hook on the
   dubbing and subtitles pipelines.
-- Frontend regression tests (Vitest + Testing Library) cover the subtitles-only
-  device selector and the completed/cancelled/failed job-panel messages.
+- Frontend regression tests (Vitest + Testing Library, 125 tests) cover the API
+  wrapper and SSE handling, the UI primitives, uploads, live job logs and
+  cancellation, activity polling, every management page (models, devices, files,
+  settings, voices), the full dub and speech payload builders, and app
+  navigation. They run without a GPU, network, or built assets.
 - `python dub.py devices` lists every GPU torch can see, its VRAM, the precision
   it would run, whether ASR can use it, and the exact flag to select it. It is
   read-only and loads no model, the same contract as `dub.py info`.
@@ -39,6 +42,14 @@ All notable changes to this project are documented here. The format follows
   sliding-window attention-mask builder writes in place onto an expanded tensor,
   which aborts Qwen3-TTS synthesis with a `RuntimeError` about a written-to
   tensor sharing a memory location.
+
+### Fixed
+
+- The job panel now keeps exactly the latest 300 log lines instead of 301; the
+  cap test caught the off-by-one in the live log buffer.
+- The upload field's file input, disclosure buttons and toggles expose accessible
+  names and expanded state, so keyboard and screen-reader users can identify
+  them and the UI tests can target them reliably.
 
 ## [0.2.0] - 2026-11-09
 

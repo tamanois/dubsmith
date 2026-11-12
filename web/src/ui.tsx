@@ -64,6 +64,7 @@ export function Disclosure({
     <div className="overflow-hidden rounded-xl border border-white/10 bg-ink-850/60">
       <button
         type="button"
+        aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
         className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
       >
@@ -151,6 +152,7 @@ export function Toggle({
       <button
         type="button"
         role="switch"
+        aria-label={label}
         aria-checked={checked}
         onClick={() => onChange(!checked)}
         className={cn(

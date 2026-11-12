@@ -33,7 +33,7 @@ export function JobPanel({
     const close = subscribeJob(
       jobId,
       (event) => {
-        setLogs((current) => [...current.slice(-300), event]);
+        setLogs((current) => [...current, event].slice(-300));
       },
       (finished) => setJob(finished),
       (message) => setError(message),

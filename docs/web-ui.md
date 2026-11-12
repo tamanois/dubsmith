@@ -139,6 +139,20 @@ npm test
 npm run build
 ```
 
-`test/DubPage.test.tsx` covers the subtitles-only device selector;
-`test/JobPanel.test.tsx` covers the terminal messages for completed, cancelled
-and failed jobs.
+The 125 frontend tests do not use a network, GPU, or built assets:
+
+- `test/api.test.ts` covers request errors, upload failures, URL encoding and SSE
+  dispatch, including malformed frames and connection loss.
+- `test/ui.test.tsx` and `test/UploadField.test.tsx` cover formatting helpers,
+  disclosures, toggles, badges and upload success/failure states.
+- `test/JobPanel.test.tsx` and `test/JobsPage.test.tsx` cover live log growth and
+  the 300-line cap, terminal messages, cancellation, result paths, activity
+  polling and cleanup.
+- `test/ModelsPage.test.tsx`, `DevicesPage.test.tsx`, `FilesPage.test.tsx`,
+  `SettingsPage.test.tsx` and `VoicesPage.test.tsx` cover the management pages,
+  including confirms, payloads, busy states and API errors.
+- `test/DubPage.test.tsx` and `SayPage.test.tsx` cover every form mode and the
+  request payloads for dubbing, subtitles, saved/designed/cloned voices and
+  backend-specific controls.
+- `test/App.test.tsx` covers navigation, the job-start hand-off, the toast and
+  the panel lifecycle.

@@ -43,6 +43,7 @@ export function UploadField({
         <input
           type="file"
           accept={accept}
+          aria-label={label}
           onChange={pick}
           className="hidden"
           disabled={busy}
