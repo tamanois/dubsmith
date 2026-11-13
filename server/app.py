@@ -31,7 +31,6 @@ from pipeline.config import (
 )
 from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError
 from pipeline.info import devices_report, environment_report, usage_report
-from pipeline.options import Defaults
 from pipeline.models import (
     MVP_REQUIRED,
     REGISTRY,
@@ -39,6 +38,7 @@ from pipeline.models import (
     registry_status,
     remove_model,
 )
+from pipeline.options import Defaults
 from pipeline.voice_ops import list_voice_summaries, remove_voice
 
 from .jobs import JobManager, QueueFullError

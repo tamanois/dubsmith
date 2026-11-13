@@ -16,9 +16,13 @@ from typing import Mapping
 
 from .options import (
     EXPRESSIVE_BACKENDS,
-    SAY_BACKENDS as SAY_BACKEND_IDS,
-    TTS_BACKENDS as TTS_BACKEND_IDS,
     Defaults,
+)
+from .options import (
+    SAY_BACKENDS as SAY_BACKEND_IDS,
+)
+from .options import (
+    TTS_BACKENDS as TTS_BACKEND_IDS,
 )
 
 __all__ = [
