@@ -19,6 +19,7 @@ from typing import Any, Protocol, Sequence
 
 import numpy as np
 
+from . import options
 from .errors import DependencyError, MediaError
 from .media import resample
 
@@ -59,7 +60,7 @@ class NullSeparator:
     is unchanged and the MVP behaviour remains available.
     """
 
-    name = "none"
+    name = options.Separator.NONE.value
 
     def separate(
         self, samples: np.ndarray, sample_rate: int
@@ -72,7 +73,7 @@ class NullSeparator:
 class DemucsSeparator:
     """Demucs-backed separator (``htdemucs`` by default)."""
 
-    name = "demucs"
+    name = options.Separator.DEMUCS.value
 
     def __init__(
         self,
@@ -218,7 +219,7 @@ def _fit_length(values: np.ndarray, size: int) -> np.ndarray:
 
 
 def detect_separator(
-    preference: str = "auto",
+    preference: str = options.Defaults.SEPARATOR,
     *,
     device: str = "auto",
     model_name: str = "htdemucs",
@@ -239,13 +240,14 @@ def detect_separator(
     """
     import importlib.util
 
-    preference = (preference or "auto").lower()
-    if preference in {"none", "off", "identity"}:
+    preference = (preference or options.Defaults.SEPARATOR).lower()
+    canonical = options.SEPARATOR_ALIASES.get(preference)
+    if canonical == options.Separator.NONE:
         return NullSeparator()
 
     available = importlib.util.find_spec("demucs") is not None
 
-    if preference == "demucs":
+    if canonical == options.Separator.DEMUCS:
         if not available:
             raise DependencyError(
                 "Background separation requested but demucs is not installed. "
@@ -253,9 +255,10 @@ def detect_separator(
             )
         return DemucsSeparator(model_name=model_name, device=device)
 
-    if preference != "auto":
+    if canonical != options.Separator.AUTO:
         raise DependencyError(
-            f"Unknown separator {preference!r}. Choose from: auto, none, demucs"
+            f"Unknown separator {preference!r}. Choose from: "
+            f"{', '.join(options.SEPARATORS)}"
         )
 
     if available:

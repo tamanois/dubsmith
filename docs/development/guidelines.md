@@ -38,6 +38,16 @@ architecture that this project does not use.
 - `pipeline/config.py` uses pydantic models. `Settings` comes from environment
   variables and `.env`; `JobConfig` describes one run and feeds the cache
   fingerprint.
+- Every accepted option value is declared once, in `pipeline/options.py`. The
+  CLI hands those tuples to `argparse`, the models validate against the alias
+  tables built from them, and `server/schemas.py` exposes the enums. Never
+  retype a value in another validator, CLI flag or test.
+- The browser mirrors the vocabulary in `web/src/options.ts`, which derives each
+  `{ value, label }` list from the declaration. Backend ids and labels come from
+  `GET /api/backends`, not from a second frontend list.
+- To rename or add a value: change `pipeline/options.py`, mirror it in
+  `web/src/options.ts`, then update `docs/options.md`. `tests/test_options.py`
+  and `web/test/options.test.ts` fail if the copies disagree.
 - Real environment variables override `.env`.
 - Never commit `models/`, `voices/`, `input/`, `output/`, `third_party/`, or
   `.env`. They are local data, often private.

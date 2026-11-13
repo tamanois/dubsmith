@@ -31,6 +31,7 @@ from pipeline.config import (
 )
 from pipeline.errors import ConfigError, DubbingError, ModelNotFoundError
 from pipeline.info import devices_report, environment_report, usage_report
+from pipeline.options import Defaults
 from pipeline.models import (
     MVP_REQUIRED,
     REGISTRY,
@@ -505,7 +506,7 @@ def create_app(
         )
         if conflict:
             raise HTTPException(status_code=422, detail=conflict)
-        raw = body.model_dump()
+        raw = body.model_dump(mode="json")
         if raw.get("clone"):
             raw["clone"] = str(validate_input(request, raw["clone"]))
         if raw.get("output"):
@@ -514,7 +515,7 @@ def create_app(
             request,
             raw.get("voice") or raw.get("save_as") or "say",
             "say",
-            raw.get("backend", "qwen"),
+            raw.get("backend") or Defaults.SAY_BACKEND,
         )
         raw["output_root"] = str(folder)
         raw["output"] = None
@@ -614,7 +615,7 @@ def create_app(
                 request,
                 str(spec.get("voice") or spec.get("save_as") or "say"),
                 "say",
-                str(spec.get("backend") or "qwen"),
+                str(spec.get("backend") or Defaults.SAY_BACKEND),
             )
             spec["output_root"] = str(folder)
             spec["output"] = None

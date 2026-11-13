@@ -19,6 +19,46 @@ from .mixing import (
     DEFAULT_ROOM_TONE_GAIN_DB,
     DEFAULT_ROOM_WET_DB,
 )
+from .options import (
+    ACCENT_BLENDS,
+    ACCENT_BLEND_ALIASES,
+    ACCENT_MATCHES,
+    ACCENT_MATCH_ALIASES,
+    ACCENT_MODES,
+    ACCENT_MODE_ALIASES,
+    DIARIZERS,
+    DIARIZER_ALIASES,
+    DTYPES,
+    DTYPE_ALIASES,
+    EXPRESSIVE_ACCENTS,
+    EXPRESSIVE_ACCENT_ALIASES,
+    LENGTH_BUDGETS,
+    LENGTH_BUDGET_ALIASES,
+    LOUDNESS_POLICIES,
+    LOUDNESS_POLICY_ALIASES,
+    OVERLAP_MODES,
+    OVERLAP_MODE_ALIASES,
+    OVERLAP_SEPARATORS,
+    OVERLAP_SEPARATOR_ALIASES,
+    PROSODY_PLANS,
+    PROSODY_PLAN_ALIASES,
+    ROOMS,
+    ROOM_ALIASES,
+    SUBTITLES_MODES,
+    SUBTITLES_MODE_ALIASES,
+    TTS_BACKENDS,
+    TTS_BACKEND_ALIASES,
+    AccentBlend,
+    AccentMatch,
+    AccentMode,
+    Defaults,
+    Diarizer,
+    ExpressiveAccent,
+    OverlapMode,
+    Room,
+    SubtitlesMode,
+    TtsBackend,
+)
 
 __all__ = [
     "ACCELERATORS",
@@ -188,46 +228,48 @@ DEFAULT_BUDGET_SPEEDUP = 0.85
 #: with the 46 lines that used the allowance starting a mean 0.12 s late.
 DEFAULT_MAX_OVERRUN = 0.25
 
-#: Accepted spellings for the loudness policy, normalised to two canonical forms.
-_LOUDNESS_POLICIES: dict[str, str] = {
-    "match-source": "match-source",
-    "match_source": "match-source",
-    "match": "match-source",
-    "source": "match-source",
-    "lufs": "lufs",
-    "fixed": "lufs",
-    "absolute": "lufs",
-}
+
+def _normalize_option(
+    value: str,
+    aliases: Mapping[str, str],
+    label: str,
+    supported: tuple[str, ...],
+) -> str:
+    """Map a user spelling onto a canonical option value.
+
+    Args:
+        value: Whatever the caller passed (``--loudness match``, ``"LUFS"``).
+        aliases: Alias table from :mod:`pipeline.options`.
+        label: Option name used in the error, e.g. ``"loudness target"``.
+        supported: Canonical values, in the order the error should list them.
+
+    Returns:
+        One of ``supported``.
+
+    Raises:
+        ConfigError: If the spelling is unknown.
+    """
+    key = str(value).strip().lower().replace("_", "-")
+    try:
+        return aliases[key]
+    except KeyError:
+        raise ConfigError(
+            f"Unknown {label} {value!r}. Use: {', '.join(supported)}"
+        ) from None
 
 
 def normalize_loudness_policy(value: str) -> str:
     """Map a user-supplied loudness policy onto ``match-source`` or ``lufs``."""
-    key = str(value).strip().lower()
-    try:
-        return _LOUDNESS_POLICIES[key]
-    except KeyError:
-        supported = ", ".join(sorted(set(_LOUDNESS_POLICIES.values())))
-        raise ConfigError(f"Unknown loudness target {value!r}. Use: {supported}") from None
-
-
-#: Accepted spellings for how target subtitles reach the video.
-_SUBTITLES_MODES: dict[str, str] = {
-    "soft": "soft", "mux": "soft", "track": "soft", "embed": "soft",
-    "burn": "burn", "burn-in": "burn", "burnin": "burn", "hard": "burn",
-    "hardcode": "burn",
-    "off": "off", "none": "off", "skip": "off",
-}
+    return _normalize_option(
+        value, LOUDNESS_POLICY_ALIASES, "loudness target", LOUDNESS_POLICIES
+    )
 
 
 def normalize_subtitles_mode(value: str) -> str:
     """Map a user-supplied subtitle delivery mode onto soft/burn/off."""
-    key = str(value).strip().lower().replace("_", "-")
-    try:
-        return _SUBTITLES_MODES[key]
-    except KeyError:
-        raise ConfigError(
-            f"Unknown subtitles mode {value!r}. Use: soft, burn or off"
-        ) from None
+    return _normalize_option(
+        value, SUBTITLES_MODE_ALIASES, "subtitles mode", SUBTITLES_MODES
+    )
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -277,12 +319,12 @@ class Settings(BaseModel):
 
     # Loudness policy. "match-source" puts the dub at the level of the track it
     # replaces; "lufs" forces the absolute target below.
-    loudness_target: str = "match-source"
+    loudness_target: str = Defaults.LOUDNESS_POLICY
     target_lufs: float = Field(default=-16.0, ge=-60.0, le=0.0)
 
     # Background preservation.
     keep_background: bool = True
-    separator: str = "auto"
+    separator: str = Defaults.SEPARATOR
     duck_db: float = Field(default=6.0, ge=0.0, le=30.0)
 
     models_dir: Path = Path("models")
@@ -294,7 +336,7 @@ class Settings(BaseModel):
     #: used, so a voice added from a clip costs one encode ever instead of one per
     #: run. Derived data: deleting it only costs that encode again.
     voices_prompt_cache: bool = True
-    log_level: str = "INFO"
+    log_level: str = Defaults.LOG_LEVEL
     log_json: bool = False
     #: Also keep the run log in a file. ``None`` means the job's own folder, which
     #: is what ``dub.py`` defaults to; ``--no-log-file`` writes no file at all.
@@ -397,7 +439,7 @@ class JobConfig(BaseModel):
     #: two runs on the same input never overwrite each other; it is volatile and
     #: therefore excluded from :meth:`fingerprint`.
     job_dir_override: Path | None = None
-    device: str = "auto"
+    device: str = Defaults.DEVICE
     #: Extra devices a single job may spread its synthesis over, e.g.
     #: ``["cuda:0", "cuda:1"]``. Each becomes its own worker process with its own
     #: copy of the checkpoint, so the cards share the *stage*; a model is never
@@ -408,8 +450,8 @@ class JobConfig(BaseModel):
     #: torch dtype for the TTS checkpoint. ``auto`` reads the device's capability:
     #: bfloat16 on Ampere and newer, float16 on older accelerators, float32 on
     #: CPU. An explicit value is honoured unless the device cannot run it.
-    dtype: str = "auto"
-    whisper_model: str = "large-v3"
+    dtype: str = Defaults.DTYPE
+    whisper_model: str = Defaults.WHISPER_MODEL
     llm_model: str | None = None  # overrides Settings.llm_model
     #: Most lines synthesised in one model call. The engine additionally caps a
     #: batch by the audio it predicts, because the checkpoint decodes a whole
@@ -424,12 +466,12 @@ class JobConfig(BaseModel):
     #   "cosyvoice3" -> CosyVoice3: instruct emotion plus inline tokens
     #   "chatterbox" -> Chatterbox: a single exaggeration scalar
     #   "fish"       -> Fish Speech: inline [tag] cues in the line itself
-    tts_backend: str = "qwen"
+    tts_backend: str = Defaults.TTS_BACKEND
     #: Per-line prosody planning for the lines that are synthesised.
     #:   "off"  -> speak neutral, no LLM call
     #:   "llm"  -> plan and fail if the endpoint is unreachable
     #:   "auto" -> plan when the backend supports it, fall back to neutral on error
-    prosody_plan: str = "auto"
+    prosody_plan: str = Defaults.PROSODY_PLAN
     #: Chatterbox tuning. Ignored by every other backend.
     chatterbox_exaggeration: float | None = Field(default=None, ge=0.0, le=1.0)
     chatterbox_cfg_weight: float | None = None
@@ -474,7 +516,7 @@ class JobConfig(BaseModel):
     #              rate, which a language model can actually act on. On by default
     #              because every accent mode now has a target-language reference to
     #              measure the rate from (the accent clip, or the native anchor).
-    length_budget: str = "words"
+    length_budget: str = Defaults.LENGTH_BUDGET
     #: Tempo the word budget is willing to spend on *every* line, i.e. the ceiling
     #: is ``window * delivery_wps / budget_speedup`` words. Deliberately gentler
     #: than ``min_stretch``: most lines then land at or above 0.85 and only the
@@ -493,7 +535,7 @@ class JobConfig(BaseModel):
     # Background preservation (music, ambience, room tone).
     keep_background: bool = True
     #: Separator backend: auto | demucs | none.
-    separator: str = "auto"
+    separator: str = Defaults.SEPARATOR
     #: Attenuation applied to the background while dialogue plays.
     duck_db: float = Field(default=6.0, ge=0.0, le=30.0)
     #: Static offset applied to the background stem (lift or lower the bed).
@@ -505,7 +547,7 @@ class JobConfig(BaseModel):
     #   "off"   -> dry dub over the ducked bed (the long-standing behaviour)
     #   "match" -> reverb, a continuous room-tone floor and a softer duck, all
     #              derived from the separated speech stem
-    room: str = "off"
+    room: str = Defaults.ROOM
     #: RT60 in seconds to use instead of measuring it from the speech stem. An
     #: escape hatch for a source whose decay cannot be estimated (or for A/B tests).
     room_rt60: float | None = Field(default=None, ge=0.05, le=5.0)
@@ -529,12 +571,12 @@ class JobConfig(BaseModel):
     #                         use its own phonetics for the target language
     #   "reference-accent" -> keep the speaker's timbre but take pronunciation and
     #                         prosody from --accent-audio/--accent-text
-    accent_mode: str = "native"
+    accent_mode: str = Defaults.ACCENT_MODE
     #: How ``native`` shapes its anchor.
     #   "off"    -> the plain per-language anchor
     #   "rate"   -> a per-speaker anchor matching the source speaker's rate
     #   "gender" -> the same, plus the source speaker's gender
-    accent_match: str = "off"
+    accent_match: str = Defaults.ACCENT_MATCH
     #: Native target-language clip whose phonetics the dub should adopt. The CLI
     #: also fills this (and ``accent_text``) from ``--accent-voice``, a saved
     #: voice that already stores its clip and transcript together.
@@ -562,13 +604,13 @@ class JobConfig(BaseModel):
     #   "donor" -> clone the source-language donor/pinned clip (current behaviour)
     #   "blend" -> clone the Qwen-built target-language blended reference, which
     #              keeps the speaker's timbre but takes a native target accent
-    expressive_accent: str = "donor"
+    expressive_accent: str = Defaults.EXPRESSIVE_ACCENT
 
     # Speaker separation.
     #   "auto" -> cluster per-segment speaker embeddings, so each voice is cloned
     #             from its own donor (needs the optional funasr dependency)
     #   "none" -> treat the whole video as one speaker, as before
-    diarizer: str = "auto"
+    diarizer: str = Defaults.DIARIZER
     #: Cosine distance at which two voices count as different speakers. ``None``
     #: uses the calibrated default; raise it for similar voices, lower it to split
     #: a speaker the clustering merged.
@@ -587,16 +629,16 @@ class JobConfig(BaseModel):
     # Overlapping speech: a segment that carries two voices at once.
     #   "dominant" -> dub the whole line in its dominant speaker's voice (v1)
     #   "separate" -> split the line, re-transcribe each stream and dub both voices
-    overlap_mode: str = "dominant"
+    overlap_mode: str = Defaults.OVERLAP_MODE
     #: Backend used to split overlapping speech: auto | sepformer | none.
-    overlap_separator: str = "auto"
+    overlap_separator: str = Defaults.OVERLAP_SEPARATOR
 
     keep_subtitles: bool = True
     #: How target subtitles reach the video when the input has one.
     #:   "soft" -> a toggleable subtitle track muxed with the stream copy (default)
     #:   "burn" -> rendered into the frames, which re-encodes the video
     #:   "off"  -> write the SRT sidecars only
-    subtitles_mode: str = "soft"
+    subtitles_mode: str = Defaults.SUBTITLES_MODE
     force: bool = False
 
     @field_validator("loudness_target")
@@ -607,93 +649,32 @@ class JobConfig(BaseModel):
     @field_validator("accent_mode")
     @classmethod
     def _check_accent(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "native": "native",
-            "auto": "native",
-            "generated": "native",
-            "anchor": "native",
-            "preserve": "preserve",
-            "icl": "preserve",
-            "source": "preserve",
-            "speaker-only": "speaker-only",
-            "xvector": "speaker-only",
-            "x-vector": "speaker-only",
-            "speaker": "speaker-only",
-            "reference-accent": "reference-accent",
-            "ref-accent": "reference-accent",
-            "hybrid": "reference-accent",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown accent mode {value!r}. Use: native, preserve, "
-                "speaker-only or reference-accent"
-            ) from None
+        return _normalize_option(
+            value, ACCENT_MODE_ALIASES, "accent mode", ACCENT_MODES
+        )
 
     @field_validator("accent_match")
     @classmethod
     def _check_accent_match(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "off": "off",
-            "none": "off",
-            "false": "off",
-            "rate": "rate",
-            "speed": "rate",
-            "pace": "rate",
-            "gender": "gender",
-            "voice": "gender",
-            "gender,rate": "gender",
-            "rate,gender": "gender",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown accent match {value!r}. Use: off, rate or gender"
-            ) from None
+        return _normalize_option(
+            value, ACCENT_MATCH_ALIASES, "accent match", ACCENT_MATCHES
+        )
 
     @field_validator("accent_blend")
     @classmethod
     def _check_accent_blend(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "two-stage": "two-stage",
-            "two": "two-stage",
-            "blend": "two-stage",
-            "single-stage": "single-stage",
-            "single": "single-stage",
-            "direct": "single-stage",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown accent blend {value!r}. Use: two-stage or single-stage"
-            ) from None
+        return _normalize_option(
+            value, ACCENT_BLEND_ALIASES, "accent blend", ACCENT_BLENDS
+        )
 
     @field_validator("expressive_accent")
     @classmethod
     def _check_expressive_accent(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "donor": "donor",
-            "preserve": "donor",
-            "source": "donor",
-            "blend": "blend",
-            "native": "blend",
-            "anchor": "blend",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown expressive accent {value!r}. Use: donor or blend"
-            ) from None
+        return _normalize_option(
+            value, EXPRESSIVE_ACCENT_ALIASES, "expressive accent", EXPRESSIVE_ACCENTS
+        )
 
     @field_validator("blend_takes")
     @classmethod
@@ -728,23 +709,9 @@ class JobConfig(BaseModel):
     @field_validator("diarizer")
     @classmethod
     def _check_diarizer(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "auto": "auto",
-            "on": "auto",
-            "true": "auto",
-            "embedding": "auto",
-            "none": "none",
-            "off": "none",
-            "false": "none",
-            "single": "none",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown diarizer {value!r}. Use: auto or none"
-            ) from None
+        return _normalize_option(
+            value, DIARIZER_ALIASES, "diarizer", DIARIZERS
+        )
 
     @field_validator("speaker_threshold")
     @classmethod
@@ -761,57 +728,26 @@ class JobConfig(BaseModel):
     @field_validator("overlap_mode")
     @classmethod
     def _check_overlap_mode(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "dominant": "dominant",
-            "keep": "dominant",
-            "off": "dominant",
-            "separate": "separate",
-            "split": "separate",
-            "on": "separate",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown overlap mode {value!r}. Use: dominant or separate"
-            ) from None
+        return _normalize_option(
+            value, OVERLAP_MODE_ALIASES, "overlap mode", OVERLAP_MODES
+        )
 
     @field_validator("overlap_separator")
     @classmethod
     def _check_overlap_separator(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "auto": "auto",
-            "sepformer": "sepformer",
-            "speechbrain": "sepformer",
-            "none": "none",
-            "off": "none",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown overlap separator {value!r}. Use: auto, sepformer or none"
-            ) from None
+        return _normalize_option(
+            value,
+            OVERLAP_SEPARATOR_ALIASES,
+            "overlap separator",
+            OVERLAP_SEPARATORS,
+        )
 
     @field_validator("length_budget")
     @classmethod
     def _check_length_budget(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "off": "off",
-            "none": "off",
-            "seconds": "off",
-            "words": "words",
-            "word": "words",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown length budget {value!r}. Use: off or words"
-            ) from None
+        return _normalize_option(
+            value, LENGTH_BUDGET_ALIASES, "length budget", LENGTH_BUDGETS
+        )
 
     @field_validator("subtitles_mode")
     @classmethod
@@ -821,23 +757,7 @@ class JobConfig(BaseModel):
     @field_validator("room")
     @classmethod
     def _check_room(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "off": "off",
-            "none": "off",
-            "dry": "off",
-            "false": "off",
-            "match": "match",
-            "on": "match",
-            "true": "match",
-            "reverb": "match",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown room mode {value!r}. Use: off or match"
-            ) from None
+        return _normalize_option(value, ROOM_ALIASES, "room mode", ROOMS)
 
     @field_validator("dtype")
     @classmethod
@@ -847,35 +767,16 @@ class JobConfig(BaseModel):
     @field_validator("tts_backend")
     @classmethod
     def _check_tts_backend(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {
-            "qwen": "qwen",
-            "base": "qwen",
-            "cosyvoice": "cosyvoice3",
-            "cosyvoice3": "cosyvoice3",
-            "chatterbox": "chatterbox",
-            "fish": "fish",
-            "fish-speech": "fish",
-        }
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown TTS backend {value!r}. Use: qwen, cosyvoice3, "
-                "chatterbox or fish"
-            ) from None
+        return _normalize_option(
+            value, TTS_BACKEND_ALIASES, "TTS backend", TTS_BACKENDS
+        )
 
     @field_validator("prosody_plan")
     @classmethod
     def _check_prosody_plan(cls, value: str) -> str:
-        key = str(value).strip().lower().replace("_", "-")
-        aliases = {"off": "off", "none": "off", "llm": "llm", "auto": "auto"}
-        try:
-            return aliases[key]
-        except KeyError:
-            raise ConfigError(
-                f"Unknown prosody plan {value!r}. Use: off, llm or auto"
-            ) from None
+        return _normalize_option(
+            value, PROSODY_PLAN_ALIASES, "prosody plan", PROSODY_PLANS
+        )
 
     @field_validator("device")
     @classmethod
@@ -949,14 +850,14 @@ class JobConfig(BaseModel):
             # ICL cloning conditions on the reference transcript, so it is required
             # there. The other modes ignore it: speaker-only drops the codes
             # entirely, and reference-accent takes them from --accent-audio.
-            needs_transcript = self.accent_mode == "preserve"
+            needs_transcript = self.accent_mode == AccentMode.PRESERVE
             if needs_transcript and (self.ref_text is None or not self.ref_text.strip()):
                 raise ConfigError(
                     "--ref-audio requires --ref-text (the exact transcript of the "
                     "reference clip). Omit both to auto-select a donor from the video."
                 )
 
-        if self.accent_mode == "reference-accent":
+        if self.accent_mode == AccentMode.REFERENCE_ACCENT:
             if self.accent_audio is None:
                 raise ConfigError(
                     "--accent-mode reference-accent requires --accent-audio: a clip "
@@ -970,12 +871,12 @@ class JobConfig(BaseModel):
                     "which aligns the accent clip's speech codes. A saved voice "
                     "already carries both: use --accent-voice instead."
                 )
-            if self.accent_match != "off":
+            if self.accent_match != AccentMatch.OFF:
                 raise ConfigError(
                     "--accent-match only applies to --accent-mode native; the supplied "
                     "--accent-audio already fixes the borrowed delivery."
                 )
-        elif self.accent_mode == "native":
+        elif self.accent_mode == AccentMode.NATIVE:
             if self.accent_audio is not None or (self.accent_text or "").strip():
                 raise ConfigError(
                     "--accent-audio only applies to --accent-mode reference-accent; "
@@ -987,26 +888,29 @@ class JobConfig(BaseModel):
                     "--accent-audio only applies to --accent-mode reference-accent; add "
                     "that flag or drop --accent-audio."
                 )
-            if self.accent_match != "off":
+            if self.accent_match != AccentMatch.OFF:
                 raise ConfigError(
                     f"--accent-match only applies to --accent-mode native, not "
                     f"{self.accent_mode!r}."
                 )
 
-        if self.expressive_accent == "blend":
+        if self.expressive_accent == ExpressiveAccent.BLEND:
             if not DUB_BACKENDS[self.tts_backend].expressive:
                 raise ConfigError(
                     "--expressive-accent blend only applies to the expressive "
                     "backends (cosyvoice3, chatterbox, fish); the Qwen path "
                     "already builds the blend."
                 )
-            if self.accent_mode not in ("native", "reference-accent"):
+            if self.accent_mode not in (
+                AccentMode.NATIVE,
+                AccentMode.REFERENCE_ACCENT,
+            ):
                 raise ConfigError(
                     "--expressive-accent blend requires --accent-mode native "
                     "or reference-accent: it needs a target-language accent "
                     "source to blend."
                 )
-            if self.accent_blend_mode != "two-stage":
+            if self.accent_blend_mode != AccentBlend.TWO_STAGE:
                 raise ConfigError(
                     "--expressive-accent blend requires --accent-blend "
                     "two-stage: single-stage leaves no clip for the backend "
@@ -1019,7 +923,10 @@ class JobConfig(BaseModel):
         # the CLI passes every flag explicitly, so a default of ``None`` would
         # otherwise look like a request and reject the plain
         # `dub.py --video in.mp4 --target fr`.
-        if self.accent_mode not in ("native", "reference-accent"):
+        if self.accent_mode not in (
+            AccentMode.NATIVE,
+            AccentMode.REFERENCE_ACCENT,
+        ):
             for field_name, flag in (
                 ("accent_blend", "--accent-blend"),
                 ("blend_takes", "--blend-takes"),
@@ -1043,7 +950,7 @@ class JobConfig(BaseModel):
         the accent codes and the donor embedding simultaneously, which leaves a
         line free to follow either signal.
         """
-        return self.accent_blend or "two-stage"
+        return self.accent_blend or Defaults.ACCENT_BLEND
 
     @property
     def resolved_blend_takes(self) -> int:
@@ -1084,17 +991,17 @@ class JobConfig(BaseModel):
     @property
     def overlap_separation(self) -> bool:
         """True when overlapping speech should be split into two voices."""
-        return self.overlap_mode == "separate"
+        return self.overlap_mode == OverlapMode.SEPARATE
 
     @property
     def multi_speaker(self) -> bool:
         """True when the job asked for speaker separation."""
-        return self.diarizer != "none"
+        return self.diarizer != Diarizer.NONE
 
     @property
     def room_matching(self) -> bool:
         """True when the dub should be placed in the source's acoustic space."""
-        return self.room == "match"
+        return self.room == Room.MATCH
 
     @property
     def resolved_devices(self) -> list[str]:
@@ -1169,7 +1076,7 @@ class JobConfig(BaseModel):
         # Subtitle embedding only affects the final mux, not a cached stage. A job
         # that keeps the historical default therefore hashes exactly what it did
         # before the field existed; only an explicit burn/off re-runs the stages.
-        if payload.get("subtitles_mode") == "soft":
+        if payload.get("subtitles_mode") == SubtitlesMode.SOFT:
             payload.pop("subtitles_mode", None)
         # A run that does not spread its work over several cards hashes exactly
         # what it hashed before the field existed, so adding it invalidates no
@@ -1200,16 +1107,16 @@ class SubtitleJobConfig(BaseModel):
     target_language: str = "French"
     source_language: str | None = None  # None -> auto-detect
 
-    whisper_model: str = "large-v3"
+    whisper_model: str = Defaults.WHISPER_MODEL
     llm_model: str | None = None  # overrides Settings.llm_model
-    device: str = "auto"
+    device: str = Defaults.DEVICE
     output_dir: Path = Path("output")
     #: Explicit folder for this run's artifacts. ``None`` derives
     #: ``<output_dir>/<stem>-subtitles``; the API sets it for unique runs.
     job_dir_override: Path | None = None
     #: How the subtitle reaches the video: soft (default), burn, or off
     #: (sidecar SRT only).
-    subtitles_mode: str = "soft"
+    subtitles_mode: str = Defaults.SUBTITLES_MODE
     #: Longest a cue's text may be before it is split, in characters.
     max_chars: int = Field(default=42, ge=10, le=200)
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
@@ -1325,18 +1232,7 @@ _BF16_MIN_CAPABILITY: dict[str, tuple[int, int]] = {"cuda": (8, 0), "rocm": (9, 
 _FP16_MIN_CAPABILITY: dict[str, tuple[int, int]] = {"cuda": (7, 0), "rocm": (7, 0)}
 
 #: Accepted spellings of a dtype, for ``--dtype`` and for ``JobConfig.dtype``.
-DTYPE_ALIASES: dict[str, str] = {
-    "auto": "auto",
-    "bf16": "bf16",
-    "bfloat16": "bf16",
-    "fp16": "fp16",
-    "float16": "fp16",
-    "half": "fp16",
-    "fp32": "fp32",
-    "float32": "fp32",
-    "full": "fp32",
-}
-
+# Re-exported from :mod:`pipeline.options`, which owns the vocabulary.
 #: Canonical dtype name -> ``torch`` attribute.
 _DTYPE_ATTRIBUTES: dict[str, str] = {
     "bf16": "bfloat16",
@@ -1600,13 +1496,9 @@ def preferred_dtype(info: DeviceInfo) -> str:
 
 def normalize_dtype(value: str | None) -> str:
     """Canonicalise a dtype spelling, raising ``ConfigError`` for nonsense."""
-    key = str(value or "auto").strip().lower()
-    try:
-        return DTYPE_ALIASES[key]
-    except KeyError:
-        raise ConfigError(
-            f"Unknown dtype {value!r}. Use: auto, bf16, fp16 or fp32"
-        ) from None
+    return _normalize_option(
+        str(value or Defaults.DTYPE), DTYPE_ALIASES, "dtype", DTYPES
+    )
 
 
 def normalize_device_request(value: str | None) -> str:

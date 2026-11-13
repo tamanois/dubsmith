@@ -22,6 +22,13 @@ from .errors import ConfigError, TTSError
 from .logging_utils import job_logger, timed
 from .media import load_audio, write_audio
 from .models import model_fingerprint, resolve_model
+from .options import (
+    FishTagMode,
+    SayBackend,
+    SayProsodyPlan,
+    StylePlan,
+    StylePlanScope,
+)
 from .provenance import (
     LineProvenance,
     NullRecorder,
@@ -161,26 +168,29 @@ def validate_say_spec(spec: SaySpec) -> None:
         )
     if not spec.text or not spec.text.strip():
         raise ConfigError("Text cannot be empty.")
-    if spec.style_instructs and spec.backend != "customvoice":
+    if spec.style_instructs and spec.backend != SayBackend.CUSTOMVOICE:
         raise ConfigError(
             "--style-instruct is only valid with --backend customvoice; the other "
             "backends take --prosody/--emotion (and --design already accepts a "
             "free-form prompt)."
         )
-    if spec.style_plan != "off" and spec.backend != "customvoice":
+    if spec.style_plan != StylePlan.OFF and spec.backend != SayBackend.CUSTOMVOICE:
         raise ConfigError(
             "--style-plan is only valid with --backend customvoice; the other "
             "backends use --prosody-plan llm for structured prosody."
         )
-    if spec.style_plan_scope != "per-line" and spec.style_plan != "llm":
+    if (
+        spec.style_plan_scope != StylePlanScope.PER_LINE
+        and spec.style_plan != StylePlan.LLM
+    ):
         raise ConfigError("--style-plan-scope only applies with --style-plan llm.")
-    if spec.fish_tag_mode != "keep" and spec.backend != "fish":
+    if spec.fish_tag_mode != FishTagMode.KEEP and spec.backend != SayBackend.FISH:
         raise ConfigError("--fish-tag-mode is only valid with --backend fish.")
-    if spec.fish_quantize is not None and spec.backend != "fish":
+    if spec.fish_quantize is not None and spec.backend != SayBackend.FISH:
         raise ConfigError("--fish-quantize is only valid with --backend fish.")
-    if spec.fish_temperature is not None and spec.backend != "fish":
+    if spec.fish_temperature is not None and spec.backend != SayBackend.FISH:
         raise ConfigError("--fish-temperature is only valid with --backend fish.")
-    if spec.fish_top_p is not None and spec.backend != "fish":
+    if spec.fish_top_p is not None and spec.backend != SayBackend.FISH:
         raise ConfigError("--fish-top-p is only valid with --backend fish.")
     conflict = say_prosody_conflict(
         spec.backend,
@@ -190,7 +200,7 @@ def validate_say_spec(spec: SaySpec) -> None:
     )
     if conflict:
         raise ConfigError(conflict)
-    if spec.backend == "customvoice":
+    if spec.backend == SayBackend.CUSTOMVOICE:
         if not spec.speaker:
             raise ConfigError(
                 "--backend customvoice needs --speaker (a preset voice, e.g. "
@@ -210,7 +220,7 @@ def validate_say_spec(spec: SaySpec) -> None:
             "One of --voice, --design or --clone is required (unless --backend "
             "customvoice, which needs --speaker)."
         )
-    if spec.fish_tag_mode == "keep" and spec.backend == "fish":
+    if spec.fish_tag_mode == FishTagMode.KEEP and spec.backend == SayBackend.FISH:
         for index, line in enumerate(_say_lines(spec.text), start=1):
             token = prosody.fish_structural_token(line)
             if token:
@@ -273,19 +283,19 @@ def _emit(event: Event | None, kind: str, **payload: Any) -> None:
 
 
 def _say_plan_source(spec: SaySpec) -> str:
-    if spec.backend == "customvoice":
-        if spec.style_plan == "llm":
+    if spec.backend == SayBackend.CUSTOMVOICE:
+        if spec.style_plan == StylePlan.LLM:
             return "llm"
         if spec.style_instructs or spec.prosody or spec.emotions:
             return "manual"
         return "off"
-    if spec.fish_tag_mode == "llm":
+    if spec.fish_tag_mode == FishTagMode.LLM:
         return "llm"
-    if spec.prosody_plan == "llm":
+    if spec.prosody_plan == SayProsodyPlan.LLM:
         return "llm"
     if spec.prosody or spec.emotions:
         return "manual"
-    if spec.backend == "fish":
+    if spec.backend == SayBackend.FISH:
         return "manual"
     return "off"
 
@@ -324,7 +334,7 @@ def _resolve_prosody_specs(
     recorder: Any | None = None,
 ) -> list[Any]:
     specs = [prosody.ProsodySpec() for _ in lines]
-    if plan == "llm":
+    if plan == SayProsodyPlan.LLM:
         planner = prosody.ProsodyPlanner(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
@@ -454,11 +464,11 @@ def render_speech(
     started = time.perf_counter()
     _emit(event, "stage_start", stage="say", backend=spec.backend)
 
-    if spec.backend == "customvoice":
+    if spec.backend == SayBackend.CUSTOMVOICE:
         result = _render_customvoice(
             spec, settings, models_root, name, lines, emotions, logger
         )
-    elif spec.backend == "qwen":
+    elif spec.backend == SayBackend.QWEN:
         result = _render_qwen(
             spec, settings, models_root, root, name, lines, logger
         )
@@ -639,9 +649,9 @@ def _render_customvoice(
         else NullRecorder()
     )
     if spec.style_instructs:
-        if spec.style_plan != "off":
+        if spec.style_plan != StylePlan.OFF:
             log.warning("--style-instruct overrides --style-plan for this run.")
-        if spec.prosody or emotions or spec.prosody_plan != "off":
+        if spec.prosody or emotions or spec.prosody_plan != SayProsodyPlan.OFF:
             log.warning(
                 "--style-instruct overrides --prosody/--emotion/--prosody-plan "
                 "for this run."
@@ -654,8 +664,8 @@ def _render_customvoice(
         assert instructs is not None
         specs = None
         mode = "verbatim"
-    elif spec.style_plan == "llm":
-        if spec.prosody or emotions or spec.prosody_plan != "off":
+    elif spec.style_plan == StylePlan.LLM:
+        if spec.prosody or emotions or spec.prosody_plan != SayProsodyPlan.OFF:
             log.warning(
                 "--style-plan overrides --prosody/--emotion/--prosody-plan for "
                 "this run."
@@ -769,7 +779,7 @@ def _resolve_expressive_reference(
         return saved.wav, saved.label, language, saved.ref_text or None
     if spec.clone is not None:
         language = normalize_language(spec.language) if spec.language else None
-        if spec.backend == "chatterbox" and language is None:
+        if spec.backend == SayBackend.CHATTERBOX and language is None:
             raise ConfigError(
                 "language is required with backend 'chatterbox' when the voice is "
                 "cloned inline."
@@ -820,7 +830,7 @@ def _render_expressive(
         language or "auto",
         len(lines),
     )
-    if spec.backend == "fish" and spec.fish_tag_mode == "llm":
+    if spec.backend == SayBackend.FISH and spec.fish_tag_mode == FishTagMode.LLM:
         planner = prosody.FishInlinePlanner(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
@@ -831,7 +841,7 @@ def _render_expressive(
         )
         tagged = planner.plan_lines(lines, language=language)
         spoken = tagged
-    elif spec.backend == "fish":
+    elif spec.backend == SayBackend.FISH:
         checked: list[str] = []
         for index, text in enumerate(lines, start=1):
             for problem in prosody.validate_fish_inline_text(text):
@@ -864,7 +874,7 @@ def _render_expressive(
         log, f"Synthesised {len(spoken)} line(s)", lines=len(spoken),
         backend=spec.backend,
     ):
-        if spec.backend == "fish":
+        if spec.backend == SayBackend.FISH:
             rendered = engine.synthesize(
                 spoken,
                 reference=reference,
@@ -872,7 +882,7 @@ def _render_expressive(
                 language=language,
                 trace=trace,
             )
-        elif spec.backend == "chatterbox":
+        elif spec.backend == SayBackend.CHATTERBOX:
             rendered = engine.synthesize(
                 spoken,
                 reference=reference,

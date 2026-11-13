@@ -14,6 +14,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Mapping
 
+from .options import (
+    EXPRESSIVE_BACKENDS,
+    SAY_BACKENDS as SAY_BACKEND_IDS,
+    TTS_BACKENDS as TTS_BACKEND_IDS,
+    Defaults,
+)
+
 __all__ = [
     "BackendCapabilities",
     "DUB_BACKENDS",
@@ -22,10 +29,6 @@ __all__ = [
     "capabilities_payload",
     "say_prosody_conflict",
 ]
-
-#: Backends that render a :class:`~pipeline.prosody.ProsodySpec` (or inline tags)
-#: instead of the plain Qwen Base clone. They all clone from a reference clip.
-EXPRESSIVE_BACKENDS: tuple[str, ...] = ("cosyvoice3", "chatterbox", "fish")
 
 _SOURCES: tuple[str, ...] = ("voice", "design", "clone")
 
@@ -167,6 +170,29 @@ DUB_BACKENDS: dict[str, BackendCapabilities] = {
 }
 
 
+def _check_backend_ids() -> None:
+    """Keep the capability tables and the option vocabulary in step.
+
+    :mod:`pipeline.options` owns the spelling of every backend id; the tables
+    above own what each backend can do. A rename that updates only one of them
+    would offer an option no table describes, so fail at import rather than at
+    the first request that names it.
+    """
+    if tuple(SAY_BACKENDS) != SAY_BACKEND_IDS:
+        raise RuntimeError(
+            "Say backends disagree: pipeline.options.SAY_BACKENDS is "
+            f"{SAY_BACKEND_IDS}, the capability table has {tuple(SAY_BACKENDS)}."
+        )
+    if tuple(DUB_BACKENDS) != TTS_BACKEND_IDS:
+        raise RuntimeError(
+            "Dub backends disagree: pipeline.options.TTS_BACKENDS is "
+            f"{TTS_BACKEND_IDS}, the capability table has {tuple(DUB_BACKENDS)}."
+        )
+
+
+_check_backend_ids()
+
+
 def capabilities_payload() -> dict[str, list[dict[str, object]]]:
     """The JSON shape ``GET /api/backends`` returns, one group per job kind."""
     return {
@@ -180,7 +206,7 @@ def say_prosody_conflict(
     *,
     prosody: object = None,
     emotions: object = None,
-    prosody_plan: str | None = "off",
+    prosody_plan: str | None = Defaults.SAY_PROSODY_PLAN,
 ) -> str | None:
     """Why this backend cannot take the given prosody fields, or ``None``.
 
@@ -190,6 +216,7 @@ def say_prosody_conflict(
     caps = SAY_BACKENDS.get(backend)
     if caps is None or caps.prosody:
         return None
-    if not prosody and not emotions and (prosody_plan or "off") == "off":
+    plan = prosody_plan or Defaults.SAY_PROSODY_PLAN
+    if not prosody and not emotions and plan == Defaults.SAY_PROSODY_PLAN:
         return None
     return caps.unsupported.get("prosody")

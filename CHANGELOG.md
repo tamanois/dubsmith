@@ -18,7 +18,7 @@ All notable changes to this project are documented here. The format follows
   `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
   structured device/environment reports and an optional stage-event hook on the
   dubbing and subtitles pipelines.
-- Frontend regression tests (Vitest + Testing Library, 185 tests) cover the API
+- Frontend regression tests (Vitest + Testing Library, 248 tests) cover the API
   wrapper and SSE reconnect, the UI primitives, uploads, live job logs,
   cancellation, retry/edit/compare and filtering, pagination and bulk actions on
   every list, model deletion, playback, presets, recent/favorite inputs, settings
@@ -50,6 +50,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Option values now have a single declaration. `pipeline/options.py` owns every
+  accepted value, its aliases and its default; the CLI's `argparse` choices, the
+  config validators, the API request schemas and the web forms all read from it,
+  and backend ids and labels come from `GET /api/backends`. The browser mirrors
+  the vocabulary in `web/src/options.ts`, which derives every dropdown from the
+  declaration. Renaming or adding a value is a two-file change instead of a
+  search across every form, flag and validator; `tests/test_options.py` and
+  `web/test/options.test.ts` fail when the copies disagree. No user-visible value
+  changed.
 - Main outputs are now named after the input stem (`talk_dubbed.mp4`,
   `talk_dubbed.wav`, `talk_subtitled.mp4`) instead of the generic
   `video_dubbed.mp4` / `dub.wav`, so a run folder is self-describing. The app's
