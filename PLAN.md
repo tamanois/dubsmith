@@ -18,7 +18,7 @@
 | Area | Status | Where |
 |---|---|---|
 | CLI + model download | ✅ | `dub.py` (`models --list/--download`, `--video/--audio`) |
-| Local browser UI + HTTP API | ✅ | `server/` (FastAPI, SQLite jobs, SSE), `web/` (React), `docs/web-ui.md` |
+| Local browser UI + HTTP API | ✅ | `server/` (FastAPI, SQLite jobs, SSE), `web/` (React), documented in `docs/usage.md#the-app` and `docs/reference.md#http-api` |
 | Config, env, languages | ✅ | `pipeline/config.py` |
 | Model registry / resolution | ✅ | `pipeline/models.py` |
 | Media (ffmpeg, loudness, SRT) | ✅ | `pipeline/media.py`, `pipeline/subtitles.py` |
@@ -39,7 +39,10 @@
 | Expressive native accent (`--expressive-accent blend`) | ✅ | `pipeline/orchestrate.py`, `pipeline/cosyvoice.py`, `--expressive-accent` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1501 tests (all passed) | `tests/` |
+| Tests | ✅ 1595 tests (all passed) | `tests/` |
+
+<details>
+<summary><strong>Verification log</strong> — the measurements behind the status above</summary>
 
 Verification performed:
 
@@ -1495,6 +1498,8 @@ above is not read as "finished".
 - `structlog`/`Loguru` are not used (stdlib logging), but every record already carries
   a `job_id` via `pipeline/logging_utils.py`.
 
+</details>
+
 ---
 
 ## 1. Vision (from AGENTS.md)
@@ -1515,7 +1520,7 @@ voice timbre**, ideally with the **target language's accent**.
 |---|-------|----------|-----------|
 | D1 | Native target accent | **Nice-to-have**, not MVP | Doubles voice-pipeline complexity (needs a voice-conversion stage) |
 | D2 | Source language(s) | **Single language** for MVP; per-utterance LID later | Simpler; leave hooks for multi-source-lang videos |
-| D3 | Product shape | **A tool** (local CLI), not a service | No FastAPI/Celery/billing in MVP; design module boundaries so service-ification is a wrapping exercise later |
+| D3 | Product shape | **CLI plus a local single-user app**, not a hosted service | The browser app and HTTP API wrap the same `pipeline/`; no accounts, billing, remote workers or Celery. Multi-user work stays behind the existing `user_id` / `JobExecutor` / input-validator seams |
 | D4 | First target language | **French** | User's native voice asset + test corpus |
 | D5 | Speakers | **Single speaker** in MVP | Diarization is P1 |
 | D6 | Lip sync | **Out of MVP** (dub audio only) | Most expensive stage (~10–60× real-time) |
@@ -1538,6 +1543,9 @@ voice timbre**, ideally with the **target language's accent**.
 ---
 
 ## 3. MVP
+
+<details>
+<summary><strong>MVP scope and CLI spec</strong> — implemented; live flags are in <code>docs/reference.md</code></summary>
 
 ### 3.1 Scope
 
@@ -1914,6 +1922,8 @@ Optional backends are extras: `pip install ".[background]"` (Demucs, keeps music
 and ambience), `".[diarization]"` (funasr, per-speaker voices), `".[separation]"`
 (SpeechBrain, splits overlapping speakers), `".[gpu-asr]"` (CUDA 12 runtime for
 faster-whisper), or `".[full]"` for all of them.
+
+</details>
 
 ---
 

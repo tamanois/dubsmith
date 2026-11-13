@@ -30,10 +30,15 @@ faked.
 python -m pytest
 python -m pytest tests/test_provenance.py -q
 python -m pytest tests/test_cli_smoke.py -q
+python -m pytest tests/test_server.py -q      # API, jobs, uploads, presets
+python -m pytest tests/test_docs.py -q        # docs match flags, routes and links
+
+cd web && npm test         # Vitest + Testing Library
+cd web && npm run build    # tsc --noEmit and the production build
 ```
 
 Optional backends live in separate environments. See
-[Setup → Optional expressive backends](docs/setup.md) and
+[Getting started → optional backends](docs/getting-started.md) and
 [Voices](docs/voices.md). Their tests skip when the dependency is absent.
 
 ## DCO sign-off
@@ -51,20 +56,28 @@ The `Signed-off-by` line certifies the Developer Certificate of Origin 1.1 in
 
 When behavior changes, update the docs in the same change:
 
-- `README.md` for user-visible capabilities and commands.
-- `docs/options.md` for flags and defaults.
-- `docs/voices.md` / `docs/voice-generation.md` for voice, backend, and emotion
-  behavior.
-- `docs/outputs-and-caching.md` for artifacts and `report.json` fields.
-- `docs/troubleshooting.md` for new error messages.
+- `README.md` for user-visible capabilities, commands and both surfaces.
+- `docs/reference.md` for flags, defaults, environment variables and HTTP routes.
+- `docs/usage.md` for the app's pages and the command chooser.
+- `docs/voices.md` for voice, backend, emotion and accent behavior.
+- `docs/dub-quality.md` for speakers, timing, room and length repair.
+- `docs/outputs-and-caching.md` for artifacts, `report.json` fields and the audit tools.
+- `docs/troubleshooting.md` for new error messages, in the app as well as the CLI.
+- `docs/README.md` when a page is added, merged or renamed.
 - `PLAN.md` for roadmap/status changes.
 
-Do not claim a capability in the README unless there is a CLI flag, a test, or a
-documented module that implements it.
+`tests/test_docs.py` fails when a flag, an HTTP route or a doc link is missing or
+orphaned, so run it while writing docs: `python -m pytest tests/test_docs.py -q`.
+
+Do not claim a capability in the README unless there is a CLI flag, an API route,
+a test, or a documented module that implements it.
 
 ## Code expectations
 
-- Keep the existing flat `pipeline/` layout; do not introduce a web service.
+- Keep the existing flat `pipeline/` layout. `server/` and `web/` are thin layers
+  over it: they call `pipeline/` and never reimplement media, TTS or translation
+  logic. No new service, queue or worker model without a decision logged in
+  `PLAN.md`.
 - Prefer pure functions for data transforms; isolate model/ffmpeg work behind
   the existing engine/protocol boundaries.
 - Use pydantic for configuration and domain errors for user-facing failures.

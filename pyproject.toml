@@ -26,6 +26,7 @@ keywords = [
     "voice-design",
     "emotion",
     "whisper",
+    "web-ui",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -33,6 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Environment :: Console",
+    "Environment :: Web Environment",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
