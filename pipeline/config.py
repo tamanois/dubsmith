@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .capabilities import DUB_BACKENDS
 from .diarize import DEFAULT_THRESHOLD
 from .errors import ConfigError
 from .mixing import (
@@ -51,6 +53,16 @@ __all__ = [
     "Settings",
     "read_env_file",
 ]
+
+#: The API stores uploads as ``<32-hex uuid>__<original name>``. Deliverables are
+#: named after the original name, so the internal prefix never reaches the user.
+_UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{32}__")
+
+
+def _deliverable_stem(path: Path) -> str:
+    """The input's file stem without the API's upload-uuid prefix."""
+    stem = path.stem
+    return _UPLOAD_PREFIX.sub("", stem) or stem
 
 
 # --------------------------------------------------------------------------- #
@@ -380,6 +392,11 @@ class JobConfig(BaseModel):
     ref_prompt_seconds: float = 0.0
 
     output_dir: Path = Path("output")
+    #: Explicit folder for this run's artifacts. ``None`` derives it from
+    #: ``output_dir`` and the input stem (the CLI behaviour). The API sets it so
+    #: two runs on the same input never overwrite each other; it is volatile and
+    #: therefore excluded from :meth:`fingerprint`.
+    job_dir_override: Path | None = None
     device: str = "auto"
     #: Extra devices a single job may spread its synthesis over, e.g.
     #: ``["cuda:0", "cuda:1"]``. Each becomes its own worker process with its own
@@ -912,6 +929,7 @@ class JobConfig(BaseModel):
         "ref_prompt",
         "accent_audio",
         "output_dir",
+        "job_dir_override",
     )
     @classmethod
     def _expand(cls, value: Path | None) -> Path | None:
@@ -976,7 +994,7 @@ class JobConfig(BaseModel):
                 )
 
         if self.expressive_accent == "blend":
-            if self.tts_backend == "qwen":
+            if not DUB_BACKENDS[self.tts_backend].expressive:
                 raise ConfigError(
                     "--expressive-accent blend only applies to the expressive "
                     "backends (cosyvoice3, chatterbox, fish); the Qwen path "
@@ -1110,12 +1128,25 @@ class JobConfig(BaseModel):
         return path
 
     @property
+    def output_stem(self) -> str:
+        """The input's plain stem, for naming deliverables.
+
+        Uploads are stored as ``<uuid>__<original>`` to avoid collisions; the
+        delivered files use the original name, not that internal prefix.
+        """
+        return _deliverable_stem(self.input_path)
+
+    @property
     def job_dir(self) -> Path:
-        """Folder this job's artifacts live in: one per input stem.
+        """Folder this job's artifacts live in.
 
         Kept here so the pipeline and anything that has to find a job's files
         beforehand - the run log, for one - cannot disagree about where they are.
+        An explicit :attr:`job_dir_override` wins; otherwise one folder per input
+        stem, which is what the CLI has always used.
         """
+        if self.job_dir_override is not None:
+            return self.job_dir_override
         return self.output_dir / self.input_path.stem
 
     @property
@@ -1133,7 +1164,7 @@ class JobConfig(BaseModel):
         import json
 
         payload = self.model_dump(mode="json")
-        for volatile in ("output_dir", "force"):
+        for volatile in ("output_dir", "job_dir_override", "force"):
             payload.pop(volatile, None)
         # Subtitle embedding only affects the final mux, not a cached stage. A job
         # that keeps the historical default therefore hashes exactly what it did
@@ -1173,6 +1204,9 @@ class SubtitleJobConfig(BaseModel):
     llm_model: str | None = None  # overrides Settings.llm_model
     device: str = "auto"
     output_dir: Path = Path("output")
+    #: Explicit folder for this run's artifacts. ``None`` derives
+    #: ``<output_dir>/<stem>-subtitles``; the API sets it for unique runs.
+    job_dir_override: Path | None = None
     #: How the subtitle reaches the video: soft (default), burn, or off
     #: (sidecar SRT only).
     subtitles_mode: str = "soft"
@@ -1181,7 +1215,7 @@ class SubtitleJobConfig(BaseModel):
     no_speech_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     force: bool = False
 
-    @field_validator("video", "audio", "output_dir")
+    @field_validator("video", "audio", "output_dir", "job_dir_override")
     @classmethod
     def _expand(cls, value: Path | None) -> Path | None:
         return value.expanduser() if value is not None else None
@@ -1216,12 +1250,20 @@ class SubtitleJobConfig(BaseModel):
         return path
 
     @property
+    def output_stem(self) -> str:
+        """The input's plain stem, for naming deliverables."""
+        return _deliverable_stem(self.input_path)
+
+    @property
     def job_dir(self) -> Path:
         """Folder this job's artifacts live in.
 
-        Named ``<stem>-subtitles`` rather than ``<stem>`` so a subtitles-only run
-        cannot overwrite a dubbing job's SRT or transcript.
+        An explicit :attr:`job_dir_override` wins. Otherwise it is named
+        ``<stem>-subtitles`` rather than ``<stem>`` so a subtitles-only run cannot
+        overwrite a dubbing job's SRT or transcript.
         """
+        if self.job_dir_override is not None:
+            return self.job_dir_override
         return self.output_dir / f"{self.input_path.stem}-subtitles"
 
     @property
@@ -1245,7 +1287,7 @@ class SubtitleJobConfig(BaseModel):
         import json
 
         payload = self.model_dump(mode="json")
-        for volatile in ("output_dir", "force"):
+        for volatile in ("output_dir", "job_dir_override", "force"):
             payload.pop(volatile, None)
         blob = json.dumps(payload, sort_keys=True).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()[:16]

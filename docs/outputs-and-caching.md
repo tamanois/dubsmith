@@ -31,8 +31,8 @@ output/talk/
 ├── 05_mix.wav           # assembled dub track, before normalisation
 ├── 05_room.json         # only with --room match: the decay measured and levels used
 ├── timing.json          # per-segment stretch ratio, placement and deficit
-├── dub.wav              # final loudness-normalised dub audio
-├── video_dubbed.mp4     # dubbed video (video input only)
+├── <input>_dubbed.wav   # final loudness-normalised dub audio
+├── <input>_dubbed.mp4   # dubbed video (video input only)
 ├── subs_source.srt
 ├── subs_target.srt
 ├── report.json          # counts, loudness, stretch stats, stage timings
@@ -40,6 +40,11 @@ output/talk/
 ├── run.log              # the log from stderr, appended across runs
 └── run-20260929-070308.log    # only once it passes --log-max-bytes
 ```
+
+The deliverables are named after the input stem, so a run folder is
+self-describing: `talk.mp4` yields `talk_dubbed.mp4` (or `talk_dubbed.wav` for an
+audio input), and the subtitles-only mode writes `talk_subtitled.mp4` (or
+`talk_burned.mp4` with `--subtitles-mode burn`).
 
 `prosody.json` is the emotion record: for every segment it states the planned text,
 the text actually spoken, the effective `ProsodySpec`, and the exact tokens/tags

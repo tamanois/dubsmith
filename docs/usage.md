@@ -49,7 +49,7 @@ python dub.py models --list                          # what is present already?
 # video -> dubbed video, source language auto-detected
 python dub.py --video talk.mp4 --target fr
 
-# audio only: no ffmpeg needed, writes dub.wav + subtitles
+# audio only: no ffmpeg needed, writes <input>_dubbed.wav + subtitles
 python dub.py --audio interview.wav --target es
 
 # trust your own language detection instead of Whisper's

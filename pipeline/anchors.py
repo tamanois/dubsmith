@@ -38,6 +38,7 @@ __all__ = [
     "AnchorSpec",
     "anchor_paths",
     "ensure_anchor",
+    "generate_anchors",
     "instruct_for",
     "list_anchors",
     "measure_gender",
@@ -338,6 +339,64 @@ def ensure_anchor(
         samples.size / float(sample_rate or 1),
     )
     return wav, txt
+
+
+def generate_anchors(
+    anchor_dir: Path | str,
+    models_dir: Path | str,
+    languages: Sequence[str],
+    *,
+    device: str = "auto",
+    dtype: str = "auto",
+    force: bool = False,
+    event: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Generate the requested accent anchors, reusing cached ones.
+
+    Returns one record per language with the file path and duration. The engine is
+    built once and released afterwards; the caller sees stage events when it
+    supplies an observer.
+    """
+    from .config import pick_dtype, release_gpu_memory
+    from .models import resolve_model
+    from .tts import VoiceDesignEngine
+
+    engine = VoiceDesignEngine(
+        resolve_model("tts_voice_design", models_dir),
+        device=device,
+        dtype=pick_dtype(device, dtype),
+    )
+    results: list[dict[str, Any]] = []
+    try:
+        for language in languages:
+            if event is not None:
+                event("stage_start", {"stage": f"anchor:{language}"})
+            wav, transcript_path = ensure_anchor(
+                anchor_dir,
+                AnchorSpec(language),
+                lambda: engine,
+                force=force,
+            )
+            try:
+                import soundfile as sf
+
+                info = sf.info(str(wav))
+                seconds = float(info.frames) / float(info.samplerate or 1)
+            except Exception:  # noqa: BLE001 - duration is informational only
+                seconds = 0.0
+            results.append(
+                {
+                    "language": language,
+                    "path": str(wav),
+                    "seconds": round(seconds, 2),
+                    "transcript_path": str(transcript_path),
+                }
+            )
+            if event is not None:
+                event("stage_end", {"stage": f"anchor:{language}"})
+    finally:
+        release_gpu_memory()
+    return results
 
 
 def list_anchors(anchor_dir: Path | str) -> list[tuple[str, Path, float]]:

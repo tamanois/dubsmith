@@ -11,6 +11,12 @@ ruff
 build
 twine
 
+# Web API tests (the runtime UI dependencies are the `web` extra in pyproject).
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+httpx
+
 # The optional multi-speaker backend, so the diarization path is covered here
 # rather than silently skipped. See requirements.txt for the constraints note.
 funasr

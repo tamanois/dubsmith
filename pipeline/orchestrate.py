@@ -158,7 +158,11 @@ _MIX_NAME = "05_mix.wav"
 #: What the room-matching pass did, beside the mix it describes. A sidecar so a
 #: cached mix still reports it, exactly as ``blend.json`` does for the blend.
 _ROOM_NAME = "05_room.json"
-_DUB_TRACK_NAME = "dub.wav"
+#: The delivered artifacts are named after the input, so a run folder is
+#: self-describing (``talk_dubbed.mp4`` rather than a generic ``video_dubbed``).
+_DUB_TRACK_SUFFIX = "_dubbed.wav"
+_DUBBED_VIDEO_SUFFIX = "_dubbed.mp4"
+_BURNED_VIDEO_SUFFIX = "_burned.mp4"
 _REPORT_NAME = "report.json"
 _MANIFEST_NAME = "manifest.json"
 _TMP_DIR = "tmp"
@@ -359,9 +363,13 @@ class Pipeline:
         speaker_separator: Any | None = None,
         stream_transcriber: Callable[[Path], Transcript] | None = None,
         stretcher_preference: str = "auto",
+        event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.job = job
         self.settings = settings or Settings.from_env()
+        #: Optional observer for stage transitions. The API uses it to stream
+        #: progress; the CLI leaves it ``None`` and nothing changes.
+        self._event = event
         self.input_path = job.input_path
         self.stem = self.input_path.stem
         self.job_dir = job.job_dir
@@ -587,13 +595,24 @@ class Pipeline:
 
     # -- stage plumbing ---------------------------------------------------- #
 
+    def _emit(self, kind: str, **payload: Any) -> None:
+        """Notify the optional observer, never letting it break the run."""
+        if self._event is None:
+            return
+        try:
+            self._event(kind, payload)
+        except Exception:  # noqa: BLE001 - an observer must not fail a job
+            self.log.debug("Stage observer failed for %s", kind, exc_info=True)
+
     def _stage(self, name: str, outputs: Sequence[Path], func: Callable[[], Any]) -> Any:
         """Run a stage unless it is already cached; record timing either way."""
         if self.manifest.is_done(name, outputs) and not self.job.force:
             self.log.info("Stage %s: cached", name, extra={"stage": name})
+            self._emit("stage_cached", stage=name)
             return None
 
         self.log.info("Stage %s: running", name, extra={"stage": name})
+        self._emit("stage_start", stage=name)
         started = time.perf_counter()
         try:
             result = func()
@@ -605,6 +624,7 @@ class Pipeline:
                 elapsed,
                 extra={"stage": name, "seconds": round(elapsed, 3)},
             )
+            self._emit("stage_failed", stage=name, seconds=round(elapsed, 3))
             raise
         elapsed = time.perf_counter() - started
         self._stage_seconds[name] = elapsed
@@ -615,6 +635,7 @@ class Pipeline:
             elapsed,
             extra={"stage": name, "seconds": round(elapsed, 3)},
         )
+        self._emit("stage_end", stage=name, seconds=round(elapsed, 3))
         return result
 
     def _resolve_stretcher(self, tmp_dir: Path) -> Any:
@@ -3365,7 +3386,8 @@ class Pipeline:
         script: dict[int, str],
     ) -> JobResult:
         """Normalise loudness, write subtitles, mux the video and report."""
-        dub_track = self.job_dir / _DUB_TRACK_NAME
+        stem = self.job.output_stem
+        dub_track = self.job_dir / f"{stem}{_DUB_TRACK_SUFFIX}"
         # Normalise here (rather than via save_normalized) so the achieved
         # loudness can be reported accurately instead of re-measuring later.
         target_lufs = self._resolve_loudness_target()
@@ -3403,7 +3425,7 @@ class Pipeline:
             dubbed_video = media.mux_audio(
                 self.input_path,
                 dub_track,
-                self.job_dir / "video_dubbed.mp4",
+                self.job_dir / f"{stem}{_DUBBED_VIDEO_SUFFIX}",
                 # Embed the target subtitles softly by default. ``burn`` is applied
                 # in a second pass, after the dub's audio is in place, so the
                 # re-encoding pass has a finished file to draw over.
@@ -3416,7 +3438,7 @@ class Pipeline:
                 burned_video = media.burn_subtitles(
                     dubbed_video,
                     target_srt,
-                    self.job_dir / "video_burned.mp4",
+                    self.job_dir / f"{stem}{_BURNED_VIDEO_SUFFIX}",
                     language=self.job.target_language,
                 )
 
@@ -3734,7 +3756,11 @@ class Pipeline:
                 )[:5]
             ],
             "outputs": {
-                "dub_track": self.job_dir.name + "/" + _DUB_TRACK_NAME,
+                "dub_track": (
+                    self.job_dir.name
+                    + "/"
+                    + f"{self.job.output_stem}{_DUB_TRACK_SUFFIX}"
+                ),
                 "video": dubbed_video.name if dubbed_video else None,
             },
             "stage_seconds": self._stage_seconds,

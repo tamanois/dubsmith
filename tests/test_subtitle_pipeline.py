@@ -150,7 +150,7 @@ class TestVideoSubtitles:
         text = result.target_srt.read_text(encoding="utf-8")
         assert "[French] Hello there." in text
         assert result.output_video is not None
-        assert result.output_video.name == "video_subtitled.mp4"
+        assert result.output_video.name == f"{video.stem}_subtitled.mp4"
         assert captured[-1]["language"] == "French"
         assert result.report["subtitles_mode"] == "soft"
 
@@ -179,7 +179,7 @@ class TestVideoSubtitles:
         result = pipeline.run()
 
         assert result.output_video is not None
-        assert result.output_video.name == "video_burned.mp4"
+        assert result.output_video.name == f"{video.stem}_burned.mp4"
         assert captured[-1]["language"] == "French"
 
     def test_off_mode_writes_the_srt_only(

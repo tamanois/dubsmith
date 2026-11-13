@@ -18,6 +18,7 @@
 | Area | Status | Where |
 |---|---|---|
 | CLI + model download | ✅ | `dub.py` (`models --list/--download`, `--video/--audio`) |
+| Local browser UI + HTTP API | ✅ | `server/` (FastAPI, SQLite jobs, SSE), `web/` (React), `docs/web-ui.md` |
 | Config, env, languages | ✅ | `pipeline/config.py` |
 | Model registry / resolution | ✅ | `pipeline/models.py` |
 | Media (ffmpeg, loudness, SRT) | ✅ | `pipeline/media.py`, `pipeline/subtitles.py` |
@@ -38,7 +39,7 @@
 | Expressive native accent (`--expressive-accent blend`) | ✅ | `pipeline/orchestrate.py`, `pipeline/cosyvoice.py`, `--expressive-accent` |
 | Orchestration, caching, report | ✅ | `pipeline/orchestrate.py` |
 | Portability & distribution (P7) | ✅ | `pipeline/config.py`, `dub.py info`, `pyproject.toml`, `LICENSE`, `.github/workflows/ci.yml` |
-| Tests | ✅ 1453 tests (all passed) | `tests/` |
+| Tests | ✅ 1501 tests (all passed) | `tests/` |
 
 Verification performed:
 
@@ -84,7 +85,7 @@ Verification performed:
   - Audio mode on a 23 s French voice clip → English dub in ~15 s (faster than
     realtime). Round-trip ASR of the output returns intelligible English matching
     the translation, confirming the voice clone is correct.
-  - Video mode on a video with an audio track → `video_dubbed.mp4` with the video
+  - Video mode on a video with an audio track → `<input>_dubbed.mp4` with the video
     stream copied and the dub muxed in; round-trip ASR confirms the new audio.
 - Whisper download verified end to end: `whisper_large_v3` transcribes French and
   Chinese correctly (language detection at p=0.99).
@@ -95,7 +96,7 @@ Verification performed:
 Issues found and fixed during e2e:
 
 - **`report.json` reported the wrong loudness.** It measured the pre-normalisation
-  mix, so it disagreed with the delivered `dub.wav`. Now reports the delivered
+  mix, so it disagreed with the delivered `<input>_dubbed.wav`. Now reports the delivered
   value plus target, applied gain, source loudness, and a `loudness_peak_limited`
   flag explaining when −16 LUFS was unreachable without clipping.
 - **`--device auto` crashed on GPU ASR** when CTranslate2's CUDA major (12) differs
@@ -909,7 +910,8 @@ moves and emotes, and no breaths — the gaps behind the voice are digitally sil
 
 **Confirm before building.** This cannot be settled by argument, only by ear.
 Listen to the three stems: `01b_speech.wav` (voice + room, discarded),
-`01c_background.wav` (music only, what actually plays under the dub) and `dub.wav`.
+`01c_background.wav` (music only, what actually plays under the dub) and
+`<input>_dubbed.wav`.
 Then A/B the one cause that is already a flag — `--duck-db 0` keeps the bed at full
 level under the voice. If that alone fixes the feel, cause 3 dominates and the fix
 is a default, not a stage.
@@ -1629,11 +1631,9 @@ lines (in memory; 02_transcript.json keeps what ASR said)
 tim│     and embed them — soft (default) or burned in (--subtitles-mode burn)
    ▼
 output/
-  ├─ video_dubbed.mp4        # dub audio + soft subtitle track (default)
-  ├─ video_burned.mp4        # with --subtitles-mode burn (re-encoded)
+  ├─ <input>_dubbed.mp4      # dub audio + soft subtitle track (default)
+  ├─ <input>_burned.mp4      # with --subtitles-mode burn (re-encoded)
   ├─ subs_source.srt         # still written as sidecars
-  ├─ video_dubbed.mp4
-  ├─ subs_source.srt
   ├─ subs_target.srt
   ├─ report.json             # quality signals (see README)
   └─ manifest.json           # stage cache, keyed by a job fingerprint
@@ -1795,7 +1795,7 @@ Optional backends run in child processes; the default Qwen path stays in-process
 ### 3.6 Definition of Done
 
 - One command runs the whole thing: `python dub.py --video in.mp4 --target fr`.
-- Produces `video_dubbed.mp4` + two SRTs.
+- Produces `<input>_dubbed.mp4` + two SRTs.
 - Same voice timbre as the source speaker — subjective listen ✅ **plus** SECS ✅
   (`audit_timbre.py`, run by hand).
 - Audio synchronized to the source timeline within ~100 ms at segment anchors ✅

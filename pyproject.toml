@@ -73,6 +73,9 @@ separation = ["speechbrain"]
 # The pipeline preloads them itself, so no LD_LIBRARY_PATH is needed.
 gpu-asr = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 full = ["demucs", "funasr", "modelscope", "speechbrain"]
+# Local browser UI and HTTP API. The frontend itself lives in web/ and is built
+# with npm; these are only the Python side.
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9"]
 dev = [
     "pytest>=8.0",
     "pytest-cov",
@@ -85,13 +88,14 @@ dev = [
 
 [project.scripts]
 dub = "dub:main"
+dub-server = "server.__main__:main"
 dub-audit-qc = "audit_qc:main"
 dub-audit-timbre = "audit_timbre:main"
 
 [tool.setuptools]
 # Flat modules: the CLI entry points plus the importable pipeline package.
 py-modules = ["dub", "audit_qc", "audit_timbre"]
-packages = ["pipeline"]
+packages = ["pipeline", "server"]
 
 [tool.setuptools.dynamic]
 version = { attr = "pipeline.__version__" }

@@ -46,6 +46,22 @@ Three design points worth knowing:
   finished dub, while the stem's own pauses become a continuous room-tone floor.
   It runs after synthesis, so it cannot disturb the voice cloning.
 
+## Local web layer
+
+`server/` and `web/` are optional convenience layers; the CLI remains a
+first-class interface. The API validates inputs and maps them onto the same
+`pipeline/` entry points, so dubbing, subtitles, speech generation and voice
+operations cannot disagree between the terminal and the browser.
+
+Jobs are persisted in SQLite and run one at a time in a spawned process (the
+same single-model residency the CLI has). Stage events and log records flow to
+the API through a queue and are streamed to the browser over SSE. Every job gets
+a unique output folder named `<stem>__<operation>__<language>__<run-id>`, so
+nothing overwrites. The backend/option matrix behind the forms comes from
+`pipeline/capabilities.py`, published as `GET /api/backends`, so the browser
+disables an impossible choice instead of submitting it and failing. See
+[web-ui.md](web-ui.md).
+
 ## Project layout
 
 ```
@@ -56,6 +72,7 @@ LICENSE                    Apache-2.0
 pipeline/
 ├── anchors.py             generated accent anchors (analysis + cache)
 ├── config.py              job + settings models, device capability, languages
+├── capabilities.py        what each backend can honour, with the reason for each gap
 ├── errors.py              domain exception hierarchy
 ├── logging_utils.py       job-scoped structured logging
 ├── models.py              model registry, download, path resolution
@@ -73,10 +90,17 @@ pipeline/
 ├── voices.py              saved voices: clip + manifest + stored encoding (cards)
 ├── provenance.py          emotion/prosody provenance artifact (schema + recorder)
 ├── parallel.py            fan-out: tasks, the worker pool, per-device counters
+├── prosody.py             per-line specs, planners and backend mappings
+├── say.py                 shared standalone speech rendering (`dub say` + API)
+├── voice_ops.py           shared design/clone/register voice operations
+├── job_ops.py             saved-voice -> JobConfig resolution
+├── info.py                structured device/environment reports
 ├── timing.py              stretching backends + timeline assembly
 ├── audit.py               timbre measurement + quality gates
 └── orchestrate.py         stages, caching, reporting
-tests/                     pytest suite (1453 tests, no GPU or models needed)
+server/                    local FastAPI app, SQLite store, job manager, worker
+web/                       React + Vite + Tailwind browser UI
+tests/                     pytest suite (no GPU or models needed)
 models/                    downloaded weights (gitignored)
 voices/                    saved voices: clip, manifest, encoding and provenance (gitignored)
 output/                    job artifacts (gitignored)

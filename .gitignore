@@ -11,6 +11,11 @@
 # Local staging for raw demo media; curated files live in docs/media/.
 /assets/
 
+# Web app local state and build output
+/data/
+/web/node_modules/
+/web/dist/
+
 # Saved voice prints: reference audio and transcripts are personal data.
 
 # Local configuration: may contain API keys
@@ -60,3 +65,7 @@ Thumbs.db
 # …but allow small, consented demo assets.
 !docs/media/**
 !examples/media/**
+
+
+# Others
+.github/instructions/

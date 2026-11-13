@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .errors import ModelNotFoundError
 
@@ -29,6 +31,7 @@ __all__ = [
     "anchors_dir",
     "download_model",
     "download_many",
+    "remove_model",
     "resolve_model",
     "model_fingerprint",
     "is_available",
@@ -376,3 +379,55 @@ def download_many(
 def registry_status(models_dir: Path | str = "models") -> list[tuple[ModelSpec, bool]]:
     """Report availability for every known model, for ``models --list``."""
     return [(spec, is_available(spec.name, models_dir)) for spec in REGISTRY.values()]
+
+
+def remove_model(name: str, models_dir: Path | str = "models") -> dict[str, Any]:
+    """Delete one model's checkpoint directory and report what was freed.
+
+    Args:
+        name: Registry name, e.g. ``tts_base``.
+        models_dir: Root that holds the model directories.
+
+    Returns:
+        ``{"name", "path", "freed_bytes", "warning"}``. ``warning`` is set when
+        the model is required by the MVP so the caller can confirm the removal
+        rather than discover it at the next job.
+
+    Raises:
+        ModelNotFoundError: If the name is unknown.
+        ConfigError: If the model is package-backed (there is no directory to
+            delete) or the resolved path escapes ``models_dir``.
+    """
+    from .errors import ConfigError
+
+    spec = _spec(name)
+    if spec.source == "demucs":
+        raise ConfigError(
+            f"{name} is a package-backed model (Demucs). Its weights live in the "
+            "torch hub cache, not the models directory, so there is nothing to "
+            "delete here."
+        )
+
+    root = Path(models_dir) / spec.dir_name
+    root = root.expanduser().resolve()
+    base = Path(models_dir).expanduser().resolve()
+    try:
+        root.relative_to(base)
+    except ValueError:
+        raise ConfigError(
+            f"Refusing to delete {root}: it is outside the models directory."
+        ) from None
+
+    freed = _directory_size(root)
+    if root.is_dir():
+        shutil.rmtree(root)
+    else:
+        freed = 0
+
+    warning = None
+    if spec.name in MVP_REQUIRED:
+        warning = (
+            f"{spec.name} is required by the MVP; the next dub or say will "
+            f"re-download it ({download_hint(spec.name)})."
+        )
+    return {"name": name, "path": str(root), "freed_bytes": freed, "warning": warning}
