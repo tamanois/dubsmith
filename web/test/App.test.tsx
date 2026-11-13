@@ -84,6 +84,9 @@ vi.mock("../src/pages/SettingsPage", () => ({
 }));
 
 beforeEach(() => {
+  // The page now comes from the URL hash, so each test must start from a clean
+  // address instead of inheriting the previous test's route.
+  window.location.hash = "";
   apiMock.settings.mockReset();
   apiMock.devices.mockReset();
   apiMock.patchSettings.mockReset();
@@ -143,6 +146,18 @@ describe("App navigation", () => {
       target: { value: "settings" },
     });
     expect(screen.getByText("Settings page")).toBeInTheDocument();
+  });
+
+  it("opens the page named in the URL hash", () => {
+    window.location.hash = "#/files";
+    render(<App />);
+    expect(screen.getByText("Files page")).toBeInTheDocument();
+  });
+
+  it("writes the route to the URL hash when navigating", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Settings/ }));
+    expect(window.location.hash).toBe("#/settings");
   });
 
   it("opens a job from the activity list", () => {

@@ -158,7 +158,11 @@ _MIX_NAME = "05_mix.wav"
 #: What the room-matching pass did, beside the mix it describes. A sidecar so a
 #: cached mix still reports it, exactly as ``blend.json`` does for the blend.
 _ROOM_NAME = "05_room.json"
-_DUB_TRACK_NAME = "dub.wav"
+#: The delivered artifacts are named after the input, so a run folder is
+#: self-describing (``talk_dubbed.mp4`` rather than a generic ``video_dubbed``).
+_DUB_TRACK_SUFFIX = "_dubbed.wav"
+_DUBBED_VIDEO_SUFFIX = "_dubbed.mp4"
+_BURNED_VIDEO_SUFFIX = "_burned.mp4"
 _REPORT_NAME = "report.json"
 _MANIFEST_NAME = "manifest.json"
 _TMP_DIR = "tmp"
@@ -3382,7 +3386,8 @@ class Pipeline:
         script: dict[int, str],
     ) -> JobResult:
         """Normalise loudness, write subtitles, mux the video and report."""
-        dub_track = self.job_dir / _DUB_TRACK_NAME
+        stem = self.job.output_stem
+        dub_track = self.job_dir / f"{stem}{_DUB_TRACK_SUFFIX}"
         # Normalise here (rather than via save_normalized) so the achieved
         # loudness can be reported accurately instead of re-measuring later.
         target_lufs = self._resolve_loudness_target()
@@ -3420,7 +3425,7 @@ class Pipeline:
             dubbed_video = media.mux_audio(
                 self.input_path,
                 dub_track,
-                self.job_dir / "video_dubbed.mp4",
+                self.job_dir / f"{stem}{_DUBBED_VIDEO_SUFFIX}",
                 # Embed the target subtitles softly by default. ``burn`` is applied
                 # in a second pass, after the dub's audio is in place, so the
                 # re-encoding pass has a finished file to draw over.
@@ -3433,7 +3438,7 @@ class Pipeline:
                 burned_video = media.burn_subtitles(
                     dubbed_video,
                     target_srt,
-                    self.job_dir / "video_burned.mp4",
+                    self.job_dir / f"{stem}{_BURNED_VIDEO_SUFFIX}",
                     language=self.job.target_language,
                 )
 
@@ -3751,7 +3756,11 @@ class Pipeline:
                 )[:5]
             ],
             "outputs": {
-                "dub_track": self.job_dir.name + "/" + _DUB_TRACK_NAME,
+                "dub_track": (
+                    self.job_dir.name
+                    + "/"
+                    + f"{self.job.output_stem}{_DUB_TRACK_SUFFIX}"
+                ),
                 "video": dubbed_video.name if dubbed_video else None,
             },
             "stage_seconds": self._stage_seconds,

@@ -109,9 +109,8 @@ describe("JobPanel logs", () => {
     job.mockResolvedValue(makeJob({ state: "PROCESSING", events: [] }));
     renderPanel();
 
-    const toggle = await screen.findByRole("button", { name: "Show log (0)" });
-    fireEvent.click(toggle);
-    expect(screen.getByText("No log lines yet.")).toBeInTheDocument();
+    // Logs are expanded by default so a running job shows progress immediately.
+    await screen.findByText("No log lines yet.");
 
     act(() => {
       onEvent?.(makeJobEvent({ id: 1, kind: "log", message: "first line" }));
@@ -130,17 +129,47 @@ describe("JobPanel logs", () => {
   it("keeps at most 300 log lines", async () => {
     job.mockResolvedValue(makeJob({ state: "PROCESSING", events: [] }));
     renderPanel();
-    await screen.findByRole("button", { name: "Show log (0)" });
+    await screen.findByText("No log lines yet.");
 
     act(() => {
       for (let index = 0; index < 305; index += 1) {
         onEvent?.(makeJobEvent({ id: index, message: `line ${index}` }));
       }
     });
+    fireEvent.click(screen.getByRole("button", { name: "Hide log" }));
     expect(screen.getByRole("button", { name: "Show log (300)" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show log (300)" }));
     expect(screen.getByText("line 304")).toBeInTheDocument();
     expect(screen.queryByText("line 0")).not.toBeInTheDocument();
+  });
+
+  it.each(["COMPLETED", "FAILED", "CANCELLED"] as const)(
+    "keeps the log collapsed for a %s job",
+    async (state) => {
+      job.mockResolvedValue(
+        makeJob({
+          state,
+          events: [makeJobEvent({ id: 1, message: "old line" })],
+        }),
+      );
+      renderPanel();
+
+      await screen.findByRole("button", { name: "Show log (1)" });
+      expect(screen.queryByText("old line")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps the log open when a live job finishes while it is open", async () => {
+    job.mockResolvedValue(makeJob({ state: "PROCESSING", events: [] }));
+    renderPanel();
+    await screen.findByText("No log lines yet.");
+
+    act(() => onEvent?.(makeJobEvent({ id: 1, message: "live line" })));
+    act(() => onJob?.(makeJob({ state: "COMPLETED" })));
+
+    expect(await screen.findByText("Finished successfully.")).toBeInTheDocument();
+    expect(screen.getByText("live line")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide log" })).toBeInTheDocument();
   });
 });
 
@@ -212,6 +241,15 @@ describe("JobPanel results and lifecycle", () => {
     expect(screen.queryByText("/output/run/private.txt")).not.toBeInTheDocument();
     expect(screen.getByText(/asr 1\.2s/)).toBeInTheDocument();
     expect(screen.getByText(/translate 1m 5s/)).toBeInTheDocument();
+  });
+
+  it("closes on Escape", async () => {
+    job.mockResolvedValue(makeJob({ state: "COMPLETED" }));
+    const { onClose } = renderPanel();
+    await screen.findByText("Finished successfully.");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalled();
   });
 
   it("calls onClose and unsubscribes on unmount", async () => {

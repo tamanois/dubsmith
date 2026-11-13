@@ -95,15 +95,17 @@ describe("FilesPage", () => {
     expect(await screen.findByText("clip.mp4")).toBeInTheDocument();
     expect(screen.getByText(/input · 2\.0 KiB/)).toBeInTheDocument();
     expect(screen.getByText("Dub video")).toBeInTheDocument();
-    expect(screen.getByText(/talk\.mp4 · dub\.wav/)).toBeInTheDocument();
+    expect(screen.getByText("dub.wav")).toBeInTheDocument();
+    expect(screen.getByText(/talk\.mp4/)).toBeInTheDocument();
     expect(screen.getByText(/3 files/)).toBeInTheDocument();
 
     const links = screen.getAllByRole("link", { name: "Download" });
-    expect(links[0]).toHaveAttribute("href", "/api/files/file-1/download");
-    expect(links[1]).toHaveAttribute(
+    // Outputs render first now, then uploads.
+    expect(links[0]).toHaveAttribute(
       "href",
       "/api/outputs/download?path=%2Foutput%2Ftalk__dub__French__abc%2Fdub.wav",
     );
+    expect(links[1]).toHaveAttribute("href", "/api/files/file-1/download");
   });
 
   it("expands a run to show every artifact", async () => {
@@ -154,6 +156,16 @@ describe("FilesPage", () => {
     render(<FilesPage />);
     await screen.findByText("Dub video");
     expect(screen.queryByRole("button", { name: "Play" })).not.toBeInTheDocument();
+  });
+
+  it("renders outputs before uploads", async () => {
+    files.mockResolvedValue(filesPage([makeFile()]));
+    outputs.mockResolvedValue(outputsPage([runOf()]));
+    render(<FilesPage />);
+    await screen.findByText("dub.wav");
+    const headings = screen.getAllByText(/^(Generated outputs|Your uploads)$/);
+    expect(headings[0]).toHaveTextContent("Generated outputs");
+    expect(headings[1]).toHaveTextContent("Your uploads");
   });
 
   it("shows a load error", async () => {

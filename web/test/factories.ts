@@ -1,4 +1,5 @@
 import type {
+  BackendCapabilities,
   Device,
   DeviceReport,
   FileInfo,
@@ -135,5 +136,88 @@ export function makeOutput(overrides: Partial<OutputFile> = {}): OutputFile {
     size: 128,
     created: 1_700_000_000,
     ...overrides,
+  };
+}
+
+export function makeCapabilities(
+  overrides: Partial<BackendCapabilities> = {},
+): BackendCapabilities {
+  // Defaults describe Qwen Base: a saved-voice cloning backend with no controls
+  // beyond the voice itself.
+  return {
+    id: "qwen",
+    label: "Qwen3-TTS Base",
+    prosody: false,
+    style: false,
+    inline_tags: false,
+    fish_tuning: false,
+    chatterbox_tuning: false,
+    speaker: false,
+    sources: ["voice", "clone", "design"],
+    save_as: true,
+    expressive: false,
+    unsupported: {
+      prosody: "--prosody is unavailable with the Qwen Base backend.",
+      expressive: "Only expressive backends have an accent style.",
+    },
+    ...overrides,
+  };
+}
+
+/** A payload that mirrors the real capability table closely enough to gate the UI. */
+export function makeBackends(): {
+  say: BackendCapabilities[];
+  dub: BackendCapabilities[];
+} {
+  const expressive = {
+    prosody: true,
+    expressive: true,
+    unsupported: {} as Record<string, string>,
+  };
+  return {
+    say: [
+      makeCapabilities(),
+      makeCapabilities({
+        id: "customvoice",
+        label: "Qwen3 CustomVoice",
+        prosody: true,
+        style: true,
+        speaker: true,
+        sources: [],
+        unsupported: {},
+      }),
+      makeCapabilities({ id: "cosyvoice3", label: "CosyVoice3", ...expressive }),
+      makeCapabilities({
+        id: "chatterbox",
+        label: "Chatterbox",
+        chatterbox_tuning: true,
+        ...expressive,
+      }),
+      makeCapabilities({
+        id: "fish",
+        label: "Fish Speech",
+        inline_tags: true,
+        fish_tuning: true,
+        save_as: false,
+        unsupported: { save_as: "Fish cannot save a voice from a one-off run." },
+      }),
+    ],
+    dub: [
+      makeCapabilities(),
+      makeCapabilities({ id: "cosyvoice3", label: "CosyVoice3", ...expressive }),
+      makeCapabilities({
+        id: "chatterbox",
+        label: "Chatterbox",
+        chatterbox_tuning: true,
+        ...expressive,
+      }),
+      makeCapabilities({
+        id: "fish",
+        label: "Fish Speech",
+        inline_tags: true,
+        fish_tuning: true,
+        ...expressive,
+      }),
+    ],
   };
 }

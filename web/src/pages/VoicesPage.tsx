@@ -159,7 +159,11 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
                 </div>
                 {preview === item.label ? (
                   <div className="mt-3">
-                    <MediaPreview src={api.voiceAudioUrl(item.label)} name={item.label} />
+                    <MediaPreview
+                      src={api.voiceAudioUrl(item.label)}
+                      name={item.label}
+                      autoPlay
+                    />
                   </div>
                 ) : null}
               </Card>

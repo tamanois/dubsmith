@@ -28,6 +28,10 @@ architecture that this project does not use.
   an actionable `DependencyError` or a documented fallback, never a raw traceback.
 - Backends that pin conflicting `torch`/`transformers` versions run in a child
   process (`*_worker.py`); do not import them into the main process.
+- What a backend can honour is declared once, in `pipeline/capabilities.py`.
+  Validators and `GET /api/backends` both read it, so never re-derive
+  backend/option compatibility from string comparisons elsewhere; a new backend
+  or rule belongs in that table.
 
 ## Configuration and data
 

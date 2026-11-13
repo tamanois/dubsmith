@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from pipeline.anchors import list_anchors
+from pipeline.capabilities import capabilities_payload, say_prosody_conflict
 from pipeline.config import (
     SUPPORTED_LANGUAGES,
     SubtitleJobConfig,
@@ -251,6 +252,11 @@ def create_app(
             "optional_packages": report["optional_packages"],
             "system_binaries": report["system_binaries"],
         }
+
+    @app.get("/api/backends")
+    def backends() -> dict[str, list[dict[str, object]]]:
+        """What each backend can honour, so the forms can disable the rest."""
+        return capabilities_payload()
 
     # -- models ------------------------------------------------------------ #
 
@@ -489,6 +495,16 @@ def create_app(
 
     @app.post("/api/jobs/say", response_model=JobSubmitResponse)
     def submit_say(request: Request, body: SayRequest) -> JobSubmitResponse:
+        # Reject an impossible backend/option pair here instead of enqueuing a
+        # job that is guaranteed to fail in the worker.
+        conflict = say_prosody_conflict(
+            body.backend,
+            prosody=body.prosody,
+            emotions=body.emotions,
+            prosody_plan=body.prosody_plan,
+        )
+        if conflict:
+            raise HTTPException(status_code=422, detail=conflict)
         raw = body.model_dump()
         if raw.get("clone"):
             raw["clone"] = str(validate_input(request, raw["clone"]))
@@ -777,7 +793,8 @@ def create_app(
             "size": size,
         }
 
-    #: Filenames the pipeline treats as a run's main deliverable.
+    #: Filenames the pipeline treats as a run's main deliverable. These are the
+    #: legacy generic names, kept so older folders still resolve their primary.
     _PRIMARY_NAMES = (
         "video_dubbed.mp4",
         "video_burned.mp4",
@@ -785,6 +802,14 @@ def create_app(
         "dubbed_video.mp4",
         "dub.wav",
         "subs_target.srt",
+    )
+    #: Current runs name their deliverables after the input (``talk_dubbed.mp4``),
+    #: so match by suffix when the exact legacy name is not present.
+    _PRIMARY_SUFFIXES = (
+        "_dubbed.mp4",
+        "_burned.mp4",
+        "_subtitled.mp4",
+        "_dubbed.wav",
     )
     _MEDIA_SUFFIXES = {
         ".wav",
@@ -854,6 +879,10 @@ def create_app(
         for name in _PRIMARY_NAMES:
             if name in by_name:
                 return by_name[name]
+        for suffix in _PRIMARY_SUFFIXES:
+            for name, path in by_name.items():
+                if name.endswith(suffix):
+                    return path
         media = sorted(
             (
                 path

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RecentInputs } from "../src/components/RecentInputs";
 import { makeFile } from "./factories";
@@ -12,6 +12,7 @@ vi.mock("../src/api", () => ({
     files: (...args: unknown[]) => files(...args),
     favorites: (...args: unknown[]) => favorites(...args),
     addFavorite: (...args: unknown[]) => addFavorite(...args),
+    fileInlineUrl: (id: string) => `/api/files/${id}/download?inline=1`,
   },
 }));
 
@@ -59,6 +60,22 @@ describe("RecentInputs", () => {
         label: "talk.mp4",
         kind: "input",
       }),
+    );
+  });
+
+  it("browses every upload through the picker", async () => {
+    const onPick = vi.fn();
+    render(<RecentInputs onPick={onPick} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Browse all…" }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Choose an uploaded file",
+    });
+    const use = await within(dialog).findByRole("button", { name: "Use" });
+    fireEvent.click(use);
+    expect(onPick).toHaveBeenCalledWith(
+      "data/uploads/f1__talk.mp4",
+      "talk.mp4",
     );
   });
 });

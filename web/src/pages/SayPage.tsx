@@ -1,5 +1,6 @@
 import React from "react";
 import { api } from "../api";
+import { capabilitiesOf, useBackends } from "../capabilities";
 import type { Job, VoiceInfo } from "../types";
 import {
   Button,
@@ -48,6 +49,13 @@ function asText(value: unknown, fallback = ""): string {
 function joined(value: unknown, separator: string): string {
   return Array.isArray(value) ? value.map(String).join(separator) : "";
 }
+
+type CapabilityFlag =
+  | "prosody"
+  | "style"
+  | "fish_tuning"
+  | "chatterbox_tuning"
+  | "save_as";
 
 export function SayPage({
   onJobStarted,
@@ -99,6 +107,14 @@ export function SayPage({
       })
       .catch(() => undefined);
   }, []);
+
+  const backends = useBackends("say");
+  const caps = capabilitiesOf(backends, backend);
+  // Unknown capabilities => permissive: the server is still the authority, and a
+  // metadata hiccup must never block every form.
+  const allows = (feature: CapabilityFlag) => (caps ? caps[feature] : true);
+  const reasonFor = (feature: CapabilityFlag) =>
+    caps && !caps[feature] ? caps.unsupported?.[feature] : undefined;
 
   const applySpec = React.useCallback((spec: Record<string, unknown>) => {
     setText(asText(spec.text));
@@ -152,30 +168,83 @@ export function SayPage({
     else if (source === "speaker") setSource("voice");
   }, [backend]);
 
+  // A backend change must not leave a stale value behind for a control it does
+  // not support; the form shows the truth, so the payload should too.
+  React.useEffect(() => {
+    if (!caps) return;
+    if (!caps.prosody) {
+      setProsody("");
+      setEmotions("");
+      setProsodyPlan("off");
+    }
+    if (!caps.style) {
+      setStyleInstructs("");
+      setStylePlan("off");
+      setStylePlanScope("per-line");
+    }
+    if (!caps.fish_tuning) {
+      setFishTemp("");
+      setFishTopP("");
+      setFishTagMode("keep");
+    }
+    if (!caps.chatterbox_tuning) {
+      setChatterboxExaggeration("");
+      setChatterboxCfg("");
+      setChatterboxTemp("");
+    }
+    if (!caps.save_as) setSaveAs("");
+  }, [caps]);
+
+  // Combinations the pipeline rejects. Shown inline and used to block submit, so
+  // an impossible request is never sent and never becomes a failed job.
+  const blockers: string[] = [];
+  if (source === "voice" && !voice) {
+    blockers.push("Choose a saved voice, or switch the voice source.");
+  }
+  if (source === "design" && !design.trim()) {
+    blockers.push("Describe the voice to design.");
+  }
+  if (source === "clone" && !clone) {
+    blockers.push("Add a reference clip to clone.");
+  }
+  if (source === "speaker" && !speaker.trim()) {
+    blockers.push("Pick or type a preset speaker, e.g. Vivian.");
+  }
+  if (source === "speaker" && (!language || language === "Auto")) {
+    blockers.push("CustomVoice needs an explicit language.");
+  }
+
   function buildSpec(): Record<string, unknown> {
     const spec: Record<string, unknown> = {
       text,
       backend,
       language: language || undefined,
-      save_as: saveAs || undefined,
+      save_as: allows("save_as") ? saveAs || undefined : undefined,
       device,
       dtype,
       force,
       provenance,
-      prosody: perLine(prosody),
-      emotions: list(emotions),
-      prosody_plan: prosodyPlan,
-      style_instructs: perLine(styleInstructs),
-      style_plan: stylePlan,
-      style_plan_scope: stylePlanScope,
+      // Strip anything the selected backend cannot honour. This is defence in
+      // depth: a preset or a restored edit can carry a value the controls no
+      // longer show.
+      prosody: allows("prosody") ? perLine(prosody) : undefined,
+      emotions: allows("prosody") ? list(emotions) : undefined,
+      prosody_plan: allows("prosody") ? prosodyPlan : "off",
+      style_instructs: allows("style") ? perLine(styleInstructs) : undefined,
+      style_plan: allows("style") ? stylePlan : "off",
+      style_plan_scope: allows("style") ? stylePlanScope : "per-line",
       plan_chunk: num(planChunk),
-      chatterbox_exaggeration: num(chatterboxExaggeration),
-      chatterbox_cfg_weight: num(chatterboxCfg),
-      chatterbox_temperature: num(chatterboxTemp),
-      fish_temperature: num(fishTemp),
-      fish_top_p: num(fishTopP),
-      fish_quantize: backend === "fish" ? fishQuantize : undefined,
-      fish_tag_mode: fishTagMode,
+      chatterbox_exaggeration: allows("chatterbox_tuning")
+        ? num(chatterboxExaggeration)
+        : undefined,
+      chatterbox_cfg_weight: allows("chatterbox_tuning") ? num(chatterboxCfg) : undefined,
+      chatterbox_temperature: allows("chatterbox_tuning")
+        ? num(chatterboxTemp)
+        : undefined,
+      fish_temperature: allows("fish_tuning") ? num(fishTemp) : undefined,
+      fish_top_p: allows("fish_tuning") ? num(fishTopP) : undefined,
+      fish_quantize: allows("fish_tuning") ? fishQuantize : undefined,
+      fish_tag_mode: allows("fish_tuning") ? fishTagMode : "keep",
     };
     if (source === "voice") spec.voice = voice || undefined;
     if (source === "design") spec.design = design || undefined;
@@ -201,6 +270,10 @@ export function SayPage({
   }
 
   async function submit() {
+    if (blockers.length) {
+      setError(blockers[0]);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -219,7 +292,11 @@ export function SayPage({
       subtitle="Speak text with a saved, designed or cloned voice — with per-line prosody."
     >
       <Card className="space-y-5 p-5">
-        <Field label="Text" hint="One line becomes one utterance. Blank lines are ignored.">
+        <Field
+          label="Text"
+          tooltip="The words to speak. Each non-empty line becomes one utterance, so line breaks control prosody and timing."
+          hint="One line becomes one utterance. Blank lines are ignored."
+        >
           <Textarea
             value={text}
             onChange={(event) => setText(event.target.value)}
@@ -227,12 +304,11 @@ export function SayPage({
           />
         </Field>
 
-        <Disclosure title="Presets" hint="Save and reuse these options">
-          <PresetPanel kind="say" buildPayload={buildPresetPayload} onApply={applyPreset} />
-        </Disclosure>
-
         <div className="grid gap-4 md:grid-cols-2">
-          <Field label="Backend">
+          <Field
+            label="Backend"
+            tooltip="Voice engine. Qwen Base clones; CustomVoice uses a preset speaker; the others add emotion controls."
+          >
             <Select
               value={backend}
               onChange={(event) => setBackend(event.target.value)}
@@ -295,13 +371,19 @@ export function SayPage({
               <div className="grid gap-4 md:grid-cols-2">
                 <UploadField
                   label="Reference clip"
+                  tooltip="The clip whose voice is cloned. A clean, single-speaker recording works best."
                   accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
+                  value={clone}
                   onUploaded={(path, name) => {
                     setClone(path);
                     setCloneName(name);
                   }}
                 />
-                <Field label="Clip transcript" hint="Optional; improves similarity and accent.">
+                <Field
+                  label="Clip transcript"
+                  tooltip="The exact words in the clip; it improves similarity and accent."
+                  hint="Optional; improves similarity and accent."
+                >
                   <Input value={cloneText} onChange={(event) => setCloneText(event.target.value)} />
                 </Field>
               </div>
@@ -313,6 +395,7 @@ export function SayPage({
                   setCloneName(name);
                 }}
                 current={clone ? { path: clone, name: cloneName || clone } : null}
+                accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
               />
             ) : null}
           </div>
@@ -322,39 +405,82 @@ export function SayPage({
           </Field>
         )}
 
-        <Field label="Save as voice" hint="Optional: store an inline design or clone in the library.">
-          <Input value={saveAs} onChange={(event) => setSaveAs(event.target.value)} placeholder="leave empty to keep it one-off" />
+        <Field
+          label="Save as voice"
+          tooltip="Store an inline design or clone in the library for later use."
+          hint={
+            allows("save_as")
+              ? "Optional: store an inline design or clone in the library."
+              : reasonFor("save_as")
+          }
+        >
+          <Input
+            value={saveAs}
+            disabled={!allows("save_as")}
+            onChange={(event) => setSaveAs(event.target.value)}
+            placeholder="leave empty to keep it one-off"
+          />
         </Field>
 
-        <Disclosure title="Prosody" hint="Emotion, pace, volume and paralinguistic cues">
-          <div className="grid gap-4 md:grid-cols-2">
-            <Field label="Prosody plan">
-              <Select
-                value={prosodyPlan}
-                onChange={(event) => setProsodyPlan(event.target.value)}
-                options={[
-                  { value: "off", label: "Use the values below" },
-                  { value: "llm", label: "Ask the LLM to plan" },
-                ]}
-              />
-            </Field>
-            <Field label="Emotion shorthand" hint="Comma-separated, applied to every line.">
-              <Input value={emotions} onChange={(event) => setEmotions(event.target.value)} placeholder="calm, warm" />
-            </Field>
-          </div>
+        {/* Basic: emotion and pacing, which most people tweak. */}
+        <div className="grid gap-4 md:grid-cols-2">
           <Field
-            label="Per-line prosody"
-            hint="One spec per line: emotion=happy, pace=fast, volume=loud, breath, pause, laughter, exaggeration=0.8"
+            label="Prosody plan"
+            tooltip="Who decides emotion and pace. 'Use the values below' keeps your input; 'Ask the LLM' plans it per line."
+            hint={allows("prosody") ? undefined : reasonFor("prosody")}
           >
-            <Textarea
-              value={prosody}
-              onChange={(event) => setProsody(event.target.value)}
-              placeholder={"emotion=calm, pace=slow\nemotion=excited, breath"}
+            <Select
+              value={prosodyPlan}
+              disabled={!allows("prosody")}
+              onChange={(event) => setProsodyPlan(event.target.value)}
+              options={[
+                { value: "off", label: "Use the values below" },
+                { value: "llm", label: "Ask the LLM to plan" },
+              ]}
             />
           </Field>
+          <Field
+            label="Emotion shorthand"
+            tooltip="Comma-separated emotions applied to every line, e.g. calm, warm."
+            hint={
+              allows("prosody")
+                ? "Comma-separated, applied to every line."
+                : reasonFor("prosody")
+            }
+          >
+            <Input
+              value={emotions}
+              disabled={!allows("prosody")}
+              onChange={(event) => setEmotions(event.target.value)}
+              placeholder="calm, warm"
+            />
+          </Field>
+        </div>
+        <Field
+          label="Per-line prosody"
+          tooltip="One spec per line, overriding the shorthand for that utterance."
+          hint={
+            allows("prosody")
+              ? "One spec per line: emotion=happy, pace=fast, volume=loud, breath, pause, laughter, exaggeration=0.8"
+              : reasonFor("prosody")
+          }
+        >
+          <Textarea
+            value={prosody}
+            disabled={!allows("prosody")}
+            onChange={(event) => setProsody(event.target.value)}
+            placeholder={"emotion=calm, pace=slow\nemotion=excited, breath"}
+          />
+        </Field>
+
+        <Disclosure title="Advanced options" hint="Style planning, sampling and hardware">
           {backend === "customvoice" ? (
             <>
-              <Field label="Verbatim style instructions" hint="One per line; wins over prosody.">
+              <Field
+                label="Verbatim style instructions"
+                tooltip="Exact style directions for the preset speaker; they win over the prosody above."
+                hint="One per line; wins over prosody."
+              >
                 <Textarea
                   value={styleInstructs}
                   onChange={(event) => setStyleInstructs(event.target.value)}
@@ -362,7 +488,7 @@ export function SayPage({
                 />
               </Field>
               <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Style plan">
+                <Field label="Style plan" tooltip="Keep your instructions, or let the LLM write them.">
                   <Select
                     value={stylePlan}
                     onChange={(event) => setStylePlan(event.target.value)}
@@ -372,7 +498,7 @@ export function SayPage({
                     ]}
                   />
                 </Field>
-                <Field label="Style plan scope">
+                <Field label="Style plan scope" tooltip="One style per line, or a single style for the whole text.">
                   <Select
                     value={stylePlanScope}
                     onChange={(event) => setStylePlanScope(event.target.value)}
@@ -386,7 +512,7 @@ export function SayPage({
             </>
           ) : null}
           {backend === "fish" ? (
-            <Field label="Fish tag mode">
+            <Field label="Fish tag mode" tooltip="Keep the [tags] you wrote, or let the LLM add them.">
               <Select
                 value={fishTagMode}
                 onChange={(event) => setFishTagMode(event.target.value)}
@@ -397,34 +523,35 @@ export function SayPage({
               />
             </Field>
           ) : null}
-          <Field label="Planning chunk size" hint="Lines per LLM planning request.">
+          <Field
+            label="Planning chunk size"
+            tooltip="How many lines go into one LLM planning request. Larger is fewer calls but less precise."
+            hint="Lines per LLM planning request."
+          >
             <Input value={planChunk} onChange={(event) => setPlanChunk(event.target.value)} placeholder="from settings" />
           </Field>
-        </Disclosure>
-
-        <Disclosure title="Backend tuning and hardware" hint="Expression, sampling and precision">
           {backend === "chatterbox" ? (
             <div className="grid gap-4 md:grid-cols-3">
-              <Field label="Exaggeration">
+              <Field label="Exaggeration" tooltip="How theatrical the delivery is.">
                 <Input value={chatterboxExaggeration} onChange={(event) => setChatterboxExaggeration(event.target.value)} />
               </Field>
-              <Field label="CFG weight">
+              <Field label="CFG weight" tooltip="Guidance strength; higher stays closer to the prompt.">
                 <Input value={chatterboxCfg} onChange={(event) => setChatterboxCfg(event.target.value)} />
               </Field>
-              <Field label="Temperature">
+              <Field label="Temperature" tooltip="Sampling randomness; lower is steadier.">
                 <Input value={chatterboxTemp} onChange={(event) => setChatterboxTemp(event.target.value)} />
               </Field>
             </div>
           ) : null}
           {backend === "fish" ? (
             <div className="grid gap-4 md:grid-cols-3">
-              <Field label="Temperature">
+              <Field label="Temperature" tooltip="Sampling randomness; lower is steadier.">
                 <Input value={fishTemp} onChange={(event) => setFishTemp(event.target.value)} />
               </Field>
-              <Field label="Top-p">
+              <Field label="Top-p" tooltip="Nucleus sampling cut-off; lower restricts to more likely tokens.">
                 <Input value={fishTopP} onChange={(event) => setFishTopP(event.target.value)} />
               </Field>
-              <Field label="Quantization">
+              <Field label="Quantization" tooltip="int8 fits smaller GPUs; bf16 needs more memory but is a little more faithful.">
                 <Select
                   value={fishQuantize}
                   onChange={(event) => setFishQuantize(event.target.value)}
@@ -437,7 +564,7 @@ export function SayPage({
             </div>
           ) : null}
           <div className="grid gap-4 md:grid-cols-2">
-            <Field label="Device">
+            <Field label="Device" tooltip="Hardware target. Auto picks the best available GPU.">
               <Select
                 value={device}
                 onChange={(event) => setDevice(event.target.value)}
@@ -449,7 +576,7 @@ export function SayPage({
                 ]}
               />
             </Field>
-            <Field label="Precision">
+            <Field label="Precision" tooltip="Numeric precision. Auto uses bfloat16/float16 when supported.">
               <Select
                 value={dtype}
                 onChange={(event) => setDtype(event.target.value)}
@@ -466,11 +593,16 @@ export function SayPage({
           </div>
         </Disclosure>
 
+        <Disclosure title="Presets" hint="Save and reuse these options">
+          <PresetPanel kind="say" buildPayload={buildPresetPayload} onApply={applyPreset} />
+        </Disclosure>
+
+        {blockers.length ? <ErrorNote message={blockers.join(" ")} /> : null}
         {error ? <ErrorNote message={error} /> : null}
         {cloneName ? <div className="text-xs text-slate-500">Clip: {cloneName}</div> : null}
 
         <div className="flex justify-end border-t border-white/5 pt-4">
-          <Button onClick={submit} disabled={busy || !text.trim()}>
+          <Button onClick={submit} disabled={busy || !text.trim() || blockers.length > 0}>
             {busy ? <Spinner /> : null}
             Generate speech
           </Button>

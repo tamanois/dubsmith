@@ -66,6 +66,22 @@ export interface SettingsExport {
   settings: Record<string, unknown>;
 }
 
+/** What a backend can honour; `unsupported` explains each gap to the user. */
+export interface BackendCapabilities {
+  id: string;
+  label: string;
+  prosody: boolean;
+  style: boolean;
+  inline_tags: boolean;
+  fish_tuning: boolean;
+  chatterbox_tuning: boolean;
+  speaker: boolean;
+  sources: string[];
+  save_as: boolean;
+  expressive: boolean;
+  unsupported: Record<string, string>;
+}
+
 export interface Device {
   label: string;
   kind: string;

@@ -145,6 +145,13 @@ class TestJobConfigValidation:
 
         assert job.job_dir == Path("out/talk")
 
+    def test_output_stem_strips_the_upload_uuid_prefix(self) -> None:
+        upload = Path("data/uploads") / ("a" * 32 + "__talk.mp4")
+
+        assert JobConfig(video=upload).output_stem == "talk"
+        assert JobConfig(video=Path("input/talk.mp4")).output_stem == "talk"
+        assert SubtitleJobConfig(video=upload).output_stem == "talk"
+
     def test_ref_audio_requires_ref_text(self) -> None:
         with pytest.raises(ConfigError, match="ref-text"):
             JobConfig(

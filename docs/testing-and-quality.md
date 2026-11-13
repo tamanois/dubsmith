@@ -15,8 +15,8 @@ python -m pytest
 ```
 
 ```
-1485 Python tests (all passing)
-163 frontend tests (all passing)
+1501 Python tests (all passing)
+185 frontend tests (all passing)
 ```
 
 Run a single area while iterating:

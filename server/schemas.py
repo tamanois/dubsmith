@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pipeline.config import JobConfig
+from pipeline.errors import ConfigError
 
 _BACKENDS = Literal["qwen", "customvoice", "cosyvoice3", "chatterbox", "fish"]
 
@@ -20,6 +21,36 @@ class DubRequest(BaseModel):
     voice: str | None = None
     accent_voice: str | None = None
     stretcher: str = "auto"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accent_voice_supplies_the_clip(cls, data: Any) -> Any:
+        """Allow ``accent_voice`` to stand in for the accent clip it provides.
+
+        ``JobConfig`` requires ``accent_audio`` for ``reference-accent``, but a
+        saved voice *is* that clip plus its transcript. Validate such a request as
+        if no mode were chosen yet; the route then re-derives the clip, the
+        transcript and the mode from the voice itself
+        (:func:`pipeline.job_ops.apply_accent_voice`), exactly as
+        ``--accent-voice`` does on the command line. Naming another mode is
+        rejected rather than silently overridden.
+        """
+        if not isinstance(data, dict) or not data.get("accent_voice"):
+            return data
+        config = data.get("config")
+        if not isinstance(config, dict):
+            return data
+        mode = config.get("accent_mode")
+        if mode is None:
+            return data
+        if mode != "reference-accent":
+            raise ConfigError(
+                "--accent-voice implies --accent-mode reference-accent; drop "
+                f"--accent-mode {mode!r} or the saved accent voice."
+            )
+        if config.get("accent_audio") or (config.get("accent_text") or "").strip():
+            return data
+        return {**data, "config": {**config, "accent_mode": "native"}}
 
 
 class SayRequest(BaseModel):

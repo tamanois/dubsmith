@@ -1,5 +1,6 @@
 import React from "react";
 import { api } from "../api";
+import { capabilitiesOf, useBackends } from "../capabilities";
 import type { Device, Job, VoiceInfo } from "../types";
 import {
   Badge,
@@ -33,6 +34,12 @@ const LANGUAGES = [
 ];
 
 const VIDEO_EXT = [".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"];
+
+type CapabilityFlag =
+  | "prosody"
+  | "expressive"
+  | "fish_tuning"
+  | "chatterbox_tuning";
 
 function text(value: unknown, fallback = ""): string {
   return value === undefined || value === null ? fallback : String(value);
@@ -200,8 +207,47 @@ export function DubPage({
   React.useEffect(() => {
     if (!initialJob) return;
     setMode(initialJob.kind === "subtitles" ? "subtitles" : "dub");
-    applyConfig((initialJob.params?.config ?? {}) as Record<string, unknown>);
+    const params = (initialJob.params ?? {}) as Record<string, unknown>;
+    applyConfig((params.config ?? {}) as Record<string, unknown>);
+    // The saved voices live next to the config, not inside it.
+    setVoice(text(params.voice));
+    setAccentVoice(text(params.accent_voice));
   }, [initialJob, applyConfig]);
+
+  const backends = useBackends("dub");
+  const caps = capabilitiesOf(backends, backend);
+  // Unknown capabilities => permissive; the server remains the authority.
+  const allows = (feature: CapabilityFlag) => (caps ? caps[feature] : true);
+  const reasonFor = (feature: CapabilityFlag) =>
+    caps && !caps[feature] ? caps.unsupported?.[feature] : undefined;
+
+  // Combinations the server would reject. Shown inline and used to block submit,
+  // so an impossible request is never sent.
+  const blockers: string[] = [];
+  if (mode === "dub") {
+    if (source && source === target) {
+      blockers.push("Source and target language must differ.");
+    }
+    if (accentMode === "preserve" && !voice && refAudio && !refText.trim()) {
+      blockers.push(
+        "Add the reference clip's transcript, or choose another accent mode.",
+      );
+    }
+    if (accentMode === "reference-accent" && !accentVoice && !accentAudio) {
+      blockers.push(
+        "Borrowed accent needs an accent clip or a saved accent voice.",
+      );
+    }
+    if (accentMode === "reference-accent" && !accentVoice && accentAudio && !accentText.trim()) {
+      blockers.push("Add the accent clip's transcript.");
+    }
+  }
+
+  // The saved accent voice *is* the borrowed accent's clip, so it only means
+  // something in that mode. Sending it alongside another mode would silently
+  // switch the run to reference-accent, which the server rejects outright.
+  const accentVoiceFor =
+    accentMode === "reference-accent" ? accentVoice || undefined : undefined;
 
   function chooseInput(path: string, name: string) {
     setInputPath(path);
@@ -226,13 +272,17 @@ export function DubPage({
       llm_model: llmModel || undefined,
       tts_batch: num(ttsBatch),
       tts_backend: backend,
-      prosody_plan: prosodyPlan,
-      chatterbox_exaggeration: num(chatterboxExaggeration),
-      chatterbox_cfg_weight: num(chatterboxCfg),
-      chatterbox_temperature: num(chatterboxTemp),
-      fish_temperature: num(fishTemp),
-      fish_top_p: num(fishTopP),
-      fish_quantize: backend === "fish" ? fishQuantize : undefined,
+      prosody_plan: allows("prosody") ? prosodyPlan : "off",
+      chatterbox_exaggeration: allows("chatterbox_tuning")
+        ? num(chatterboxExaggeration)
+        : undefined,
+      chatterbox_cfg_weight: allows("chatterbox_tuning") ? num(chatterboxCfg) : undefined,
+      chatterbox_temperature: allows("chatterbox_tuning")
+        ? num(chatterboxTemp)
+        : undefined,
+      fish_temperature: allows("fish_tuning") ? num(fishTemp) : undefined,
+      fish_top_p: allows("fish_tuning") ? num(fishTopP) : undefined,
+      fish_quantize: allows("fish_tuning") ? fishQuantize : undefined,
       min_stretch: num(minStretch),
       max_stretch: num(maxStretch),
       max_overrun: num(maxOverrun),
@@ -273,7 +323,7 @@ export function DubPage({
         accentMode === "reference-accent" && !accentVoice
           ? accentText || undefined
           : undefined,
-      expressive_accent: backend === "qwen" ? "donor" : expressiveAccent,
+      expressive_accent: allows("expressive") ? expressiveAccent : "donor",
       diarizer,
       speaker_threshold: num(speakerThreshold),
       min_speaker_seconds: num(minSpeakerSeconds),
@@ -305,7 +355,7 @@ export function DubPage({
     return {
       config,
       voice: voice || undefined,
-      accent_voice: accentVoice || undefined,
+      accent_voice: accentVoiceFor,
     };
   }
 
@@ -320,6 +370,10 @@ export function DubPage({
   }
 
   async function submit() {
+    if (mode === "dub" && blockers.length) {
+      setError(blockers[0]);
+      return;
+    }
     if (!inputPath) {
       setError("Choose an input video or audio file first.");
       return;
@@ -348,7 +402,7 @@ export function DubPage({
           {
             config: buildDubConfig(),
             voice: voice || undefined,
-            accent_voice: accentVoice || undefined,
+            accent_voice: accentVoiceFor,
           },
           "auto",
         );
@@ -389,12 +443,17 @@ export function DubPage({
           <div className="grid gap-4 md:grid-cols-2">
             <UploadField
               label="Input file"
+              tooltip="The video or audio to dub. It is uploaded once and kept under the app data directory so later jobs can reuse it."
               hint="Video or audio. It is uploaded and kept under the app data directory."
               accept=".mp4,.mkv,.mov,.webm,.avi,.m4v,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus"
+              value={inputPath}
               onUploaded={chooseInput}
             />
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="Target language">
+              <Field
+                label="Target language"
+                tooltip="The language the speakers will speak after dubbing."
+              >
                 <Select
                   value={target}
                   onChange={(event) => setTarget(event.target.value)}
@@ -404,7 +463,15 @@ export function DubPage({
                   }))}
                 />
               </Field>
-              <Field label="Source language" hint="Auto detects when left empty.">
+              <Field
+                label="Source language"
+                tooltip="The language spoken in the input. Leave on Auto-detect to let ASR identify it."
+                hint={
+                  source && source === target
+                    ? "Source and target must differ."
+                    : "Auto detects when left empty."
+                }
+              >
                 <Select
                   value={source}
                   onChange={(event) => setSource(event.target.value)}
@@ -423,21 +490,15 @@ export function DubPage({
           <RecentInputs
             onPick={chooseInput}
             current={inputPath ? { path: inputPath, name: inputName } : null}
+            accept=".mp4,.mkv,.mov,.webm,.avi,.m4v,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus"
           />
-
-          {mode === "dub" ? (
-            <Disclosure title="Presets" hint="Save and reuse these options">
-              <PresetPanel
-                kind="dub"
-                buildPayload={buildPresetPayload}
-                onApply={applyPreset}
-              />
-            </Disclosure>
-          ) : null}
 
           {mode === "subtitles" ? (
             <div className="grid gap-4 md:grid-cols-3">
-              <Field label="Subtitle mode">
+              <Field
+                label="Subtitle mode"
+                tooltip="How target subtitles reach the video: a toggleable track, burned into the frames, or a sidecar SRT only."
+              >
                 <Select
                   value={subtitlesMode}
                   onChange={(event) => setSubtitlesMode(event.target.value)}
@@ -448,13 +509,22 @@ export function DubPage({
                   ]}
                 />
               </Field>
-              <Field label="Max characters per cue">
+              <Field
+                label="Max characters per cue"
+                tooltip="Longer lines are split into shorter cues. Smaller values read faster but add more cues."
+              >
                 <Input value={maxChars} onChange={(event) => setMaxChars(event.target.value)} />
               </Field>
-              <Field label="Whisper model">
+              <Field
+                label="Whisper model"
+                tooltip="ASR checkpoint used to transcribe. large-v3 is the most accurate."
+              >
                 <Input value={whisperModel} onChange={(event) => setWhisperModel(event.target.value)} />
               </Field>
-              <Field label="Device">
+              <Field
+                label="Device"
+                tooltip="Hardware to run on. Auto picks the best available GPU."
+              >
                 <Select
                   value={device}
                   onChange={(event) => setDevice(event.target.value)}
@@ -468,7 +538,10 @@ export function DubPage({
                   ]}
                 />
               </Field>
-              <Field label="Precision">
+              <Field
+                label="Precision"
+                tooltip="Numeric precision. Auto uses bfloat16/float16 when the GPU supports it."
+              >
                 <Select
                   value={dtype}
                   onChange={(event) => setDtype(event.target.value)}
@@ -485,76 +558,168 @@ export function DubPage({
 
           {mode === "dub" ? (
             <>
-              <Disclosure title="Voice and accent" hint="Who speaks, and with which accent">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <Field label="Saved voice" hint="Leave empty to clone the source speaker.">
-                    <Select
-                      value={voice}
-                      onChange={(event) => setVoice(event.target.value)}
-                      options={[
-                        { value: "", label: "Clone the source speaker" },
-                        ...savedVoices.map((item) => ({
-                          value: item.label,
-                          label: `${item.label} (${item.language})`,
-                        })),
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Accent mode">
-                    <Select
-                      value={accentMode}
-                      onChange={(event) => setAccentMode(event.target.value)}
-                      options={[
-                        { value: "native", label: "Native target accent (anchor)" },
-                        { value: "preserve", label: "Keep the speaker's accent" },
-                        { value: "speaker-only", label: "Speaker timbre only" },
-                        { value: "reference-accent", label: "Borrow a reference accent" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Accent match" hint="Only with the native anchor mode.">
-                    <Select
-                      value={accentMatch}
-                      onChange={(event) => setAccentMatch(event.target.value)}
-                      options={[
-                        { value: "off", label: "Off" },
-                        { value: "rate", label: "Match speaking rate" },
-                        { value: "gender", label: "Match rate and gender" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Saved accent voice" hint="A target-language voice for pronunciation.">
-                    <Select
-                      value={accentVoice}
-                      onChange={(event) => setAccentVoice(event.target.value)}
-                      options={[
-                        { value: "", label: "None" },
-                        ...savedVoices.map((item) => ({
-                          value: item.label,
-                          label: `${item.label} (${item.language})`,
-                        })),
-                      ]}
-                    />
-                  </Field>
-                  <UploadField
-                    label="Reference clip"
-                    hint="Optional: clone this voice instead of the source speaker."
-                    accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
-                    onUploaded={(path) => setRefAudio(path)}
+              {/* Basic: the few choices most people actually make. */}
+              <div className="grid gap-4 md:grid-cols-2">
+                <Field
+                  label="TTS backend"
+                  tooltip="Voice engine. Qwen Base clones cleanly; CosyVoice3/Chatterbox add emotion control; Fish reads [tags] in the text."
+                >
+                  <Select
+                    value={backend}
+                    onChange={(event) => setBackend(event.target.value)}
+                    options={[
+                      { value: "qwen", label: "Qwen Base (cloning, no prosody)" },
+                      { value: "cosyvoice3", label: "CosyVoice3 (emotion + tokens)" },
+                      { value: "chatterbox", label: "Chatterbox (expression intensity)" },
+                      { value: "fish", label: "Fish S2-Pro (inline tags)" },
+                    ]}
                   />
-                  <Field label="Reference transcript" hint="Required with a reference clip in preserve mode.">
-                    <Input value={refText} onChange={(event) => setRefText(event.target.value)} />
-                  </Field>
-                  <UploadField
-                    label="Accent clip"
-                    hint="Used only with reference-accent."
-                    accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
-                    onUploaded={(path) => setAccentAudio(path)}
+                </Field>
+                <Field
+                  label="Prosody plan"
+                  tooltip="Who decides emotion and pace. 'Ask the LLM' writes it per line; 'Auto' plans when an LLM is reachable and falls back to neutral."
+                  hint={
+                    allows("prosody")
+                      ? "Auto falls back to neutral when no LLM is reachable."
+                      : reasonFor("prosody")
+                  }
+                >
+                  <Select
+                    value={prosodyPlan}
+                    disabled={!allows("prosody")}
+                    onChange={(event) => setProsodyPlan(event.target.value)}
+                    options={[
+                      { value: "auto", label: "Auto" },
+                      { value: "llm", label: "Ask the LLM" },
+                      { value: "off", label: "Neutral" },
+                    ]}
                   />
-                  <Field label="Accent transcript">
-                    <Input value={accentText} onChange={(event) => setAccentText(event.target.value)} />
-                  </Field>
-                </div>
+                </Field>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <Field
+                  label="Saved voice"
+                  tooltip="Clone one of your library voices instead of the source speaker."
+                  hint="Leave empty to clone the source speaker."
+                >
+                  <Select
+                    value={voice}
+                    onChange={(event) => setVoice(event.target.value)}
+                    options={[
+                      { value: "", label: "Clone the source speaker" },
+                      ...savedVoices.map((item) => ({
+                        value: item.label,
+                        label: `${item.label} (${item.language})`,
+                      })),
+                    ]}
+                  />
+                </Field>
+                <Field
+                  label="Accent mode"
+                  tooltip="How target-language colour is added. The native anchor blends a target accent; preserve keeps the speaker's accent."
+                >
+                  <Select
+                    value={accentMode}
+                    onChange={(event) => setAccentMode(event.target.value)}
+                    options={[
+                      { value: "native", label: "Native target accent (anchor)" },
+                      { value: "preserve", label: "Keep the speaker's accent" },
+                      { value: "speaker-only", label: "Speaker timbre only" },
+                      { value: "reference-accent", label: "Borrow a reference accent" },
+                    ]}
+                  />
+                </Field>
+                <Field
+                  label="Saved accent voice"
+                  tooltip="A target-language voice used for pronunciation and accent colour, never for timbre."
+                  hint={
+                    accentMode === "reference-accent"
+                      ? "A target-language voice for pronunciation."
+                      : "Only used when borrowing a reference accent."
+                  }
+                >
+                  <Select
+                    value={accentVoice}
+                    disabled={accentMode !== "reference-accent"}
+                    onChange={(event) => setAccentVoice(event.target.value)}
+                    options={[
+                      { value: "", label: "None" },
+                      ...savedVoices.map((item) => ({
+                        value: item.label,
+                        label: `${item.label} (${item.language})`,
+                      })),
+                    ]}
+                  />
+                </Field>
+                <Field
+                  label="Expressive accent"
+                  tooltip="For expressive backends: clone the donor's delivery, or blend a native accent into it."
+                  hint={allows("expressive") ? undefined : reasonFor("expressive")}
+                >
+                  <Select
+                    value={expressiveAccent}
+                    disabled={!allows("expressive")}
+                    onChange={(event) => setExpressiveAccent(event.target.value)}
+                    options={[
+                      { value: "donor", label: "Clone the donor" },
+                      { value: "blend", label: "Blend a native accent" },
+                    ]}
+                  />
+                </Field>
+                <UploadField
+                  label="Reference clip"
+                  tooltip="Optional clip to clone instead of the source speaker."
+                  hint="Optional: clone this voice instead of the source speaker."
+                  accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
+                  value={refAudio}
+                  onUploaded={(path) => setRefAudio(path)}
+                />
+                <Field
+                  label="Reference transcript"
+                  tooltip="The exact words spoken in the reference clip; required in preserve mode and improves similarity."
+                  hint="Required with a reference clip in preserve mode."
+                >
+                  <Input value={refText} onChange={(event) => setRefText(event.target.value)} />
+                </Field>
+                <UploadField
+                  label="Accent clip"
+                  tooltip="A target-language sample to borrow pronunciation from. Used only with reference-accent."
+                  hint="Used only with reference-accent."
+                  accept=".wav,.mp3,.flac,.m4a,.ogg,.opus"
+                  value={accentAudio}
+                  onUploaded={(path) => setAccentAudio(path)}
+                />
+                <Field
+                  label="Accent transcript"
+                  tooltip="The exact words spoken in the accent clip; it aligns the speech codes."
+                >
+                  <Input value={accentText} onChange={(event) => setAccentText(event.target.value)} />
+                </Field>
+              </div>
+
+              <Disclosure title="Advanced options" hint="Fine-tuning most projects never need">
+                <Field
+                  label="Accent match"
+                  tooltip="Match the speaker's rate (and gender) to the target anchor. Native mode only."
+                  hint={
+                    accentMode === "native"
+                      ? "Only with the native anchor mode."
+                      : "Available only in the native accent mode."
+                  }
+                >
+                  <Select
+                    value={accentMatch}
+                    disabled={accentMode !== "native"}
+                    onChange={(event) => setAccentMatch(event.target.value)}
+                    options={[
+                      { value: "off", label: "Off" },
+                      { value: "rate", label: "Match speaking rate" },
+                      { value: "gender", label: "Match rate and gender" },
+                    ]}
+                  />
+                </Field>
+
                 <Disclosure title="Accent blend detail" hint="How the native target accent is built">
                   <div className="grid gap-4 md:grid-cols-4">
                     <Field label="Blend mode">
@@ -579,69 +744,29 @@ export function DubPage({
                     </Field>
                   </div>
                 </Disclosure>
-              </Disclosure>
 
-              <Disclosure title="Backend and prosody" hint="Emotion, pace and expression">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <Field label="TTS backend">
-                    <Select
-                      value={backend}
-                      onChange={(event) => setBackend(event.target.value)}
-                      options={[
-                        { value: "qwen", label: "Qwen Base (cloning, no prosody)" },
-                        { value: "cosyvoice3", label: "CosyVoice3 (emotion + tokens)" },
-                        { value: "chatterbox", label: "Chatterbox (expression intensity)" },
-                        { value: "fish", label: "Fish S2-Pro (inline tags)" },
-                      ]}
-                    />
-                  </Field>
-                  <Field
-                    label="Prosody plan"
-                    hint={backend === "qwen" ? "Ignored by the Qwen Base backend." : "Auto falls back to neutral when no LLM is reachable."}
-                  >
-                    <Select
-                      value={prosodyPlan}
-                      onChange={(event) => setProsodyPlan(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "llm", label: "Ask the LLM" },
-                        { value: "off", label: "Neutral" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Expressive accent">
-                    <Select
-                      value={expressiveAccent}
-                      onChange={(event) => setExpressiveAccent(event.target.value)}
-                      options={[
-                        { value: "donor", label: "Clone the donor" },
-                        { value: "blend", label: "Blend a native accent" },
-                      ]}
-                    />
-                  </Field>
-                </div>
                 {backend === "chatterbox" ? (
                   <div className="grid gap-4 md:grid-cols-3">
-                    <Field label="Exaggeration">
+                    <Field label="Exaggeration" tooltip="How theatrical the delivery is; blank lets the plan decide.">
                       <Input value={chatterboxExaggeration} onChange={(event) => setChatterboxExaggeration(event.target.value)} placeholder="derived" />
                     </Field>
-                    <Field label="CFG weight">
+                    <Field label="CFG weight" tooltip="Classifier-free guidance strength; higher stays closer to the prompt.">
                       <Input value={chatterboxCfg} onChange={(event) => setChatterboxCfg(event.target.value)} placeholder="0.5" />
                     </Field>
-                    <Field label="Temperature">
+                    <Field label="Temperature" tooltip="Sampling randomness; lower is steadier, higher is more varied.">
                       <Input value={chatterboxTemp} onChange={(event) => setChatterboxTemp(event.target.value)} placeholder="0.8" />
                     </Field>
                   </div>
                 ) : null}
                 {backend === "fish" ? (
                   <div className="grid gap-4 md:grid-cols-3">
-                    <Field label="Temperature">
+                    <Field label="Temperature" tooltip="Sampling randomness; lower is steadier, higher is more varied.">
                       <Input value={fishTemp} onChange={(event) => setFishTemp(event.target.value)} placeholder="0.7" />
                     </Field>
-                    <Field label="Top-p">
+                    <Field label="Top-p" tooltip="Nucleus sampling cut-off; lower restricts to more likely tokens.">
                       <Input value={fishTopP} onChange={(event) => setFishTopP(event.target.value)} placeholder="0.7" />
                     </Field>
-                    <Field label="Quantization">
+                    <Field label="Quantization" tooltip="int8 fits smaller GPUs; bf16 needs more memory but is a little more faithful.">
                       <Select
                         value={fishQuantize}
                         onChange={(event) => setFishQuantize(event.target.value)}
@@ -653,235 +778,248 @@ export function DubPage({
                     </Field>
                   </div>
                 ) : null}
-              </Disclosure>
 
-              <Disclosure title="Audio and subtitles" hint="Background, loudness, room and captions">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <Toggle
-                    label="Keep music and ambience"
-                    hint="Separate and duck the original bed under the dub."
-                    checked={keepBackground}
-                    onChange={setKeepBackground}
-                  />
-                  <Toggle
-                    label="Write subtitles"
-                    hint="Turn off to skip the SRT files."
-                    checked={keepSubtitles}
-                    onChange={setKeepSubtitles}
-                  />
-                  <Field label="Separator">
-                    <Select
-                      value={separator}
-                      onChange={(event) => setSeparator(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "demucs", label: "Demucs" },
-                        { value: "none", label: "None" },
-                      ]}
+                <Disclosure title="Audio and subtitles" hint="Background, loudness, room and captions">
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Toggle
+                      label="Keep music and ambience"
+                      hint="Separate and duck the original bed under the dub."
+                      checked={keepBackground}
+                      onChange={setKeepBackground}
                     />
-                  </Field>
-                  <Field label="Subtitle mode">
-                    <Select
-                      value={subtitlesMode}
-                      onChange={(event) => setSubtitlesMode(event.target.value)}
-                      options={[
-                        { value: "soft", label: "Soft track (toggleable)" },
-                        { value: "burn", label: "Burn into the video" },
-                        { value: "off", label: "Sidecar only" },
-                      ]}
+                    <Toggle
+                      label="Write subtitles"
+                      hint="Turn off to skip the SRT files."
+                      checked={keepSubtitles}
+                      onChange={setKeepSubtitles}
                     />
-                  </Field>
-                  <Field label="Duck under dialogue (dB)">
-                    <Input value={duckDb} onChange={(event) => setDuckDb(event.target.value)} />
-                  </Field>
-                  <Field label="Background gain (dB)">
-                    <Input value={backgroundGain} onChange={(event) => setBackgroundGain(event.target.value)} />
-                  </Field>
-                  <Field label="Room matching">
-                    <Select
-                      value={room}
-                      onChange={(event) => setRoom(event.target.value)}
-                      options={[
-                        { value: "off", label: "Dry voice-over" },
-                        { value: "match", label: "Match the source room" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Loudness">
-                    <Select
-                      value={loudness}
-                      onChange={(event) => setLoudness(event.target.value)}
-                      options={[
-                        { value: "match-source", label: "Match the source" },
-                        { value: "lufs", label: "Absolute LUFS" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="LUFS target" hint="Only with absolute loudness.">
-                    <Input value={lufs} onChange={(event) => setLufs(event.target.value)} />
-                  </Field>
-                </div>
-                <Disclosure title="Room matching detail" hint="Only used when room matching is on">
-                  <div className="grid gap-4 md:grid-cols-4">
-                    <Field label="RT60 (s)" hint="Blank measures it.">
-                      <Input value={roomRt60} onChange={(event) => setRoomRt60(event.target.value)} />
+                    <Field label="Separator" tooltip="Stem splitter for music and ambience. Auto uses Demucs when installed.">
+                      <Select
+                        value={separator}
+                        onChange={(event) => setSeparator(event.target.value)}
+                        options={[
+                          { value: "auto", label: "Auto" },
+                          { value: "demucs", label: "Demucs" },
+                          { value: "none", label: "None" },
+                        ]}
+                      />
                     </Field>
-                    <Field label="Wet level (dB)">
-                      <Input value={roomWetDb} onChange={(event) => setRoomWetDb(event.target.value)} />
+                    <Field label="Subtitle mode" tooltip="A toggleable track, burned into the frames, or a sidecar SRT only.">
+                      <Select
+                        value={subtitlesMode}
+                        onChange={(event) => setSubtitlesMode(event.target.value)}
+                        options={[
+                          { value: "soft", label: "Soft track (toggleable)" },
+                          { value: "burn", label: "Burn into the video" },
+                          { value: "off", label: "Sidecar only" },
+                        ]}
+                      />
                     </Field>
-                    <Field label="Room duck (dB)">
-                      <Input value={roomDuckDb} onChange={(event) => setRoomDuckDb(event.target.value)} />
+                    <Field label="Duck under dialogue (dB)" tooltip="How far the background bed drops under the dub, in decibels.">
+                      <Input value={duckDb} onChange={(event) => setDuckDb(event.target.value)} />
                     </Field>
-                    <Field label="Room tone (dB)">
-                      <Input value={roomToneDb} onChange={(event) => setRoomToneDb(event.target.value)} />
+                    <Field label="Background gain (dB)" tooltip="Overall level change applied to the separated background.">
+                      <Input value={backgroundGain} onChange={(event) => setBackgroundGain(event.target.value)} />
+                    </Field>
+                    <Field label="Room matching" tooltip="Add a short reverb that matches the source room to the dry dub.">
+                      <Select
+                        value={room}
+                        onChange={(event) => setRoom(event.target.value)}
+                        options={[
+                          { value: "off", label: "Dry voice-over" },
+                          { value: "match", label: "Match the source room" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Loudness" tooltip="Match the source loudness, or normalise to an absolute LUFS target.">
+                      <Select
+                        value={loudness}
+                        onChange={(event) => setLoudness(event.target.value)}
+                        options={[
+                          { value: "match-source", label: "Match the source" },
+                          { value: "lufs", label: "Absolute LUFS" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="LUFS target" tooltip="Integrated loudness target used with absolute loudness." hint="Only with absolute loudness.">
+                      <Input value={lufs} onChange={(event) => setLufs(event.target.value)} />
+                    </Field>
+                  </div>
+                  <Disclosure title="Room matching detail" hint="Only used when room matching is on">
+                    <div className="grid gap-4 md:grid-cols-4">
+                      <Field label="RT60 (s)" hint="Blank measures it.">
+                        <Input value={roomRt60} onChange={(event) => setRoomRt60(event.target.value)} />
+                      </Field>
+                      <Field label="Wet level (dB)">
+                        <Input value={roomWetDb} onChange={(event) => setRoomWetDb(event.target.value)} />
+                      </Field>
+                      <Field label="Room duck (dB)">
+                        <Input value={roomDuckDb} onChange={(event) => setRoomDuckDb(event.target.value)} />
+                      </Field>
+                      <Field label="Room tone (dB)">
+                        <Input value={roomToneDb} onChange={(event) => setRoomToneDb(event.target.value)} />
+                      </Field>
+                    </div>
+                  </Disclosure>
+                </Disclosure>
+
+                <Disclosure title="Timing, speakers and repair" hint="Sync, diarization and length repair">
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <Field label="Min stretch" tooltip="The most a line may be slowed when fitting its time slot (0.75 = 75%).">
+                      <Input value={minStretch} onChange={(event) => setMinStretch(event.target.value)} />
+                    </Field>
+                    <Field label="Max stretch" tooltip="The most a line may be sped up when fitting its time slot (1.18 = 118%).">
+                      <Input value={maxStretch} onChange={(event) => setMaxStretch(event.target.value)} />
+                    </Field>
+                    <Field label="Max overrun (s)" tooltip="How far a line may spill past its slot before it is repaired.">
+                      <Input value={maxOverrun} onChange={(event) => setMaxOverrun(event.target.value)} />
+                    </Field>
+                    <Field label="Diarizer" tooltip="Split the audio by speaker, or treat everything as one voice.">
+                      <Select
+                        value={diarizer}
+                        onChange={(event) => setDiarizer(event.target.value)}
+                        options={[
+                          { value: "auto", label: "Separate speakers" },
+                          { value: "none", label: "Single speaker" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Speaker threshold" tooltip="Clustering strictness for speaker turns; higher splits less eagerly.">
+                      <Input value={speakerThreshold} onChange={(event) => setSpeakerThreshold(event.target.value)} placeholder="0.7" />
+                    </Field>
+                    <Field label="Min speaker seconds" tooltip="Speakers shorter than this are merged into a neighbour.">
+                      <Input value={minSpeakerSeconds} onChange={(event) => setMinSpeakerSeconds(event.target.value)} />
+                    </Field>
+                    <Field label="Overlap" tooltip="Keep the dominant voice, or separate and dub both overlapping speakers.">
+                      <Select
+                        value={overlap}
+                        onChange={(event) => setOverlap(event.target.value)}
+                        options={[
+                          { value: "dominant", label: "Dominant speaker" },
+                          { value: "separate", label: "Separate both voices" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Overlap separator" tooltip="Model used to split overlapping speech; Auto picks SepFormer when installed.">
+                      <Select
+                        value={overlapSeparator}
+                        onChange={(event) => setOverlapSeparator(event.target.value)}
+                        options={[
+                          { value: "auto", label: "Auto" },
+                          { value: "sepformer", label: "SepFormer" },
+                          { value: "none", label: "None" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Length budget" tooltip="Cap translated length by word count, or by duration only.">
+                      <Select
+                        value={lengthBudget}
+                        onChange={(event) => setLengthBudget(event.target.value)}
+                        options={[
+                          { value: "words", label: "Word budget" },
+                          { value: "off", label: "Duration only" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Budget speedup" tooltip="Target speaking-rate multiplier used when a line is over its word budget.">
+                      <Input value={budgetSpeedup} onChange={(event) => setBudgetSpeedup(event.target.value)} />
+                    </Field>
+                    <Field label="Refine passes" tooltip="How many LLM rewrite passes fix overlong lines.">
+                      <Input value={refineMaxPasses} onChange={(event) => setRefineMaxPasses(event.target.value)} />
+                    </Field>
+                    <Field label="Refine threshold (s)" tooltip="Overrun beyond this triggers a rewrite pass.">
+                      <Input value={refineThreshold} onChange={(event) => setRefineThreshold(event.target.value)} />
+                    </Field>
+                    <Field label="No-speech threshold" tooltip="ASR segments below this confidence are dropped." hint="ASR segments the model distrusts are dropped.">
+                      <Input value={noSpeechThreshold} onChange={(event) => setNoSpeechThreshold(event.target.value)} />
+                    </Field>
+                    <Toggle
+                      label="Repair overlong lines"
+                      hint="Reword lines that would otherwise lose words."
+                      checked={refine}
+                      onChange={setRefine}
+                    />
+                    <Toggle
+                      label="Write provenance"
+                      hint="Per-line prosody and text transformations."
+                      checked={provenance}
+                      onChange={setProvenance}
+                    />
+                    <Toggle
+                      label="Ignore caches"
+                      hint="Rebuild every stage."
+                      checked={force}
+                      onChange={setForce}
+                    />
+                  </div>
+                </Disclosure>
+
+                <Disclosure title="Models and hardware" hint="Precision, batch and per-op devices">
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <Field label="Device" tooltip="Hardware target. Auto picks the best available GPU.">
+                      <Select
+                        value={device}
+                        onChange={(event) => setDevice(event.target.value)}
+                        options={[
+                          { value: "auto", label: "Auto" },
+                          { value: "cpu", label: "CPU" },
+                          ...availableDevices.map((item) => ({
+                            value: item.label,
+                            label: `${item.label} — ${item.name}`,
+                          })),
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Precision" tooltip="Numeric precision. Auto uses bfloat16/float16 when supported.">
+                      <Select
+                        value={dtype}
+                        onChange={(event) => setDtype(event.target.value)}
+                        options={[
+                          { value: "auto", label: "Auto" },
+                          { value: "bf16", label: "bfloat16" },
+                          { value: "fp16", label: "float16" },
+                          { value: "fp32", label: "float32" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Fan-out devices" tooltip="Extra GPUs to spread synthesis over, each with its own worker." hint="Comma-separated, e.g. cuda:0,cuda:1">
+                      <Input value={devices} onChange={(event) => setDevices(event.target.value)} placeholder="unset" />
+                    </Field>
+                    <Field label="TTS batch" tooltip="Lines synthesised per model call; higher is faster but uses more memory.">
+                      <Input value={ttsBatch} onChange={(event) => setTtsBatch(event.target.value)} />
+                    </Field>
+                    <Field label="Whisper model" tooltip="ASR checkpoint used to transcribe; large-v3 is the most accurate.">
+                      <Input value={whisperModel} onChange={(event) => setWhisperModel(event.target.value)} />
+                    </Field>
+                    <Field label="LLM model override" tooltip="Use a different OpenAI-compatible model for this run only.">
+                      <Input value={llmModel} onChange={(event) => setLlmModel(event.target.value)} placeholder="from settings" />
                     </Field>
                   </div>
                 </Disclosure>
               </Disclosure>
 
-              <Disclosure title="Timing, speakers and repair" hint="Sync, diarization and length repair">
-                <div className="grid gap-4 md:grid-cols-3">
-                  <Field label="Min stretch">
-                    <Input value={minStretch} onChange={(event) => setMinStretch(event.target.value)} />
-                  </Field>
-                  <Field label="Max stretch">
-                    <Input value={maxStretch} onChange={(event) => setMaxStretch(event.target.value)} />
-                  </Field>
-                  <Field label="Max overrun (s)">
-                    <Input value={maxOverrun} onChange={(event) => setMaxOverrun(event.target.value)} />
-                  </Field>
-                  <Field label="Diarizer">
-                    <Select
-                      value={diarizer}
-                      onChange={(event) => setDiarizer(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Separate speakers" },
-                        { value: "none", label: "Single speaker" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Speaker threshold">
-                    <Input value={speakerThreshold} onChange={(event) => setSpeakerThreshold(event.target.value)} placeholder="0.7" />
-                  </Field>
-                  <Field label="Min speaker seconds">
-                    <Input value={minSpeakerSeconds} onChange={(event) => setMinSpeakerSeconds(event.target.value)} />
-                  </Field>
-                  <Field label="Overlap">
-                    <Select
-                      value={overlap}
-                      onChange={(event) => setOverlap(event.target.value)}
-                      options={[
-                        { value: "dominant", label: "Dominant speaker" },
-                        { value: "separate", label: "Separate both voices" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Overlap separator">
-                    <Select
-                      value={overlapSeparator}
-                      onChange={(event) => setOverlapSeparator(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "sepformer", label: "SepFormer" },
-                        { value: "none", label: "None" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Length budget">
-                    <Select
-                      value={lengthBudget}
-                      onChange={(event) => setLengthBudget(event.target.value)}
-                      options={[
-                        { value: "words", label: "Word budget" },
-                        { value: "off", label: "Duration only" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Budget speedup">
-                    <Input value={budgetSpeedup} onChange={(event) => setBudgetSpeedup(event.target.value)} />
-                  </Field>
-                  <Field label="Refine passes">
-                    <Input value={refineMaxPasses} onChange={(event) => setRefineMaxPasses(event.target.value)} />
-                  </Field>
-                  <Field label="Refine threshold (s)">
-                    <Input value={refineThreshold} onChange={(event) => setRefineThreshold(event.target.value)} />
-                  </Field>
-                  <Field label="No-speech threshold" hint="ASR segments the model distrusts are dropped.">
-                    <Input value={noSpeechThreshold} onChange={(event) => setNoSpeechThreshold(event.target.value)} />
-                  </Field>
-                  <Toggle
-                    label="Repair overlong lines"
-                    hint="Reword lines that would otherwise lose words."
-                    checked={refine}
-                    onChange={setRefine}
-                  />
-                  <Toggle
-                    label="Write provenance"
-                    hint="Per-line prosody and text transformations."
-                    checked={provenance}
-                    onChange={setProvenance}
-                  />
-                  <Toggle
-                    label="Ignore caches"
-                    hint="Rebuild every stage."
-                    checked={force}
-                    onChange={setForce}
-                  />
-                </div>
-              </Disclosure>
-
-              <Disclosure title="Models and hardware" hint="Precision, batch and per-op devices">
-                <div className="grid gap-4 md:grid-cols-3">
-                  <Field label="Device">
-                    <Select
-                      value={device}
-                      onChange={(event) => setDevice(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "cpu", label: "CPU" },
-                        ...availableDevices.map((item) => ({
-                          value: item.label,
-                          label: `${item.label} — ${item.name}`,
-                        })),
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Precision">
-                    <Select
-                      value={dtype}
-                      onChange={(event) => setDtype(event.target.value)}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "bf16", label: "bfloat16" },
-                        { value: "fp16", label: "float16" },
-                        { value: "fp32", label: "float32" },
-                      ]}
-                    />
-                  </Field>
-                  <Field label="Fan-out devices" hint="Comma-separated, e.g. cuda:0,cuda:1">
-                    <Input value={devices} onChange={(event) => setDevices(event.target.value)} placeholder="unset" />
-                  </Field>
-                  <Field label="TTS batch">
-                    <Input value={ttsBatch} onChange={(event) => setTtsBatch(event.target.value)} />
-                  </Field>
-                  <Field label="Whisper model">
-                    <Input value={whisperModel} onChange={(event) => setWhisperModel(event.target.value)} />
-                  </Field>
-                  <Field label="LLM model override">
-                    <Input value={llmModel} onChange={(event) => setLlmModel(event.target.value)} placeholder="from settings" />
-                  </Field>
-                </div>
+              <Disclosure title="Presets" hint="Save and reuse these options">
+                <PresetPanel
+                  kind="dub"
+                  buildPayload={buildPresetPayload}
+                  onApply={applyPreset}
+                />
               </Disclosure>
             </>
           ) : null}
 
+
+          {blockers.length ? <ErrorNote message={blockers.join(" ")} /> : null}
           {error ? <ErrorNote message={error} /> : null}
 
           <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-4">
             <div className="text-xs text-slate-500">
               {inputName ? `Input: ${inputName}` : "No input selected"}
             </div>
-            <Button onClick={submit} disabled={busy || !inputPath}>
+            <Button
+              onClick={submit}
+              disabled={busy || !inputPath || blockers.length > 0}
+            >
               {busy ? <Spinner /> : null}
               {mode === "dub" ? "Start dubbing" : "Start subtitles"}
             </Button>

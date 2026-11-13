@@ -5,11 +5,15 @@ import { makeJob } from "./factories";
 
 const jobs = vi.fn();
 const clearJobs = vi.fn();
+const outputUrl = vi.fn(
+  (path: string) => `/api/outputs/download?path=${encodeURIComponent(path)}`,
+);
 
 vi.mock("../src/api", () => ({
   api: {
     jobs: (...args: unknown[]) => jobs(...args),
     clearJobs: (...args: unknown[]) => clearJobs(...args),
+    outputUrl: (path: string) => outputUrl(path),
   },
 }));
 
@@ -79,6 +83,30 @@ describe("JobsPage", () => {
     expect(await screen.findByText(/1m 5s/)).toBeInTheDocument();
     expect(screen.getByText(/dur-yes/)).toBeInTheDocument();
     expect(screen.getByText(/dur-no/).textContent).not.toMatch(/1m 5s/);
+  });
+
+  it("offers a direct download and a Files link for a finished job", async () => {
+    jobs.mockResolvedValue(
+      pageOf([
+        makeJob({
+          id: "done-1",
+          state: "COMPLETED",
+          result: { dubbed_video: "/output/run/talk_dubbed.mp4" },
+        }),
+      ]),
+    );
+    const onOpenFiles = vi.fn();
+    render(
+      <JobsPage onOpenJob={vi.fn()} activeJobId={null} onOpenFiles={onOpenFiles} />,
+    );
+
+    const link = await screen.findByRole("link", { name: "Download" });
+    expect(link).toHaveAttribute(
+      "href",
+      "/api/outputs/download?path=%2Foutput%2Frun%2Ftalk_dubbed.mp4",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    expect(onOpenFiles).toHaveBeenCalled();
   });
 
   it("marks the active job", async () => {

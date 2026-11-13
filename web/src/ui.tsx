@@ -86,25 +86,60 @@ export function Disclosure({
   );
 }
 
+/**
+ * A hover/focus tooltip for a field label. The text lives in the DOM (hidden
+ * until hover or keyboard focus) so it is discoverable to tests and assistive
+ * technology instead of relying on the browser's native `title` delay.
+ */
+export function Tooltip({ text }: { text: string }) {
+  return (
+    <span className="group relative inline-flex align-middle">
+      <span
+        aria-hidden="true"
+        className="cursor-help text-[10px] leading-none text-slate-500 group-hover:text-slate-300"
+      >
+        ⓘ
+      </span>
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute right-0 top-full z-30 mt-1 hidden w-56 whitespace-normal rounded-lg border border-white/10 bg-ink-900 p-2 text-[11px] font-normal normal-case leading-snug tracking-normal text-slate-300 shadow-glow group-hover:block group-focus-within:block"
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
+
 export function Field({
   label,
   hint,
+  tooltip,
   children,
   className,
 }: {
   label: string;
   hint?: string;
+  tooltip?: string;
   children: React.ReactNode;
   className?: string;
 }) {
+  // The tooltip lives outside the <label> on purpose: label text is the
+  // field's accessible name, and a tooltip must not become part of it.
   return (
-    <label className={cn("block space-y-1.5", className)}>
-      <span className="text-xs font-medium uppercase tracking-wide text-slate-400">
-        {label}
-      </span>
-      {children}
+    <div className={cn("relative space-y-1.5", className)}>
+      <label className="block space-y-1.5">
+        <span className="block text-xs font-medium uppercase tracking-wide text-slate-400">
+          {label}
+        </span>
+        {children}
+      </label>
+      {tooltip ? (
+        <span className="absolute right-0 top-0">
+          <Tooltip text={tooltip} />
+        </span>
+      ) : null}
       {hint ? <span className="block text-xs text-slate-500">{hint}</span> : null}
-    </label>
+    </div>
   );
 }
 
@@ -139,16 +174,18 @@ export function Select({
 export function Toggle({
   label,
   hint,
+  tooltip,
   checked,
   onChange,
 }: {
   label: string;
   hint?: string;
+  tooltip?: string;
   checked: boolean;
   onChange: (value: boolean) => void;
 }) {
   return (
-    <label className="flex cursor-pointer items-start gap-3">
+    <div className="flex cursor-pointer items-start gap-3">
       <button
         type="button"
         role="switch"
@@ -170,10 +207,13 @@ export function Toggle({
         />
       </button>
       <span>
-        <span className="block text-sm text-slate-200">{label}</span>
+        <span className="flex items-center gap-1 text-sm text-slate-200">
+          <span>{label}</span>
+          {tooltip ? <Tooltip text={tooltip} /> : null}
+        </span>
         {hint ? <span className="block text-xs text-slate-500">{hint}</span> : null}
       </span>
-    </label>
+    </div>
   );
 }
 
@@ -205,10 +245,12 @@ export function Button({
 }
 
 export function Spinner({ className }: { className?: string }) {
+  // `currentColor` keeps the loader visible on both the dark and the light
+  // surface, and inside coloured buttons (where the text is already white).
   return (
     <span
       className={cn(
-        "inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/25 border-t-white",
+        "inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent",
         className,
       )}
     />
@@ -404,11 +446,22 @@ export function isPlayable(name: string): boolean {
   );
 }
 
-export function MediaPreview({ src, name }: { src: string; name: string }) {
+export function MediaPreview({
+  src,
+  name,
+  autoPlay = false,
+}: {
+  src: string;
+  name: string;
+  autoPlay?: boolean;
+}) {
   if (isVideoFile(name)) {
     return (
       <video
+        key={src}
         controls
+        autoPlay={autoPlay}
+        playsInline
         preload="metadata"
         src={src}
         aria-label={`Play ${name}`}
@@ -418,7 +471,9 @@ export function MediaPreview({ src, name }: { src: string; name: string }) {
   }
   return (
     <audio
+      key={src}
       controls
+      autoPlay={autoPlay}
       preload="metadata"
       src={src}
       aria-label={`Play ${name}`}

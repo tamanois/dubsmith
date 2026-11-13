@@ -100,7 +100,7 @@ python dub.py models --list
 python dub.py --video talk.mp4 --target fr
 ```
 
-The result is `output/talk/video_dubbed.mp4`, with `dub.wav`, subtitles and
+The result is `output/talk/talk_dubbed.mp4`, with `talk_dubbed.wav`, subtitles and
 `report.json` beside it. A first run also generates the French accent anchor,
 cached under `models/anchors/`.
 
@@ -131,9 +131,10 @@ dub-server          # http://127.0.0.1:8000
 ```
 
 It covers dubbing, subtitles, speech generation, the voice library, models,
-devices, files and settings, with live stage progress and an expandable log.
-Outputs go into unique per-run folders so they never overwrite each other. See
-[docs/web-ui.md](docs/web-ui.md).
+devices, files and settings, with live stage progress, a job log whose default
+depends on the job state, and forms that disable options the chosen backend
+cannot honour. Outputs go into unique per-run folders so they never overwrite
+each other. See [docs/web-ui.md](docs/web-ui.md).
 
 ---
 
@@ -304,7 +305,7 @@ python -m pytest
 ```
 
 ```text
-1485 tests (all passing)
+1501 tests (all passing)
 ```
 
 Run one area while iterating:

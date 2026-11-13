@@ -9,8 +9,8 @@ Exactly one of `--video` / `--audio` is required.
 
 | Option | Default | What it achieves |
 |---|---|---|
-| `--video PATH` | – | Video input. Enables muxing, so you get `video_dubbed.mp4`. Needs `ffmpeg`. |
-| `--audio PATH` | – | Audio-only input. Produces `dub.wav` + subtitles, needs no `ffmpeg`. |
+| `--video PATH` | – | Video input. Enables muxing, so you get `<input>_dubbed.mp4`. Needs `ffmpeg`. |
+| `--audio PATH` | – | Audio-only input. Produces `<input>_dubbed.wav` + subtitles, needs no `ffmpeg`. |
 | `--target LANG` | `fr` | Language to dub into. Accepts a code (`fr`) or a name (`French`). |
 | `--source LANG` | auto | Overrides the detected source language. Useful when a clip is too short or too noisy for reliable detection. |
 
@@ -224,13 +224,13 @@ model, the prosody plan, per-line render times and a total.
 | Option | Default | What it achieves |
 |---|---|---|
 | `--backend NAME` | `qwen` | `qwen` (clone), `customvoice` (preset speaker + instruction), `cosyvoice3` (clone + per-line prosody), `chatterbox` (clone + expression intensity), `fish` (clone + inline tags). |
-| `--prosody SPEC` | — | Per-line `emotion`/`pace`/`volume`/`exaggeration` and bare `breath`/`pause`/`laughter` flags; repeat per line or broadcast one. |
+| `--prosody SPEC` | — | Per-line `emotion`/`pace`/`volume`/`exaggeration` and bare `breath`/`pause`/`laughter` flags; repeat per line or broadcast one. Rejected by `qwen` and `fish`. |
 | `--emotion TEXT` | — | Shorthand for `emotion=` (alias `--instruct`); repeatable/comma-separated. Rejected by `qwen` and `fish` (Fish takes its direction from tags in `--text`). |
 | `--style-instruct TEXT` | — | `customvoice` only: the delivery instruction, sent **verbatim** to the checkpoint. Repeatable (one per line, or one value broadcast). Wins over `--style-plan`/`--prosody`/`--emotion`/`--prosody-plan`. |
 | `--style-plan {off,llm}` | `off` | `customvoice` only: `llm` writes those verbatim instructions for you, which is the form the checkpoint expects. An explicit `--style-instruct` still wins. Requires the LLM settings. `-v` logs every request and reply. |
 | `--style-plan-scope {per-line,whole}` | `per-line` | With `--style-plan llm`: one instruction per line (chunked, with a whole-passage overview when long), or a single instruction for the entire text. |
 | `--plan-chunk N` | `LLM_PLAN_CHUNK_SIZE` (10) | Lines per planning request before `--style-plan llm`, `--prosody-plan llm` and `--fish-tag-mode llm` switch to the overview + chunked strategy. |
-| `--prosody-plan {off,llm}` | `off` | `llm` asks the configured OpenAI-compatible model to plan per-line prosody; explicit values still win. Skipped when `--style-instruct` or `--style-plan llm` is given. Long passages get a whole-passage overview first. `-v` logs the raw request and reply. |
+| `--prosody-plan {off,llm}` | `off` | `llm` asks the configured OpenAI-compatible model to plan per-line prosody; explicit values still win. Skipped when `--style-instruct` or `--style-plan llm` is given. Long passages get a whole-passage overview first. `-v` logs the raw request and reply. `llm` is rejected by `qwen` and `fish`. |
 | `--speaker NAME` | — | Preset voice for `--backend customvoice` (e.g. `Vivian`, `Ryan`). |
 | `--chatterbox-exaggeration 0..1` | derive | Fixes Chatterbox's expression intensity for every line. |
 | `--chatterbox-cfg-weight FLOAT` | `0.5` | Chatterbox guidance weight. |

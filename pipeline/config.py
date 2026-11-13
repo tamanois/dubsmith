@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .capabilities import DUB_BACKENDS
 from .diarize import DEFAULT_THRESHOLD
 from .errors import ConfigError
 from .mixing import (
@@ -51,6 +53,16 @@ __all__ = [
     "Settings",
     "read_env_file",
 ]
+
+#: The API stores uploads as ``<32-hex uuid>__<original name>``. Deliverables are
+#: named after the original name, so the internal prefix never reaches the user.
+_UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{32}__")
+
+
+def _deliverable_stem(path: Path) -> str:
+    """The input's file stem without the API's upload-uuid prefix."""
+    stem = path.stem
+    return _UPLOAD_PREFIX.sub("", stem) or stem
 
 
 # --------------------------------------------------------------------------- #
@@ -982,7 +994,7 @@ class JobConfig(BaseModel):
                 )
 
         if self.expressive_accent == "blend":
-            if self.tts_backend == "qwen":
+            if not DUB_BACKENDS[self.tts_backend].expressive:
                 raise ConfigError(
                     "--expressive-accent blend only applies to the expressive "
                     "backends (cosyvoice3, chatterbox, fish); the Qwen path "
@@ -1116,6 +1128,15 @@ class JobConfig(BaseModel):
         return path
 
     @property
+    def output_stem(self) -> str:
+        """The input's plain stem, for naming deliverables.
+
+        Uploads are stored as ``<uuid>__<original>`` to avoid collisions; the
+        delivered files use the original name, not that internal prefix.
+        """
+        return _deliverable_stem(self.input_path)
+
+    @property
     def job_dir(self) -> Path:
         """Folder this job's artifacts live in.
 
@@ -1227,6 +1248,11 @@ class SubtitleJobConfig(BaseModel):
         path = self.video if self.video is not None else self.audio
         assert path is not None  # guaranteed by the model validator
         return path
+
+    @property
+    def output_stem(self) -> str:
+        """The input's plain stem, for naming deliverables."""
+        return _deliverable_stem(self.input_path)
 
     @property
     def job_dir(self) -> Path:

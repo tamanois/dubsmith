@@ -89,9 +89,38 @@ def test_read_endpoints(client: TestClient) -> None:
         "/api/anchors",
         "/api/info",
         "/api/usage",
+        "/api/backends",
     ):
         response = client.get(path)
         assert response.status_code == 200, (path, response.text)
+
+
+def test_backends_publish_each_group(client: TestClient) -> None:
+    payload = client.get("/api/backends").json()
+
+    assert {"say", "dub"} == set(payload)
+    say = {item["id"]: item for item in payload["say"]}
+    assert say["qwen"]["prosody"] is False
+    assert say["customvoice"]["speaker"] is True
+    assert say["fish"]["fish_tuning"] is True
+    assert say["qwen"]["unsupported"]["prosody"]
+
+
+def test_say_rejects_prosody_for_the_base_backend(client: TestClient) -> None:
+    response = client.post(
+        "/api/jobs/say",
+        json={
+            "text": "hi",
+            "backend": "qwen",
+            "voice": "warm-fr",
+            "prosody": ["emotion=happy"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "prosody" in response.json()["detail"].lower()
+    # No doomed job was enqueued.
+    assert client.get("/api/jobs").json()["total"] == 0
 
 
 def test_upload_rejects_unknown_extension(client: TestClient) -> None:
@@ -168,6 +197,70 @@ def test_saved_voice_is_resolved_into_reference_audio(
     config = job["params"]["config"]
     assert Path(config["ref_audio"]).name == "voice.wav"
     assert config["accent_mode"] == "preserve"
+
+
+def test_saved_accent_voice_supplies_the_borrowed_accent(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """`accent_voice` alone must work, like `--accent-voice` on the CLI."""
+    voices = tmp_path / "voices"
+    save_voice(
+        voices,
+        "native-fr",
+        np.zeros(24000, dtype=np.float32),
+        24000,
+        language="French",
+        source="design",
+        ref_text="Bonjour.",
+        instruct="native",
+    )
+    path = _upload(client)
+    body = {
+        "config": {
+            "audio": path,
+            "target_language": "French",
+            "accent_mode": "reference-accent",
+        },
+        "accent_voice": "native-fr",
+    }
+    response = client.post("/api/jobs/dub", json=body)
+    assert response.status_code == 200, response.text
+    job = _wait(client, response.json()["job_id"])
+    config = job["params"]["config"]
+    assert config["accent_mode"] == "reference-accent"
+    assert Path(config["accent_audio"]).name == "voice.wav"
+    assert config["accent_text"] == "Bonjour."
+
+
+def test_accent_voice_rejects_another_explicit_mode(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Naming a mode the saved voice cannot serve is an error, not an override."""
+    voices = tmp_path / "voices"
+    save_voice(
+        voices,
+        "native-fr",
+        np.zeros(24000, dtype=np.float32),
+        24000,
+        language="French",
+        source="design",
+        ref_text="Bonjour.",
+        instruct="native",
+    )
+    path = _upload(client)
+    response = client.post(
+        "/api/jobs/dub",
+        json={
+            "config": {
+                "audio": path,
+                "target_language": "French",
+                "accent_mode": "preserve",
+            },
+            "accent_voice": "native-fr",
+        },
+    )
+    assert response.status_code == 400
+    assert "accent-voice implies" in response.json()["detail"]
 
 
 def test_settings_patch_and_validation(client: TestClient) -> None:

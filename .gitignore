@@ -65,3 +65,7 @@ Thumbs.db
 # …but allow small, consented demo assets.
 !docs/media/**
 !examples/media/**
+
+
+# Others
+.github/instructions/

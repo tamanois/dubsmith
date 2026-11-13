@@ -57,7 +57,10 @@ Jobs are persisted in SQLite and run one at a time in a spawned process (the
 same single-model residency the CLI has). Stage events and log records flow to
 the API through a queue and are streamed to the browser over SSE. Every job gets
 a unique output folder named `<stem>__<operation>__<language>__<run-id>`, so
-nothing overwrites. See [web-ui.md](web-ui.md).
+nothing overwrites. The backend/option matrix behind the forms comes from
+`pipeline/capabilities.py`, published as `GET /api/backends`, so the browser
+disables an impossible choice instead of submitting it and failing. See
+[web-ui.md](web-ui.md).
 
 ## Project layout
 
@@ -69,6 +72,7 @@ LICENSE                    Apache-2.0
 pipeline/
 ├── anchors.py             generated accent anchors (analysis + cache)
 ├── config.py              job + settings models, device capability, languages
+├── capabilities.py        what each backend can honour, with the reason for each gap
 ├── errors.py              domain exception hierarchy
 ├── logging_utils.py       job-scoped structured logging
 ├── models.py              model registry, download, path resolution

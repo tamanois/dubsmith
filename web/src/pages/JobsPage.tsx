@@ -34,12 +34,31 @@ function isActive(job: Job): boolean {
   return job.state === "QUEUED" || job.state === "PROCESSING";
 }
 
+/** The one deliverable a finished job produced, in preference order. */
+function primaryPath(job: Job): string | null {
+  const result = (job.result ?? {}) as Record<string, unknown>;
+  for (const key of [
+    "dubbed_video",
+    "burned_video",
+    "output_video",
+    "dub_track",
+    "target_srt",
+    "output",
+  ]) {
+    const value = result[key];
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
+}
+
 export function JobsPage({
   onOpenJob,
   activeJobId,
+  onOpenFiles,
 }: {
   onOpenJob: (id: string) => void;
   activeJobId: string | null;
+  onOpenFiles?: () => void;
 }) {
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [total, setTotal] = React.useState(0);
@@ -239,6 +258,10 @@ export function JobsPage({
                 const stage = job.stage ? ` · ${job.stage}` : "";
                 const duration =
                   job.started && job.finished ? job.finished - job.started : null;
+                const output = primaryPath(job);
+                // The output name leads; the operation type is the subtitle.
+                const primaryLabel =
+                  job.output_label ?? job.input_label ?? job.title ?? job.kind;
                 return (
                   <div
                     key={job.id}
@@ -262,22 +285,42 @@ export function JobsPage({
                     >
                       <div className="flex items-center gap-2">
                         <span className="truncate text-sm font-medium text-slate-200">
-                          {job.title ?? job.kind}
+                          {primaryLabel}
                         </span>
                         <Badge state={job.state} />
                       </div>
                       <div className="mt-0.5 truncate text-xs text-slate-500">
-                        {job.input_label ? `${job.input_label} · ` : `${job.id.slice(0, 12)} · `}
-                        {job.output_label ? `→ ${job.output_label} · ` : ""}
-                        {formatDate(job.created)}
-                        {duration ? ` · ${formatSeconds(duration)}` : ""}
-                        {stage}
+                        <span>{job.title ?? job.kind}</span>
+                        <span>{` · ${job.input_label ?? job.id.slice(0, 12)}`}</span>
+                        <span>{` · ${formatDate(job.created)}`}</span>
+                        {duration ? <span>{` · ${formatSeconds(duration)}`}</span> : null}
+                        {stage ? <span>{stage}</span> : null}
                       </div>
                       {job.error ? (
                         <div className="mt-1 truncate text-xs text-rose-300">{job.error}</div>
                       ) : null}
                     </button>
-                    <span className="text-xs text-slate-500">Open</span>
+                    {output ? (
+                      <>
+                        <a
+                          href={api.outputUrl(output)}
+                          className="rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:border-white/20"
+                        >
+                          Download
+                        </a>
+                        {onOpenFiles ? (
+                          <button
+                            type="button"
+                            onClick={onOpenFiles}
+                            className="rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:border-white/20"
+                          >
+                            Files
+                          </button>
+                        ) : null}
+                      </>
+                    ) : (
+                      <span className="text-xs text-slate-500">Open</span>
+                    )}
                   </div>
                 );
               })}

@@ -400,7 +400,8 @@ class TestAudioJob:
         pipeline, _, _, _ = make_pipeline(tmp_path, simple_transcript)
         result = pipeline.run()
         assert result.dubbed_video is None
-        assert not (result.job_dir / "video_dubbed.mp4").exists()
+        # Deliverables are now named after the input; no video must be written.
+        assert not list(result.job_dir.glob("*_dubbed.mp4"))
 
     def test_dub_track_length_matches_the_source(
         self, tmp_path: Path, simple_transcript: Transcript

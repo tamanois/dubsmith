@@ -15,15 +15,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from .capabilities import EXPRESSIVE_BACKENDS
 from .errors import ConfigError, ModelNotFoundError
 from .models import resolve_model
 
 __all__ = ["EXPRESSIVE_BACKENDS", "build_expressive_engine"]
-
-#: Backends this module can build. ``qwen`` is deliberately absent: it is the
-#: Base checkpoint, has no prosody control, and is built by :class:`TTSEngine`
-#: directly.
-EXPRESSIVE_BACKENDS: tuple[str, ...] = ("cosyvoice3", "chatterbox", "fish")
 
 
 def build_expressive_engine(

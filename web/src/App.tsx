@@ -38,6 +38,24 @@ const NAV: { id: Page; label: string; glyph: string; hint: string }[] = [
 
 type Toast = { message: string; tone: "info" | "success" | "error" };
 
+const PAGE_IDS: Page[] = [
+  "activity",
+  "dub",
+  "say",
+  "voices",
+  "models",
+  "devices",
+  "files",
+  "settings",
+];
+
+/** Read the page from the URL hash, so every screen has a shareable address. */
+function pageFromHash(): Page {
+  if (typeof window === "undefined") return "activity";
+  const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+  return (PAGE_IDS as string[]).includes(raw) ? (raw as Page) : "activity";
+}
+
 function resolveTheme(theme: string): "light" | "dark" {
   if (theme === "light" || theme === "dark") return theme;
   if (typeof window.matchMedia === "function") {
@@ -54,7 +72,7 @@ const ACTIVE_POLL_MS = 2500;
 const IDLE_POLL_MS = 15000;
 
 export default function App() {
-  const [page, setPage] = React.useState<Page>("activity");
+  const [page, setPage] = React.useState<Page>(() => pageFromHash());
   const [activeJobId, setActiveJobId] = React.useState<string | null>(null);
   const [toast, setToast] = React.useState<Toast | null>(null);
   const [settings, setSettings] = React.useState<SettingsInfo | null>(null);
@@ -63,6 +81,20 @@ export default function App() {
   const [editJob, setEditJob] = React.useState<Job | null>(null);
   // Previous state per job, so a completion is announced exactly once.
   const seen = React.useRef<Map<string, string>>(new Map());
+
+  // Keep the visible page and the URL hash in sync in both directions, so a
+  // deep link and the browser back/forward buttons both work.
+  React.useEffect(() => {
+    const onHash = () => setPage(pageFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const navigate = React.useCallback((next: Page) => {
+    const target = `#/${next}`;
+    if (window.location.hash !== target) window.location.hash = target;
+    setPage(next);
+  }, []);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -179,7 +211,7 @@ export default function App() {
   function startJob(id: string) {
     setEditJob(null);
     setActiveJobId(id);
-    setPage("activity");
+    navigate("activity");
     setToast({
       message: "Job accepted. Live progress is shown in the activity panel.",
       tone: "info",
@@ -189,7 +221,7 @@ export default function App() {
   function editJobFrom(kind: string, job: Job) {
     setEditJob(job);
     setActiveJobId(null);
-    setPage(
+    navigate(
       kind === "dub" || kind === "subtitles"
         ? "dub"
         : kind === "say"
@@ -214,7 +246,7 @@ export default function App() {
               key={item.id}
               type="button"
               onClick={() => {
-                setPage(item.id);
+                navigate(item.id);
                 setEditJob(null);
               }}
               className={cn(
@@ -256,7 +288,7 @@ export default function App() {
                   aria-label="Page"
                   value={page}
                   onChange={(event) => {
-                    setPage(event.target.value as Page);
+                    navigate(event.target.value as Page);
                     setEditJob(null);
                   }}
                   className="rounded-lg border border-white/10 bg-ink-800 px-2 py-1 text-sm text-slate-200"
@@ -300,7 +332,11 @@ export default function App() {
         <main className="flex-1 px-5 py-6 lg:px-8 lg:py-8">
           <div className="mx-auto w-full max-w-6xl">
             {page === "activity" ? (
-              <JobsPage onOpenJob={setActiveJobId} activeJobId={activeJobId} />
+              <JobsPage
+                onOpenJob={setActiveJobId}
+                activeJobId={activeJobId}
+                onOpenFiles={() => navigate("files")}
+              />
             ) : null}
             {page === "dub" ? (
               <DubPage onJobStarted={startJob} initialJob={editJob} />
@@ -319,10 +355,15 @@ export default function App() {
 
       {activeJobId ? (
         <JobPanel
+          key={activeJobId}
           jobId={activeJobId}
           onClose={() => setActiveJobId(null)}
           onJobStarted={startJob}
           onEdit={editJobFrom}
+          onOpenFiles={() => {
+            setActiveJobId(null);
+            navigate("files");
+          }}
         />
       ) : null}
 

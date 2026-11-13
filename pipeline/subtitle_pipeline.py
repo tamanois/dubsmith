@@ -36,8 +36,9 @@ __all__ = ["SubtitlesPipeline", "SubtitleResult"]
 _AUDIO_NAME = "01_audio.wav"
 _TRANSCRIPT_NAME = "02_transcript.json"
 _SUBTITLE_NAME = "subs_target.srt"
-_SOFT_VIDEO_NAME = "video_subtitled.mp4"
-_BURNED_VIDEO_NAME = "video_burned.mp4"
+#: Deliverables are named after the input so a run folder is self-describing.
+_SOFT_VIDEO_SUFFIX = "_subtitled.mp4"
+_BURNED_VIDEO_SUFFIX = "_burned.mp4"
 _REPORT_NAME = "report.json"
 
 #: Transcription signature. Injected in tests so no model is ever loaded.
@@ -279,12 +280,13 @@ class SubtitlesPipeline:
 
     def _embed(self, target_srt: Path) -> Path:
         """Put the SRT into the video, softly or burned in."""
+        stem = self.job.output_stem
         if self.job.subtitles_mode == "burn":
-            output = self.job_dir / _BURNED_VIDEO_NAME
+            output = self.job_dir / f"{stem}{_BURNED_VIDEO_SUFFIX}"
             return media.burn_subtitles(
                 self.input_path, target_srt, output, language=self.job.target_language
             )
-        output = self.job_dir / _SOFT_VIDEO_NAME
+        output = self.job_dir / f"{stem}{_SOFT_VIDEO_SUFFIX}"
         return media.add_subtitle_track(
             self.input_path, target_srt, output, language=self.job.target_language
         )

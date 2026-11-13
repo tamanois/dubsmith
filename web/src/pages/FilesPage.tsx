@@ -168,32 +168,161 @@ export function FilesPage() {
     >
       <div className="space-y-4">
         {error ? <ErrorNote message={error} /> : null}
+
+        {/* Outputs lead: that is what people come to this page to get. */}
+        <div className="text-sm font-semibold text-white">Generated outputs</div>
+        {runs.length === 0 ? (
+          <Empty
+            text="No outputs yet. Each finished job appears here with its main file."
+            action={
+              <Button variant="ghost" onClick={refresh}>
+                Reload outputs
+              </Button>
+            }
+          />
+        ) : (
+          <>
+            <Card className="overflow-hidden">
+              <div className="divide-y divide-white/5">
+                {runs.map((run) => {
+                  const src = api.outputInlineUrl(run.primary.path);
+                  const playing = preview?.src === src;
+                  const playable = isPlayable(run.primary.name);
+                  const open = details?.jobDir === run.job_dir;
+                  return (
+                    <div key={run.job_dir} className="px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm text-slate-200">
+                            {run.primary.name}
+                          </div>
+                          <div className="truncate text-xs text-slate-500">
+                            <span>{run.title}</span>
+                            {run.input_label ? (
+                              <span>{` · ${run.input_label}`}</span>
+                            ) : null}
+                            <span>{` · ${formatBytes(run.primary.size)} · ${formatDate(run.created)}`}</span>
+                            {run.file_count > 1 ? (
+                              <span>{` · ${run.file_count} files`}</span>
+                            ) : null}
+                          </div>
+                        </div>
+                        {playable ? (
+                          <Button
+                            variant="ghost"
+                            className="px-2 py-1 text-xs"
+                            onClick={() => play(src, run.primary.name)}
+                          >
+                            {playing ? "Hide" : "Play"}
+                          </Button>
+                        ) : null}
+                        <CopyButton
+                          value={run.primary.path}
+                          label={`Copy path of ${run.primary.name}`}
+                        />
+                        <a
+                          href={api.outputUrl(run.primary.path)}
+                          className="rounded-lg border border-white/10 px-3 py-1 text-xs text-slate-300 hover:border-white/20"
+                        >
+                          Download
+                        </a>
+                        <Button
+                          variant="ghost"
+                          className="px-2 py-1 text-xs"
+                          aria-expanded={open}
+                          onClick={() => toggleDetails(run.job_dir)}
+                        >
+                          {open ? "Hide details" : `Details (${run.file_count})`}
+                        </Button>
+                        <Button
+                          variant="danger"
+                          className="px-2 py-1 text-xs"
+                          aria-label={`Delete ${run.primary.name}`}
+                          onClick={() => deleteRunPrimary(run)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                      {playing ? (
+                        <div className="mt-2">
+                          <MediaPreview src={src} name={run.primary.name} autoPlay />
+                        </div>
+                      ) : null}
+                      {details && details.jobDir === run.job_dir ? (
+                        <div className="mt-3 space-y-2 rounded-lg border border-white/5 bg-ink-850/60 p-2 text-xs">
+                          {details.files.map((file) => {
+                            const fileSrc = api.outputInlineUrl(file.path);
+                            const filePlaying = preview?.src === fileSrc;
+                            return (
+                              <div key={file.path}>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-slate-400">
+                                    {file.relative}
+                                  </span>
+                                  <span className="text-slate-600">
+                                    {formatBytes(file.size)}
+                                  </span>
+                                  {isPlayable(file.name) ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => play(fileSrc, file.name)}
+                                      className="text-slate-400 hover:text-slate-200"
+                                    >
+                                      {filePlaying ? "Hide" : "Play"}
+                                    </button>
+                                  ) : null}
+                                  <a
+                                    href={api.outputUrl(file.path)}
+                                    className="rounded border border-white/10 px-2 py-0.5 text-slate-300 hover:border-white/20"
+                                  >
+                                    Download
+                                  </a>
+                                  <button
+                                    type="button"
+                                    aria-label={`Delete ${file.relative}`}
+                                    onClick={() => deleteDetailFile(file)}
+                                    className="text-rose-300 hover:text-rose-200"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                                {filePlaying ? (
+                                  <div className="mt-2">
+                                    <MediaPreview src={fileSrc} name={file.name} autoPlay />
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+            <Pagination
+              page={runPage}
+              pageSize={PAGE_SIZE}
+              total={runTotal}
+              onPage={(next) => {
+                setRunPage(next);
+                setDetails(null);
+              }}
+            />
+          </>
+        )}
+
+        <div className="pt-2 text-sm font-semibold text-white">Your uploads</div>
         <Card className="p-5">
           <UploadField
             label="Upload a media file"
+            tooltip="Upload a video or audio file so it can be reused as a job input."
             hint="Videos and audio. The server stores it under data/uploads."
             accept=".mp4,.mkv,.mov,.webm,.avi,.m4v,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus"
             onUploaded={() => refresh()}
           />
         </Card>
-
-        {preview ? (
-          <Card className="space-y-2 p-4">
-            <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
-              <span className="truncate">{preview.name}</span>
-              <button
-                type="button"
-                onClick={() => setPreview(null)}
-                className="text-slate-500 hover:text-slate-300"
-              >
-                Close player
-              </button>
-            </div>
-            <MediaPreview src={preview.src} name={preview.name} />
-          </Card>
-        ) : null}
-
-        <div className="text-sm font-semibold text-white">Your uploads</div>
         {files.length === 0 ? (
           <Empty text="No uploads yet. Add a video or audio clip above." />
         ) : (
@@ -249,6 +378,11 @@ export function FilesPage() {
                       >
                         Delete
                       </Button>
+                      {playing ? (
+                        <div className="mt-2 basis-full">
+                          <MediaPreview src={src} name={item.original_name} autoPlay />
+                        </div>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -261,136 +395,6 @@ export function FilesPage() {
               onPage={(next) => {
                 setFilePage(next);
                 setSelectedFiles(new Set());
-              }}
-            />
-          </>
-        )}
-
-        <div className="pt-2 text-sm font-semibold text-white">Generated outputs</div>
-        {runs.length === 0 ? (
-          <Empty
-            text="No outputs yet. Each finished job appears here with its main file."
-            action={
-              <Button variant="ghost" onClick={refresh}>
-                Reload outputs
-              </Button>
-            }
-          />
-        ) : (
-          <>
-            <Card className="overflow-hidden">
-              <div className="divide-y divide-white/5">
-                {runs.map((run) => {
-                  const src = api.outputInlineUrl(run.primary.path);
-                  const playing = preview?.src === src;
-                  const playable = isPlayable(run.primary.name);
-                  const open = details?.jobDir === run.job_dir;
-                  return (
-                    <div key={run.job_dir} className="px-4 py-3">
-                      <div className="flex flex-wrap items-center gap-3">
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm text-slate-200">
-                            {run.title}
-                          </div>
-                          <div className="truncate text-xs text-slate-500">
-                            {run.input_label ? `${run.input_label} · ` : ""}
-                            {run.primary.name} · {formatBytes(run.primary.size)} ·{" "}
-                            {formatDate(run.created)}
-                            {run.file_count > 1
-                              ? ` · ${run.file_count} files`
-                              : ""}
-                          </div>
-                        </div>
-                        {playable ? (
-                          <Button
-                            variant="ghost"
-                            className="px-2 py-1 text-xs"
-                            onClick={() => play(src, run.primary.name)}
-                          >
-                            {playing ? "Hide" : "Play"}
-                          </Button>
-                        ) : null}
-                        <CopyButton
-                          value={run.primary.path}
-                          label={`Copy path of ${run.primary.name}`}
-                        />
-                        <a
-                          href={api.outputUrl(run.primary.path)}
-                          className="rounded-lg border border-white/10 px-3 py-1 text-xs text-slate-300 hover:border-white/20"
-                        >
-                          Download
-                        </a>
-                        <Button
-                          variant="ghost"
-                          className="px-2 py-1 text-xs"
-                          aria-expanded={open}
-                          onClick={() => toggleDetails(run.job_dir)}
-                        >
-                          {open ? "Hide details" : `Details (${run.file_count})`}
-                        </Button>
-                        <Button
-                          variant="danger"
-                          className="px-2 py-1 text-xs"
-                          aria-label={`Delete ${run.primary.name}`}
-                          onClick={() => deleteRunPrimary(run)}
-                        >
-                          Delete
-                        </Button>
-                      </div>
-                      {details && details.jobDir === run.job_dir ? (
-                        <div className="mt-3 space-y-1 rounded-lg border border-white/5 bg-ink-850/60 p-2 text-xs">
-                          {details.files.map((file) => (
-                            <div
-                              key={file.path}
-                              className="flex flex-wrap items-center gap-2"
-                            >
-                              <span className="min-w-0 flex-1 truncate text-slate-400">
-                                {file.relative}
-                              </span>
-                              <span className="text-slate-600">
-                                {formatBytes(file.size)}
-                              </span>
-                              {isPlayable(file.name) ? (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    play(api.outputInlineUrl(file.path), file.name)
-                                  }
-                                  className="text-slate-400 hover:text-slate-200"
-                                >
-                                  Play
-                                </button>
-                              ) : null}
-                              <a
-                                href={api.outputUrl(file.path)}
-                                className="rounded border border-white/10 px-2 py-0.5 text-slate-300 hover:border-white/20"
-                              >
-                                Download
-                              </a>
-                              <button
-                                type="button"
-                                aria-label={`Delete ${file.relative}`}
-                                onClick={() => deleteDetailFile(file)}
-                                className="text-rose-300 hover:text-rose-200"
-                              >
-                                Delete
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            </Card>
-            <Pagination
-              page={runPage}
-              pageSize={PAGE_SIZE}
-              total={runTotal}
-              onPage={(next) => {
-                setRunPage(next);
-                setDetails(null);
               }}
             />
           </>

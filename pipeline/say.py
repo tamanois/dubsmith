@@ -16,6 +16,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from . import backends, prosody, tts
+from .capabilities import SAY_BACKENDS, say_prosody_conflict
 from .config import NAME_TO_CODE, Settings, normalize_language, pick_dtype
 from .errors import ConfigError, TTSError
 from .logging_utils import job_logger, timed
@@ -42,7 +43,7 @@ __all__ = ["SayResult", "SaySpec", "render_speech"]
 Event = Callable[[str, dict[str, Any]], None]
 Log = logging.Logger | logging.LoggerAdapter
 
-_BACKENDS = ("qwen", "customvoice", "cosyvoice3", "chatterbox", "fish")
+_BACKENDS = tuple(SAY_BACKENDS)
 
 
 @dataclass
@@ -181,21 +182,14 @@ def validate_say_spec(spec: SaySpec) -> None:
         raise ConfigError("--fish-temperature is only valid with --backend fish.")
     if spec.fish_top_p is not None and spec.backend != "fish":
         raise ConfigError("--fish-top-p is only valid with --backend fish.")
-    if spec.backend == "qwen" and (
-        spec.emotions or spec.prosody or spec.prosody_plan != "off"
-    ):
-        raise ConfigError(
-            "--emotion/--prosody/--prosody-plan only applies to --backend "
-            "customvoice, cosyvoice3 or chatterbox; fish takes tags in --text."
-        )
-    if spec.backend == "fish" and (
-        spec.prosody or spec.emotions or spec.prosody_plan != "off"
-    ):
-        raise ConfigError(
-            "--backend fish takes its direction from [tags] inside --text (or "
-            "--fish-tag-mode llm); it has no --prosody/--emotion/--prosody-plan "
-            "channel."
-        )
+    conflict = say_prosody_conflict(
+        spec.backend,
+        prosody=spec.prosody,
+        emotions=spec.emotions,
+        prosody_plan=spec.prosody_plan,
+    )
+    if conflict:
+        raise ConfigError(conflict)
     if spec.backend == "customvoice":
         if not spec.speaker:
             raise ConfigError(

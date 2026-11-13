@@ -1,4 +1,5 @@
 import type {
+  BackendCapabilities,
   DeviceReport,
   Favorite,
   FileInfo,
@@ -48,6 +49,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   devices: () => request<DeviceReport>("/api/devices"),
+  backends: () =>
+    request<{ say: BackendCapabilities[]; dub: BackendCapabilities[] }>(
+      "/api/backends",
+    ),
   packages: () =>
     request<{
       optional_packages: { name: string; available: boolean; purpose: string }[];

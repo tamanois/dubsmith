@@ -1,11 +1,19 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DubPage } from "../src/pages/DubPage";
-import { makeDevice, makeDeviceReport, makeSettings, makeVoice } from "./factories";
+import {
+  makeBackends,
+  makeDevice,
+  makeDeviceReport,
+  makeJob,
+  makeSettings,
+  makeVoice,
+} from "./factories";
 
 const voices = vi.fn();
 const devices = vi.fn();
 const settings = vi.fn();
+const backends = vi.fn();
 const submitDub = vi.fn();
 const submitSubtitles = vi.fn();
 const upload = vi.hoisted(() => ({ path: "/tmp/clip.mp4", name: "clip.mp4" }));
@@ -15,6 +23,7 @@ vi.mock("../src/api", () => ({
     voices: (...args: unknown[]) => voices(...args),
     devices: (...args: unknown[]) => devices(...args),
     settings: (...args: unknown[]) => settings(...args),
+    backends: (...args: unknown[]) => backends(...args),
     submitDub: (...args: unknown[]) => submitDub(...args),
     submitSubtitles: (...args: unknown[]) => submitSubtitles(...args),
     files: async () => ({ files: [], total: 0, page: 1, page_size: 20 }),
@@ -60,6 +69,11 @@ async function renderPage() {
   return onJobStarted;
 }
 
+/** Open the collapsed "Advanced options" section and return its container. */
+function openAdvanced(): HTMLElement {
+  return openDisclosure(/Advanced options/);
+}
+
 function chooseInput() {
   fireEvent.click(screen.getByRole("button", { name: "upload:Input file" }));
 }
@@ -72,8 +86,10 @@ beforeEach(() => {
   voices.mockReset();
   devices.mockReset();
   settings.mockReset();
+  backends.mockReset();
   submitDub.mockReset();
   submitSubtitles.mockReset();
+  backends.mockResolvedValue(makeBackends());
   upload.path = "/tmp/clip.mp4";
   upload.name = "clip.mp4";
   voices.mockResolvedValue({
@@ -194,15 +210,17 @@ describe("DubPage dubbing mode", () => {
   it("uses a saved voice and accent voice", async () => {
     await renderPage();
     chooseInput();
-    const voice = openDisclosure(/Voice and accent/);
-    fireEvent.change(within(voice).getByLabelText(/Saved voice/), {
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
+      target: { value: "reference-accent" },
+    });
+    fireEvent.change(screen.getByLabelText(/Saved voice/), {
       target: { value: "warm-fr" },
     });
-    fireEvent.change(within(voice).getByLabelText(/Saved accent voice/), {
+    fireEvent.change(screen.getByLabelText(/Saved accent voice/), {
       target: { value: "warm-en" },
     });
-    fireEvent.click(within(voice).getByRole("button", { name: "upload:Reference clip" }));
-    fireEvent.change(within(voice).getByLabelText(/Reference transcript/), {
+    fireEvent.click(screen.getByRole("button", { name: "upload:Reference clip" }));
+    fireEvent.change(screen.getByLabelText(/Reference transcript/), {
       target: { value: "Bonjour" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start dubbing" }));
@@ -218,11 +236,10 @@ describe("DubPage dubbing mode", () => {
   it("sends a reference clip when no saved voice is chosen", async () => {
     await renderPage();
     chooseInput();
-    const voice = openDisclosure(/Voice and accent/);
     upload.path = "/tmp/reference.wav";
     upload.name = "reference.wav";
-    fireEvent.click(within(voice).getByRole("button", { name: "upload:Reference clip" }));
-    fireEvent.change(within(voice).getByLabelText(/Reference transcript/), {
+    fireEvent.click(screen.getByRole("button", { name: "upload:Reference clip" }));
+    fireEvent.change(screen.getByLabelText(/Reference transcript/), {
       target: { value: "Bonjour tout le monde" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start dubbing" }));
@@ -239,11 +256,11 @@ describe("DubPage dubbing mode", () => {
   it("sends native accent matching and blend detail", async () => {
     await renderPage();
     chooseInput();
-    const voice = openDisclosure(/Voice and accent/);
-    fireEvent.change(within(voice).getByLabelText(/Accent match/), {
+    const advanced = openAdvanced();
+    fireEvent.change(within(advanced).getByLabelText(/Accent match/), {
       target: { value: "rate" },
     });
-    const blend = openDisclosure(/Accent blend detail/, voice);
+    const blend = openDisclosure(/Accent blend detail/, advanced);
     fireEvent.change(within(blend).getByLabelText(/Blend mode/), {
       target: { value: "two-stage" },
     });
@@ -274,15 +291,15 @@ describe("DubPage dubbing mode", () => {
   it("sends a reference accent clip only in reference-accent mode", async () => {
     await renderPage();
     chooseInput();
-    const voice = openDisclosure(/Voice and accent/);
-    fireEvent.change(within(voice).getByLabelText(/Accent mode/), {
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
       target: { value: "reference-accent" },
     });
-    expect(within(voice).getByLabelText(/Accent match/)).toHaveValue("off");
+    const advanced = openAdvanced();
+    expect(within(advanced).getByLabelText(/Accent match/)).toHaveValue("off");
     upload.path = "/tmp/accent.wav";
     upload.name = "accent.wav";
-    fireEvent.click(within(voice).getByRole("button", { name: "upload:Accent clip" }));
-    fireEvent.change(within(voice).getByLabelText(/Accent transcript/), {
+    fireEvent.click(screen.getByRole("button", { name: "upload:Accent clip" }));
+    fireEvent.change(screen.getByLabelText(/Accent transcript/), {
       target: { value: "Guten Tag" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start dubbing" }));
@@ -301,7 +318,8 @@ describe("DubPage dubbing mode", () => {
   it("applies background, subtitle and loudness conditionals", async () => {
     await renderPage();
     chooseInput();
-    const audio = openDisclosure(/Audio and subtitles/);
+    const advanced = openAdvanced();
+    const audio = openDisclosure(/Audio and subtitles/, advanced);
     fireEvent.click(within(audio).getByRole("switch", { name: "Keep music and ambience" }));
     fireEvent.click(within(audio).getByRole("switch", { name: "Write subtitles" }));
     fireEvent.change(within(audio).getByLabelText(/Separator/), {
@@ -336,7 +354,8 @@ describe("DubPage dubbing mode", () => {
   it("sends room matching detail only when room matching is on", async () => {
     await renderPage();
     chooseInput();
-    const audio = openDisclosure(/Audio and subtitles/);
+    const advanced = openAdvanced();
+    const audio = openDisclosure(/Audio and subtitles/, advanced);
     fireEvent.change(within(audio).getByLabelText(/Room matching/), {
       target: { value: "match" },
     });
@@ -364,17 +383,17 @@ describe("DubPage dubbing mode", () => {
   it("sends backend-specific sampling fields", async () => {
     await renderPage();
     chooseInput();
-    const backend = openDisclosure(/Backend and prosody/);
-    fireEvent.change(within(backend).getByLabelText(/TTS backend/), {
+    fireEvent.change(screen.getByLabelText(/TTS backend/), {
       target: { value: "chatterbox" },
     });
-    fireEvent.change(within(backend).getByLabelText(/Exaggeration/), {
+    const advanced = openAdvanced();
+    fireEvent.change(within(advanced).getByLabelText(/Exaggeration/), {
       target: { value: "0.8" },
     });
-    fireEvent.change(within(backend).getByLabelText(/CFG weight/), {
+    fireEvent.change(within(advanced).getByLabelText(/CFG weight/), {
       target: { value: "0.5" },
     });
-    fireEvent.change(within(backend).getByLabelText(/Temperature/), {
+    fireEvent.change(within(advanced).getByLabelText(/Temperature/), {
       target: { value: "0.7" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start dubbing" }));
@@ -394,11 +413,11 @@ describe("DubPage dubbing mode", () => {
   it("sends fish quantization only for the fish backend", async () => {
     await renderPage();
     chooseInput();
-    const backend = openDisclosure(/Backend and prosody/);
-    fireEvent.change(within(backend).getByLabelText(/TTS backend/), {
+    fireEvent.change(screen.getByLabelText(/TTS backend/), {
       target: { value: "fish" },
     });
-    fireEvent.change(within(backend).getByLabelText(/Quantization/), {
+    const advanced = openAdvanced();
+    fireEvent.change(within(advanced).getByLabelText(/Quantization/), {
       target: { value: "off" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start dubbing" }));
@@ -414,7 +433,8 @@ describe("DubPage dubbing mode", () => {
     );
     await renderPage();
     chooseInput();
-    const models = openDisclosure(/Models and hardware/);
+    const advanced = openAdvanced();
+    const models = openDisclosure(/Models and hardware/, advanced);
     expect(within(models).getByLabelText(/^Device/)).toHaveValue("cuda:1");
     expect(within(models).getByLabelText(/^Precision/)).toHaveValue("fp16");
     fireEvent.change(within(models).getByLabelText(/Fan-out devices/), {
@@ -443,7 +463,8 @@ describe("DubPage dubbing mode", () => {
   it("sends timing and cache toggles", async () => {
     await renderPage();
     chooseInput();
-    const timing = openDisclosure(/Timing, speakers and repair/);
+    const advanced = openAdvanced();
+    const timing = openDisclosure(/Timing, speakers and repair/, advanced);
     fireEvent.click(within(timing).getByRole("switch", { name: "Ignore caches" }));
     fireEvent.click(within(timing).getByRole("switch", { name: "Write provenance" }));
     fireEvent.click(within(timing).getByRole("switch", { name: "Repair overlong lines" }));
@@ -479,5 +500,124 @@ describe("DubPage dubbing mode", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Start dubbing" })).not.toBeDisabled(),
     );
+  });
+});
+
+describe("DubPage capability and combination guards", () => {
+  it("blocks a source language equal to the target", async () => {
+    await renderPage();
+    chooseInput();
+    fireEvent.change(screen.getByLabelText(/Source language/), {
+      target: { value: "French" },
+    });
+
+    expect(screen.getByRole("button", { name: "Start dubbing" })).toBeDisabled();
+    expect(screen.getByText("Source and target must differ.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Source and target language must differ."),
+    ).toBeInTheDocument();
+  });
+
+  it("needs the reference transcript in preserve mode", async () => {
+    await renderPage();
+    chooseInput();
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
+      target: { value: "preserve" },
+    });
+    upload.path = "/tmp/reference.wav";
+    upload.name = "reference.wav";
+    fireEvent.click(screen.getByRole("button", { name: "upload:Reference clip" }));
+
+    expect(screen.getByRole("button", { name: "Start dubbing" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(/Reference transcript/), {
+      target: { value: "Bonjour tout le monde" },
+    });
+    expect(screen.getByRole("button", { name: "Start dubbing" })).not.toBeDisabled();
+  });
+
+  it("needs a donor before borrowing an accent", async () => {
+    await renderPage();
+    chooseInput();
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
+      target: { value: "reference-accent" },
+    });
+    expect(screen.getByRole("button", { name: "Start dubbing" })).toBeDisabled();
+
+    // A saved accent voice is a donor too, no upload required.
+    fireEvent.change(screen.getByLabelText(/Saved accent voice/), {
+      target: { value: "warm-en" },
+    });
+    expect(screen.getByRole("button", { name: "Start dubbing" })).not.toBeDisabled();
+  });
+
+  it("disables prosody and expressive accent on the base backend", async () => {
+    await renderPage();
+    chooseInput();
+    expect(screen.getByLabelText(/Prosody plan/)).toBeDisabled();
+    expect(screen.getByLabelText(/Expressive accent/)).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(/TTS backend/), {
+      target: { value: "chatterbox" },
+    });
+    expect(screen.getByLabelText(/Prosody plan/)).not.toBeDisabled();
+    expect(screen.getByLabelText(/Expressive accent/)).not.toBeDisabled();
+  });
+
+  it("only offers the saved accent voice when borrowing an accent", async () => {
+    await renderPage();
+    chooseInput();
+    expect(screen.getByLabelText(/Saved accent voice/)).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
+      target: { value: "reference-accent" },
+    });
+    expect(screen.getByLabelText(/Saved accent voice/)).not.toBeDisabled();
+  });
+
+  it("locks accent matching outside the native mode", async () => {
+    await renderPage();
+    chooseInput();
+    const advanced = openAdvanced();
+    expect(within(advanced).getByLabelText(/Accent match/)).not.toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(/Accent mode/), {
+      target: { value: "speaker-only" },
+    });
+    expect(within(advanced).getByLabelText(/Accent match/)).toBeDisabled();
+  });
+});
+
+describe("DubPage editing", () => {
+  it("prefills the stored config and the saved voices", async () => {
+    const job = makeJob({
+      kind: "dub",
+      params: {
+        config: {
+          video: "/tmp/clip.mp4",
+          target_language: "German",
+          source_language: "English",
+          tts_backend: "fish",
+          prosody_plan: "llm",
+          device: "cpu",
+          dtype: "fp16",
+        },
+        voice: "warm-fr",
+        accent_voice: "warm-en",
+      },
+    });
+    render(<DubPage onJobStarted={vi.fn()} initialJob={job} />);
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(/Target language/)).toHaveValue("German"),
+    );
+    expect(screen.getByLabelText(/Source language/)).toHaveValue("English");
+    expect(screen.getByLabelText(/TTS backend/)).toHaveValue("fish");
+    expect(screen.getByLabelText(/Prosody plan/)).toHaveValue("llm");
+    // The saved voices live beside the config and must also come back.
+    await waitFor(() =>
+      expect(screen.getByLabelText(/Saved voice/)).toHaveValue("warm-fr"),
+    );
+    expect(screen.getByLabelText(/Saved accent voice/)).toHaveValue("warm-en");
   });
 });
