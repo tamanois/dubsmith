@@ -13,6 +13,7 @@ the form and shows the same message in the job's log.
 | Edits to `web/src` have no effect | The server serves the built bundle. Re-run `npm run build` and hard-refresh the tab; or run `npm run dev` (port 5173, proxying `/api`). |
 | Edits to `server/` or `pipeline/` have no effect | Restart `dub-server`. If the package was installed with `pip install .` instead of `pip install -e ".[web]"`, the server is running the frozen copy in `site-packages`. |
 | `Address already in use` on start | Another process owns port 8000. Stop it, or set `DUB_PORT` (and open the new port). |
+| `Attribute "app" not found in module "server.app"` | `server/app.py` exposes a factory, `create_app()`. Use `uvicorn server.asgi:app …` or `uvicorn server.app:create_app --factory …`. |
 | The app is unreachable from another machine | It binds `127.0.0.1` on purpose. Set `DUB_HOST=0.0.0.0` only behind authentication — there is none built in. |
 | An upload is rejected | Only media types and the size cap the server enforces are accepted; the file must go through the upload field. Paths outside `input/`, `output/` and the data directory are refused by design. |
 | A job stays `QUEUED` | One heavy job runs at a time; the queue is bounded and excess work is rejected. Cancel or clear the running job on **Activity**, and check that `DUB_DATA_DIR` is writable. |

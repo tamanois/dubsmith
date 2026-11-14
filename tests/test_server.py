@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pipeline.voices import save_voice
@@ -651,3 +653,23 @@ def test_job_input_streams_the_original_file(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.headers["content-disposition"].startswith("inline")
     assert client.get("/api/jobs/nope/input").status_code == 404
+
+
+def test_asgi_entry_point_exposes_an_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`uvicorn server.asgi:app` is a documented command, so `app` must exist.
+
+    The module builds the default app at import, which creates the data and
+    output directories, so it is reloaded in a temporary working directory.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DUB_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DUB_OUTPUT_DIR", str(tmp_path / "output"))
+
+    import server.asgi
+
+    app = importlib.reload(server.asgi).app
+    assert isinstance(app, FastAPI)
+    assert app.state.data_dir == (tmp_path / "data").resolve()
+    assert (tmp_path / "data" / "uploads").is_dir()

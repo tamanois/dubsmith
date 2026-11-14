@@ -259,9 +259,19 @@ dub-server
 # http://127.0.0.1:8000
 ```
 
-`python -m server` is equivalent. While working on the frontend, `npm run dev`
-serves <http://localhost:5173> and proxies `/api` to port 8000 instead; the
-single-process `dub-server` serves the built `web/dist`.
+Every way to start it, from the repository root:
+
+| Command | Use it for |
+|---|---|
+| `dub-server` | the normal start: the API and the built UI on one port |
+| `python -m server` | the same, from a checkout without the console script |
+| `make serve` | the API with auto-reload — `uvicorn server.asgi:app --reload --reload-dir server --reload-dir pipeline` |
+| `make web` | the frontend in development: Vite on <http://localhost:5173>, HMR, `/api` proxied to port 8000 |
+| `make web-build` | write `web/dist`, which the single-process server serves at `/` |
+
+The first three read `DUB_HOST` and `DUB_PORT`. The Vite server always listens on
+5173 and proxies to 8000, so start the API first; it needs Node 22 (CI's
+version) and `npm install` once in `web/`.
 
 | Variable | Default | Meaning |
 |---|---|---|

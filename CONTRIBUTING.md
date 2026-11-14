@@ -37,6 +37,20 @@ cd web && npm test         # Vitest + Testing Library
 cd web && npm run build    # tsc --noEmit and the production build
 ```
 
+### Web UI development
+
+Two processes: the API with auto-reload, and Vite with hot module replacement.
+The API needs the `web` extra (`pip install -e ".[web]"`).
+
+```bash
+make serve        # :8000, reloads when server/ or pipeline/ changes
+make web          # :5173, HMR, /api proxied to :8000
+make web-build    # write web/dist for a single-process run (dub-server)
+```
+
+`pip install -e ".[web]"` matters: a plain `pip install .` freezes a copy in
+`site-packages`, so the running server ignores your edits.
+
 Optional backends live in separate environments. See
 [Getting started → optional backends](docs/getting-started.md) and
 [Voices](docs/voices.md). Their tests skip when the dependency is absent.
