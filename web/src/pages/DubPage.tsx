@@ -1,7 +1,35 @@
 import React from "react";
 import { api } from "../api";
-import { capabilitiesOf, useBackends } from "../capabilities";
+import { backendOptions, capabilitiesOf, useBackends } from "../capabilities";
 import type { Device, Job, VoiceInfo } from "../types";
+import {
+  ACCENT_BLEND_OPTIONS,
+  ACCENT_MATCH,
+  ACCENT_MATCH_OPTIONS,
+  ACCENT_MODE,
+  ACCENT_MODE_OPTIONS,
+  DEFAULTS,
+  DEVICE_OPTIONS,
+  DIARIZER_OPTIONS,
+  DTYPE_OPTIONS,
+  EXPRESSIVE_ACCENT,
+  EXPRESSIVE_ACCENT_OPTIONS,
+  FISH_QUANTIZE_OPTIONS,
+  LANGUAGE_OPTIONS,
+  LENGTH_BUDGET_OPTIONS,
+  LOUDNESS,
+  LOUDNESS_OPTIONS,
+  OVERLAP_MODE_OPTIONS,
+  OVERLAP_SEPARATOR_OPTIONS,
+  PROSODY_PLAN,
+  PROSODY_PLAN_OPTIONS,
+  ROOM,
+  ROOM_OPTIONS,
+  SEPARATOR_OPTIONS,
+  SUBTITLES_MODE,
+  SUBTITLES_MODE_OPTIONS,
+  TTS_BACKEND,
+} from "../options";
 import {
   Badge,
   Button,
@@ -19,19 +47,6 @@ import {
 import { UploadField } from "../components/UploadField";
 import { PresetPanel } from "../components/PresetPanel";
 import { RecentInputs } from "../components/RecentInputs";
-
-const LANGUAGES = [
-  "French",
-  "English",
-  "German",
-  "Italian",
-  "Portuguese",
-  "Spanish",
-  "Japanese",
-  "Korean",
-  "Chinese",
-  "Russian",
-];
 
 const VIDEO_EXT = [".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"];
 
@@ -59,7 +74,7 @@ export function DubPage({
   const [mode, setMode] = React.useState<"dub" | "subtitles">("dub");
   const [inputPath, setInputPath] = React.useState("");
   const [inputName, setInputName] = React.useState("");
-  const [target, setTarget] = React.useState("French");
+  const [target, setTarget] = React.useState<string>(DEFAULTS.language);
   const [source, setSource] = React.useState("");
   const [voice, setVoice] = React.useState("");
   const [accentVoice, setAccentVoice] = React.useState("");
@@ -67,25 +82,29 @@ export function DubPage({
   const [refText, setRefText] = React.useState("");
   const [accentAudio, setAccentAudio] = React.useState("");
   const [accentText, setAccentText] = React.useState("");
-  const [accentMode, setAccentMode] = React.useState("native");
-  const [accentMatch, setAccentMatch] = React.useState("off");
-  const [backend, setBackend] = React.useState("qwen");
-  const [prosodyPlan, setProsodyPlan] = React.useState("auto");
-  const [device, setDevice] = React.useState("auto");
-  const [dtype, setDtype] = React.useState("auto");
+  const [accentMode, setAccentMode] = React.useState<string>(DEFAULTS.accentMode);
+  const [accentMatch, setAccentMatch] = React.useState<string>(DEFAULTS.accentMatch);
+  const [backend, setBackend] = React.useState<string>(DEFAULTS.ttsBackend);
+  const [prosodyPlan, setProsodyPlan] = React.useState<string>(DEFAULTS.prosodyPlan);
+  const [device, setDevice] = React.useState<string>(DEFAULTS.device);
+  const [dtype, setDtype] = React.useState<string>(DEFAULTS.dtype);
   const [devices, setDevices] = React.useState("");
   const [ttsBatch, setTtsBatch] = React.useState("8");
-  const [whisperModel, setWhisperModel] = React.useState("large-v3");
+  const [whisperModel, setWhisperModel] = React.useState<string>(
+    DEFAULTS.whisperModel,
+  );
   const [llmModel, setLlmModel] = React.useState("");
-  const [subtitlesMode, setSubtitlesMode] = React.useState("soft");
+  const [subtitlesMode, setSubtitlesMode] = React.useState<string>(
+    DEFAULTS.subtitlesMode,
+  );
   const [keepSubtitles, setKeepSubtitles] = React.useState(true);
   const [keepBackground, setKeepBackground] = React.useState(true);
-  const [separator, setSeparator] = React.useState("auto");
+  const [separator, setSeparator] = React.useState<string>(DEFAULTS.separator);
   const [duckDb, setDuckDb] = React.useState("6");
   const [backgroundGain, setBackgroundGain] = React.useState("0");
-  const [loudness, setLoudness] = React.useState("match-source");
+  const [loudness, setLoudness] = React.useState<string>(DEFAULTS.loudness);
   const [lufs, setLufs] = React.useState("-16");
-  const [room, setRoom] = React.useState("off");
+  const [room, setRoom] = React.useState<string>(DEFAULTS.room);
   const [roomRt60, setRoomRt60] = React.useState("");
   const [roomWetDb, setRoomWetDb] = React.useState("0");
   const [roomDuckDb, setRoomDuckDb] = React.useState("3");
@@ -96,16 +115,22 @@ export function DubPage({
   const [refine, setRefine] = React.useState(true);
   const [refineMaxPasses, setRefineMaxPasses] = React.useState("1");
   const [refineThreshold, setRefineThreshold] = React.useState("0.05");
-  const [lengthBudget, setLengthBudget] = React.useState("words");
+  const [lengthBudget, setLengthBudget] = React.useState<string>(
+    DEFAULTS.lengthBudget,
+  );
   const [budgetSpeedup, setBudgetSpeedup] = React.useState("0.85");
   const [noSpeechThreshold, setNoSpeechThreshold] = React.useState("0.6");
   const [maxChars, setMaxChars] = React.useState("42");
-  const [diarizer, setDiarizer] = React.useState("auto");
+  const [diarizer, setDiarizer] = React.useState<string>(DEFAULTS.diarizer);
   const [speakerThreshold, setSpeakerThreshold] = React.useState("");
   const [minSpeakerSeconds, setMinSpeakerSeconds] = React.useState("20");
-  const [overlap, setOverlap] = React.useState("dominant");
-  const [overlapSeparator, setOverlapSeparator] = React.useState("auto");
-  const [expressiveAccent, setExpressiveAccent] = React.useState("donor");
+  const [overlap, setOverlap] = React.useState<string>(DEFAULTS.overlapMode);
+  const [overlapSeparator, setOverlapSeparator] = React.useState<string>(
+    DEFAULTS.overlapSeparator,
+  );
+  const [expressiveAccent, setExpressiveAccent] = React.useState<string>(
+    DEFAULTS.expressiveAccent,
+  );
   const [accentBlend, setAccentBlend] = React.useState("");
   const [blendTakes, setBlendTakes] = React.useState("");
   const [blendIters, setBlendIters] = React.useState("");
@@ -115,7 +140,9 @@ export function DubPage({
   const [chatterboxTemp, setChatterboxTemp] = React.useState("");
   const [fishTemp, setFishTemp] = React.useState("");
   const [fishTopP, setFishTopP] = React.useState("");
-  const [fishQuantize, setFishQuantize] = React.useState("int8");
+  const [fishQuantize, setFishQuantize] = React.useState<string>(
+    DEFAULTS.fishQuantize,
+  );
   const [force, setForce] = React.useState(false);
   const [provenance, setProvenance] = React.useState(true);
   const [savedVoices, setSavedVoices] = React.useState<VoiceInfo[]>([]);
@@ -141,60 +168,60 @@ export function DubPage({
       setInputPath(input);
       setInputName(input.split(/[\\/]/).pop() ?? input);
     }
-    setTarget(text(config.target_language, "French"));
+    setTarget(text(config.target_language, DEFAULTS.language));
     setSource(text(config.source_language));
-    setDevice(text(config.device, "auto"));
-    setDtype(text(config.dtype, "auto"));
+    setDevice(text(config.device, DEFAULTS.device));
+    setDtype(text(config.dtype, DEFAULTS.dtype));
     setDevices(
       Array.isArray(config.devices) ? (config.devices as string[]).join(",") : "",
     );
-    setWhisperModel(text(config.whisper_model, "large-v3"));
+    setWhisperModel(text(config.whisper_model, DEFAULTS.whisperModel));
     setLlmModel(text(config.llm_model));
     setTtsBatch(text(config.tts_batch, "8"));
-    setBackend(text(config.tts_backend, "qwen"));
-    setProsodyPlan(text(config.prosody_plan, "auto"));
+    setBackend(text(config.tts_backend, DEFAULTS.ttsBackend));
+    setProsodyPlan(text(config.prosody_plan, DEFAULTS.prosodyPlan));
     setChatterboxExaggeration(text(config.chatterbox_exaggeration));
     setChatterboxCfg(text(config.chatterbox_cfg_weight));
     setChatterboxTemp(text(config.chatterbox_temperature));
     setFishTemp(text(config.fish_temperature));
     setFishTopP(text(config.fish_top_p));
-    setFishQuantize(text(config.fish_quantize, "int8"));
+    setFishQuantize(text(config.fish_quantize, DEFAULTS.fishQuantize));
     setMinStretch(text(config.min_stretch, "0.75"));
     setMaxStretch(text(config.max_stretch, "1.18"));
     setMaxOverrun(text(config.max_overrun, "0.25"));
-    setLoudness(text(config.loudness_target, "match-source"));
+    setLoudness(text(config.loudness_target, DEFAULTS.loudness));
     setLufs(text(config.target_lufs, "-16"));
     setKeepBackground(flag(config.keep_background, true));
-    setSeparator(text(config.separator, "auto"));
+    setSeparator(text(config.separator, DEFAULTS.separator));
     setDuckDb(text(config.duck_db, "6"));
     setBackgroundGain(text(config.background_gain_db, "0"));
-    setRoom(text(config.room, "off"));
+    setRoom(text(config.room, DEFAULTS.room));
     setRoomRt60(text(config.room_rt60));
     setRoomWetDb(text(config.room_wet_db, "0"));
     setRoomDuckDb(text(config.room_duck_db, "3"));
     setRoomToneDb(text(config.room_tone_gain_db, "-30"));
-    setAccentMode(text(config.accent_mode, "native"));
-    setAccentMatch(text(config.accent_match, "off"));
+    setAccentMode(text(config.accent_mode, DEFAULTS.accentMode));
+    setAccentMatch(text(config.accent_match, DEFAULTS.accentMatch));
     setAccentBlend(text(config.accent_blend));
     setBlendTakes(text(config.blend_takes));
     setBlendIters(text(config.blend_iters));
     setBlendRatio(text(config.blend_ratio));
     setAccentAudio(text(config.accent_audio));
     setAccentText(text(config.accent_text));
-    setExpressiveAccent(text(config.expressive_accent, "donor"));
-    setDiarizer(text(config.diarizer, "auto"));
+    setExpressiveAccent(text(config.expressive_accent, DEFAULTS.expressiveAccent));
+    setDiarizer(text(config.diarizer, DEFAULTS.diarizer));
     setSpeakerThreshold(text(config.speaker_threshold));
     setMinSpeakerSeconds(text(config.min_speaker_seconds, "20"));
-    setOverlap(text(config.overlap_mode, "dominant"));
-    setOverlapSeparator(text(config.overlap_separator, "auto"));
+    setOverlap(text(config.overlap_mode, DEFAULTS.overlapMode));
+    setOverlapSeparator(text(config.overlap_separator, DEFAULTS.overlapSeparator));
     setRefine(flag(config.refine, true));
     setRefineMaxPasses(text(config.refine_max_passes, "1"));
     setRefineThreshold(text(config.refine_threshold, "0.05"));
-    setLengthBudget(text(config.length_budget, "words"));
+    setLengthBudget(text(config.length_budget, DEFAULTS.lengthBudget));
     setBudgetSpeedup(text(config.budget_speedup, "0.85"));
     setNoSpeechThreshold(text(config.no_speech_threshold, "0.6"));
     setKeepSubtitles(flag(config.keep_subtitles, true));
-    setSubtitlesMode(text(config.subtitles_mode, "soft"));
+    setSubtitlesMode(text(config.subtitles_mode, DEFAULTS.subtitlesMode));
     setMaxChars(text(config.max_chars, "42"));
     setForce(flag(config.force, false));
     setProvenance(flag(config.provenance, true));
@@ -228,17 +255,22 @@ export function DubPage({
     if (source && source === target) {
       blockers.push("Source and target language must differ.");
     }
-    if (accentMode === "preserve" && !voice && refAudio && !refText.trim()) {
+    if (accentMode === ACCENT_MODE.preserve && !voice && refAudio && !refText.trim()) {
       blockers.push(
         "Add the reference clip's transcript, or choose another accent mode.",
       );
     }
-    if (accentMode === "reference-accent" && !accentVoice && !accentAudio) {
+    if (accentMode === ACCENT_MODE.referenceAccent && !accentVoice && !accentAudio) {
       blockers.push(
         "Borrowed accent needs an accent clip or a saved accent voice.",
       );
     }
-    if (accentMode === "reference-accent" && !accentVoice && accentAudio && !accentText.trim()) {
+    if (
+      accentMode === ACCENT_MODE.referenceAccent &&
+      !accentVoice &&
+      accentAudio &&
+      !accentText.trim()
+    ) {
       blockers.push("Add the accent clip's transcript.");
     }
   }
@@ -247,7 +279,7 @@ export function DubPage({
   // something in that mode. Sending it alongside another mode would silently
   // switch the run to reference-accent, which the server rejects outright.
   const accentVoiceFor =
-    accentMode === "reference-accent" ? accentVoice || undefined : undefined;
+    accentMode === ACCENT_MODE.referenceAccent ? accentVoice || undefined : undefined;
 
   function chooseInput(path: string, name: string) {
     setInputPath(path);
@@ -272,7 +304,7 @@ export function DubPage({
       llm_model: llmModel || undefined,
       tts_batch: num(ttsBatch),
       tts_backend: backend,
-      prosody_plan: allows("prosody") ? prosodyPlan : "off",
+      prosody_plan: allows("prosody") ? prosodyPlan : PROSODY_PLAN.off,
       chatterbox_exaggeration: allows("chatterbox_tuning")
         ? num(chatterboxExaggeration)
         : undefined,
@@ -287,43 +319,43 @@ export function DubPage({
       max_stretch: num(maxStretch),
       max_overrun: num(maxOverrun),
       loudness_target: loudness,
-      target_lufs: loudness === "lufs" ? num(lufs) : undefined,
+      target_lufs: loudness === LOUDNESS.lufs ? num(lufs) : undefined,
       keep_background: keepBackground,
       separator,
       duck_db: num(duckDb),
       background_gain_db: num(backgroundGain),
-      room: keepBackground ? room : "off",
+      room: keepBackground ? room : ROOM.off,
       room_rt60: room === "match" ? num(roomRt60) : undefined,
       room_wet_db: room === "match" ? num(roomWetDb) : undefined,
       room_duck_db: room === "match" ? num(roomDuckDb) : undefined,
       room_tone_gain_db: room === "match" ? num(roomToneDb) : undefined,
       accent_mode: accentMode,
-      accent_match: accentMode === "native" ? accentMatch : "off",
+      accent_match: accentMode === ACCENT_MODE.native ? accentMatch : ACCENT_MATCH.off,
       accent_blend:
-        accentMode === "native" || accentMode === "reference-accent"
+        accentMode === ACCENT_MODE.native || accentMode === ACCENT_MODE.referenceAccent
           ? accentBlend || undefined
           : undefined,
       blend_takes:
-        accentMode === "native" || accentMode === "reference-accent"
+        accentMode === ACCENT_MODE.native || accentMode === ACCENT_MODE.referenceAccent
           ? num(blendTakes)
           : undefined,
       blend_iters:
-        accentMode === "native" || accentMode === "reference-accent"
+        accentMode === ACCENT_MODE.native || accentMode === ACCENT_MODE.referenceAccent
           ? num(blendIters)
           : undefined,
       blend_ratio:
-        accentMode === "native" || accentMode === "reference-accent"
+        accentMode === ACCENT_MODE.native || accentMode === ACCENT_MODE.referenceAccent
           ? num(blendRatio)
           : undefined,
       accent_audio:
-        accentMode === "reference-accent" && !accentVoice
+        accentMode === ACCENT_MODE.referenceAccent && !accentVoice
           ? accentAudio || undefined
           : undefined,
       accent_text:
-        accentMode === "reference-accent" && !accentVoice
+        accentMode === ACCENT_MODE.referenceAccent && !accentVoice
           ? accentText || undefined
           : undefined,
-      expressive_accent: allows("expressive") ? expressiveAccent : "donor",
+      expressive_accent: allows("expressive") ? expressiveAccent : EXPRESSIVE_ACCENT.donor,
       diarizer,
       speaker_threshold: num(speakerThreshold),
       min_speaker_seconds: num(minSpeakerSeconds),
@@ -336,7 +368,7 @@ export function DubPage({
       budget_speedup: num(budgetSpeedup),
       no_speech_threshold: num(noSpeechThreshold),
       keep_subtitles: keepSubtitles,
-      subtitles_mode: keepSubtitles ? subtitlesMode : "off",
+      subtitles_mode: keepSubtitles ? subtitlesMode : SUBTITLES_MODE.off,
       force,
       provenance,
     };
@@ -457,10 +489,7 @@ export function DubPage({
                 <Select
                   value={target}
                   onChange={(event) => setTarget(event.target.value)}
-                  options={LANGUAGES.map((language) => ({
-                    value: language,
-                    label: language,
-                  }))}
+                  options={LANGUAGE_OPTIONS}
                 />
               </Field>
               <Field
@@ -477,10 +506,7 @@ export function DubPage({
                   onChange={(event) => setSource(event.target.value)}
                   options={[
                     { value: "", label: "Auto-detect" },
-                    ...LANGUAGES.map((language) => ({
-                      value: language,
-                      label: language,
-                    })),
+                    ...LANGUAGE_OPTIONS,
                   ]}
                 />
               </Field>
@@ -502,11 +528,7 @@ export function DubPage({
                 <Select
                   value={subtitlesMode}
                   onChange={(event) => setSubtitlesMode(event.target.value)}
-                  options={[
-                    { value: "soft", label: "Soft track (toggleable)" },
-                    { value: "burn", label: "Burn into the video" },
-                    { value: "off", label: "Sidecar only" },
-                  ]}
+                  options={SUBTITLES_MODE_OPTIONS}
                 />
               </Field>
               <Field
@@ -529,8 +551,7 @@ export function DubPage({
                   value={device}
                   onChange={(event) => setDevice(event.target.value)}
                   options={[
-                    { value: "auto", label: "Auto" },
-                    { value: "cpu", label: "CPU" },
+                    ...DEVICE_OPTIONS,
                     ...availableDevices.map((item) => ({
                       value: item.label,
                       label: `${item.label} — ${item.name}`,
@@ -545,12 +566,7 @@ export function DubPage({
                 <Select
                   value={dtype}
                   onChange={(event) => setDtype(event.target.value)}
-                  options={[
-                    { value: "auto", label: "Auto" },
-                    { value: "bf16", label: "bfloat16" },
-                    { value: "fp16", label: "float16" },
-                    { value: "fp32", label: "float32" },
-                  ]}
+                  options={DTYPE_OPTIONS}
                 />
               </Field>
             </div>
@@ -567,12 +583,7 @@ export function DubPage({
                   <Select
                     value={backend}
                     onChange={(event) => setBackend(event.target.value)}
-                    options={[
-                      { value: "qwen", label: "Qwen Base (cloning, no prosody)" },
-                      { value: "cosyvoice3", label: "CosyVoice3 (emotion + tokens)" },
-                      { value: "chatterbox", label: "Chatterbox (expression intensity)" },
-                      { value: "fish", label: "Fish S2-Pro (inline tags)" },
-                    ]}
+                    options={backendOptions(backends, "dub")}
                   />
                 </Field>
                 <Field
@@ -588,11 +599,7 @@ export function DubPage({
                     value={prosodyPlan}
                     disabled={!allows("prosody")}
                     onChange={(event) => setProsodyPlan(event.target.value)}
-                    options={[
-                      { value: "auto", label: "Auto" },
-                      { value: "llm", label: "Ask the LLM" },
-                      { value: "off", label: "Neutral" },
-                    ]}
+                    options={PROSODY_PLAN_OPTIONS}
                   />
                 </Field>
               </div>
@@ -622,26 +629,21 @@ export function DubPage({
                   <Select
                     value={accentMode}
                     onChange={(event) => setAccentMode(event.target.value)}
-                    options={[
-                      { value: "native", label: "Native target accent (anchor)" },
-                      { value: "preserve", label: "Keep the speaker's accent" },
-                      { value: "speaker-only", label: "Speaker timbre only" },
-                      { value: "reference-accent", label: "Borrow a reference accent" },
-                    ]}
+                    options={ACCENT_MODE_OPTIONS}
                   />
                 </Field>
                 <Field
                   label="Saved accent voice"
                   tooltip="A target-language voice used for pronunciation and accent colour, never for timbre."
                   hint={
-                    accentMode === "reference-accent"
+                    accentMode === ACCENT_MODE.referenceAccent
                       ? "A target-language voice for pronunciation."
                       : "Only used when borrowing a reference accent."
                   }
                 >
                   <Select
                     value={accentVoice}
-                    disabled={accentMode !== "reference-accent"}
+                    disabled={accentMode !== ACCENT_MODE.referenceAccent}
                     onChange={(event) => setAccentVoice(event.target.value)}
                     options={[
                       { value: "", label: "None" },
@@ -661,10 +663,7 @@ export function DubPage({
                     value={expressiveAccent}
                     disabled={!allows("expressive")}
                     onChange={(event) => setExpressiveAccent(event.target.value)}
-                    options={[
-                      { value: "donor", label: "Clone the donor" },
-                      { value: "blend", label: "Blend a native accent" },
-                    ]}
+                    options={EXPRESSIVE_ACCENT_OPTIONS}
                   />
                 </Field>
                 <UploadField
@@ -703,20 +702,16 @@ export function DubPage({
                   label="Accent match"
                   tooltip="Match the speaker's rate (and gender) to the target anchor. Native mode only."
                   hint={
-                    accentMode === "native"
+                    accentMode === ACCENT_MODE.native
                       ? "Only with the native anchor mode."
                       : "Available only in the native accent mode."
                   }
                 >
                   <Select
                     value={accentMatch}
-                    disabled={accentMode !== "native"}
+                    disabled={accentMode !== ACCENT_MODE.native}
                     onChange={(event) => setAccentMatch(event.target.value)}
-                    options={[
-                      { value: "off", label: "Off" },
-                      { value: "rate", label: "Match speaking rate" },
-                      { value: "gender", label: "Match rate and gender" },
-                    ]}
+                    options={ACCENT_MATCH_OPTIONS}
                   />
                 </Field>
 
@@ -728,8 +723,7 @@ export function DubPage({
                         onChange={(event) => setAccentBlend(event.target.value)}
                         options={[
                           { value: "", label: "Default (two-stage)" },
-                          { value: "two-stage", label: "Two-stage" },
-                          { value: "single-stage", label: "Single-stage" },
+                          ...ACCENT_BLEND_OPTIONS,
                         ]}
                       />
                     </Field>
@@ -745,7 +739,7 @@ export function DubPage({
                   </div>
                 </Disclosure>
 
-                {backend === "chatterbox" ? (
+                {backend === TTS_BACKEND.chatterbox ? (
                   <div className="grid gap-4 md:grid-cols-3">
                     <Field label="Exaggeration" tooltip="How theatrical the delivery is; blank lets the plan decide.">
                       <Input value={chatterboxExaggeration} onChange={(event) => setChatterboxExaggeration(event.target.value)} placeholder="derived" />
@@ -758,7 +752,7 @@ export function DubPage({
                     </Field>
                   </div>
                 ) : null}
-                {backend === "fish" ? (
+                {backend === TTS_BACKEND.fish ? (
                   <div className="grid gap-4 md:grid-cols-3">
                     <Field label="Temperature" tooltip="Sampling randomness; lower is steadier, higher is more varied.">
                       <Input value={fishTemp} onChange={(event) => setFishTemp(event.target.value)} placeholder="0.7" />
@@ -770,10 +764,7 @@ export function DubPage({
                       <Select
                         value={fishQuantize}
                         onChange={(event) => setFishQuantize(event.target.value)}
-                        options={[
-                          { value: "int8", label: "int8 (12 GB cards)" },
-                          { value: "off", label: "bf16 (~24 GB)" },
-                        ]}
+                        options={FISH_QUANTIZE_OPTIONS}
                       />
                     </Field>
                   </div>
@@ -797,22 +788,14 @@ export function DubPage({
                       <Select
                         value={separator}
                         onChange={(event) => setSeparator(event.target.value)}
-                        options={[
-                          { value: "auto", label: "Auto" },
-                          { value: "demucs", label: "Demucs" },
-                          { value: "none", label: "None" },
-                        ]}
+                        options={SEPARATOR_OPTIONS}
                       />
                     </Field>
                     <Field label="Subtitle mode" tooltip="A toggleable track, burned into the frames, or a sidecar SRT only.">
                       <Select
                         value={subtitlesMode}
                         onChange={(event) => setSubtitlesMode(event.target.value)}
-                        options={[
-                          { value: "soft", label: "Soft track (toggleable)" },
-                          { value: "burn", label: "Burn into the video" },
-                          { value: "off", label: "Sidecar only" },
-                        ]}
+                        options={SUBTITLES_MODE_OPTIONS}
                       />
                     </Field>
                     <Field label="Duck under dialogue (dB)" tooltip="How far the background bed drops under the dub, in decibels.">
@@ -825,20 +808,14 @@ export function DubPage({
                       <Select
                         value={room}
                         onChange={(event) => setRoom(event.target.value)}
-                        options={[
-                          { value: "off", label: "Dry voice-over" },
-                          { value: "match", label: "Match the source room" },
-                        ]}
+                        options={ROOM_OPTIONS}
                       />
                     </Field>
                     <Field label="Loudness" tooltip="Match the source loudness, or normalise to an absolute LUFS target.">
                       <Select
                         value={loudness}
                         onChange={(event) => setLoudness(event.target.value)}
-                        options={[
-                          { value: "match-source", label: "Match the source" },
-                          { value: "lufs", label: "Absolute LUFS" },
-                        ]}
+                        options={LOUDNESS_OPTIONS}
                       />
                     </Field>
                     <Field label="LUFS target" tooltip="Integrated loudness target used with absolute loudness." hint="Only with absolute loudness.">
@@ -878,10 +855,7 @@ export function DubPage({
                       <Select
                         value={diarizer}
                         onChange={(event) => setDiarizer(event.target.value)}
-                        options={[
-                          { value: "auto", label: "Separate speakers" },
-                          { value: "none", label: "Single speaker" },
-                        ]}
+                        options={DIARIZER_OPTIONS}
                       />
                     </Field>
                     <Field label="Speaker threshold" tooltip="Clustering strictness for speaker turns; higher splits less eagerly.">
@@ -894,31 +868,21 @@ export function DubPage({
                       <Select
                         value={overlap}
                         onChange={(event) => setOverlap(event.target.value)}
-                        options={[
-                          { value: "dominant", label: "Dominant speaker" },
-                          { value: "separate", label: "Separate both voices" },
-                        ]}
+                        options={OVERLAP_MODE_OPTIONS}
                       />
                     </Field>
                     <Field label="Overlap separator" tooltip="Model used to split overlapping speech; Auto picks SepFormer when installed.">
                       <Select
                         value={overlapSeparator}
                         onChange={(event) => setOverlapSeparator(event.target.value)}
-                        options={[
-                          { value: "auto", label: "Auto" },
-                          { value: "sepformer", label: "SepFormer" },
-                          { value: "none", label: "None" },
-                        ]}
+                        options={OVERLAP_SEPARATOR_OPTIONS}
                       />
                     </Field>
                     <Field label="Length budget" tooltip="Cap translated length by word count, or by duration only.">
                       <Select
                         value={lengthBudget}
                         onChange={(event) => setLengthBudget(event.target.value)}
-                        options={[
-                          { value: "words", label: "Word budget" },
-                          { value: "off", label: "Duration only" },
-                        ]}
+                        options={LENGTH_BUDGET_OPTIONS}
                       />
                     </Field>
                     <Field label="Budget speedup" tooltip="Target speaking-rate multiplier used when a line is over its word budget.">
@@ -961,8 +925,7 @@ export function DubPage({
                         value={device}
                         onChange={(event) => setDevice(event.target.value)}
                         options={[
-                          { value: "auto", label: "Auto" },
-                          { value: "cpu", label: "CPU" },
+                          ...DEVICE_OPTIONS,
                           ...availableDevices.map((item) => ({
                             value: item.label,
                             label: `${item.label} — ${item.name}`,
@@ -974,12 +937,7 @@ export function DubPage({
                       <Select
                         value={dtype}
                         onChange={(event) => setDtype(event.target.value)}
-                        options={[
-                          { value: "auto", label: "Auto" },
-                          { value: "bf16", label: "bfloat16" },
-                          { value: "fp16", label: "float16" },
-                          { value: "fp32", label: "float32" },
-                        ]}
+                        options={DTYPE_OPTIONS}
                       />
                     </Field>
                     <Field label="Fan-out devices" tooltip="Extra GPUs to spread synthesis over, each with its own worker." hint="Comma-separated, e.g. cuda:0,cuda:1">

@@ -186,4 +186,4 @@ by deleting anything.
 ---
 
 Next: [Outputs and caching](outputs-and-caching.md), or the
-[full option reference](options.md).
+[full option reference](reference.md).

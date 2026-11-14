@@ -15,6 +15,7 @@ import type {
   Usage,
   VoiceInfo,
 } from "./types";
+import { STRETCHER } from "./options";
 
 const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
 
@@ -102,7 +103,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ languages, force }),
     }),
-  submitDub: (config: Record<string, unknown>, stretcher = "auto") =>
+  submitDub: (config: Record<string, unknown>, stretcher = STRETCHER.auto) =>
     request<{ job_id: string; state: string }>(
       `/api/jobs/dub?stretcher=${encodeURIComponent(stretcher)}`,
       { method: "POST", body: JSON.stringify(config) },

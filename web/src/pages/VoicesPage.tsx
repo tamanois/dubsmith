@@ -1,5 +1,6 @@
 import React from "react";
 import { api } from "../api";
+import { DEFAULTS, DEVICE_OPTIONS, DTYPE_OPTIONS, LANGUAGE_OPTIONS } from "../options";
 import type { VoiceInfo } from "../types";
 import {
   Button,
@@ -18,19 +19,6 @@ import {
 } from "../ui";
 import { UploadField } from "../components/UploadField";
 
-const LANGUAGES = [
-  "French",
-  "English",
-  "German",
-  "Italian",
-  "Portuguese",
-  "Spanish",
-  "Japanese",
-  "Korean",
-  "Chinese",
-  "Russian",
-];
-
 const PAGE_SIZE = 20;
 
 export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => void }) {
@@ -44,7 +32,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
   const [deleting, setDeleting] = React.useState(false);
 
   const [prompt, setPrompt] = React.useState("");
-  const [language, setLanguage] = React.useState("French");
+  const [language, setLanguage] = React.useState<string>(DEFAULTS.language);
   const [label, setLabel] = React.useState("");
   const [speak, setSpeak] = React.useState("");
   const [clip, setClip] = React.useState("");
@@ -52,8 +40,8 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
   const [transcribe, setTranscribe] = React.useState(true);
   const [verify, setVerify] = React.useState(false);
   const [force, setForce] = React.useState(false);
-  const [device, setDevice] = React.useState("auto");
-  const [dtype, setDtype] = React.useState("auto");
+  const [device, setDevice] = React.useState<string>(DEFAULTS.device);
+  const [dtype, setDtype] = React.useState<string>(DEFAULTS.dtype);
 
   const refresh = React.useCallback(() => {
     api
@@ -181,7 +169,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
               <Select
                 value={language}
                 onChange={(event) => setLanguage(event.target.value)}
-                options={LANGUAGES.map((item) => ({ value: item, label: item }))}
+                options={LANGUAGE_OPTIONS}
               />
             </Field>
             <Field label="Label" hint="Optional; derived from the description otherwise.">
@@ -195,8 +183,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
                 value={device}
                 onChange={(event) => setDevice(event.target.value)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "cpu", label: "CPU" },
+                  ...DEVICE_OPTIONS,
                   { value: "cuda:0", label: "cuda:0" },
                   { value: "cuda:1", label: "cuda:1" },
                 ]}
@@ -206,12 +193,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
               <Select
                 value={dtype}
                 onChange={(event) => setDtype(event.target.value)}
-                options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "bf16", label: "bfloat16" },
-                  { value: "fp16", label: "float16" },
-                  { value: "fp32", label: "float32" },
-                ]}
+                options={DTYPE_OPTIONS}
               />
             </Field>
           </div>
@@ -254,7 +236,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
               <Select
                 value={language}
                 onChange={(event) => setLanguage(event.target.value)}
-                options={LANGUAGES.map((item) => ({ value: item, label: item }))}
+                options={LANGUAGE_OPTIONS}
               />
             </Field>
             <Field label="Label">
@@ -320,7 +302,7 @@ export function VoicesPage({ onJobStarted }: { onJobStarted: (id: string) => voi
               <Select
                 value={language}
                 onChange={(event) => setLanguage(event.target.value)}
-                options={LANGUAGES.map((item) => ({ value: item, label: item }))}
+                options={LANGUAGE_OPTIONS}
               />
             </Field>
             <Field label="Label">

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pipeline.config import JobConfig
 from pipeline.errors import ConfigError
-
-_BACKENDS = Literal["qwen", "customvoice", "cosyvoice3", "chatterbox", "fish"]
+from pipeline.options import (
+    AccentMode,
+    Defaults,
+    FishQuantize,
+    FishTagMode,
+    SayBackend,
+    SayProsodyPlan,
+    StylePlan,
+    StylePlanScope,
+)
 
 
 class DubRequest(BaseModel):
@@ -20,7 +28,7 @@ class DubRequest(BaseModel):
     config: JobConfig
     voice: str | None = None
     accent_voice: str | None = None
-    stretcher: str = "auto"
+    stretcher: str = Defaults.STRETCHER
 
     @model_validator(mode="before")
     @classmethod
@@ -43,14 +51,14 @@ class DubRequest(BaseModel):
         mode = config.get("accent_mode")
         if mode is None:
             return data
-        if mode != "reference-accent":
+        if mode != AccentMode.REFERENCE_ACCENT:
             raise ConfigError(
                 "--accent-voice implies --accent-mode reference-accent; drop "
                 f"--accent-mode {mode!r} or the saved accent voice."
             )
         if config.get("accent_audio") or (config.get("accent_text") or "").strip():
             return data
-        return {**data, "config": {**config, "accent_mode": "native"}}
+        return {**data, "config": {**config, "accent_mode": AccentMode.NATIVE.value}}
 
 
 class SayRequest(BaseModel):
@@ -59,7 +67,7 @@ class SayRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str
-    backend: _BACKENDS = "qwen"
+    backend: SayBackend = SayBackend.QWEN
     voice: str | None = None
     design: str | None = None
     clone: str | None = None
@@ -74,18 +82,18 @@ class SayRequest(BaseModel):
     provenance: bool = True
     prosody: list[str] | None = None
     emotions: list[str] | None = None
-    prosody_plan: Literal["off", "llm"] = "off"
+    prosody_plan: SayProsodyPlan = SayProsodyPlan.OFF
     style_instructs: list[str] | None = None
-    style_plan: Literal["off", "llm"] = "off"
-    style_plan_scope: Literal["per-line", "whole"] = "per-line"
+    style_plan: StylePlan = StylePlan.OFF
+    style_plan_scope: StylePlanScope = StylePlanScope.PER_LINE
     plan_chunk: int | None = Field(default=None, ge=1)
     chatterbox_exaggeration: float | None = Field(default=None, ge=0.0, le=1.0)
     chatterbox_cfg_weight: float | None = None
     chatterbox_temperature: float | None = None
     fish_temperature: float | None = None
     fish_top_p: float | None = None
-    fish_quantize: Literal["int8", "off"] | None = None
-    fish_tag_mode: Literal["keep", "llm"] = "keep"
+    fish_quantize: FishQuantize | None = None
+    fish_tag_mode: FishTagMode = FishTagMode.KEEP
 
 
 class VoiceDesignRequest(BaseModel):

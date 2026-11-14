@@ -62,6 +62,16 @@ from .errors import ASRError, MediaError, TTSError
 from .logging_utils import job_logger
 from .mixing import apply_room, duck_and_mix, room_tone_floor
 from .models import anchors_dir, resolve_model
+from .options import (
+    AccentBlend,
+    AccentMatch,
+    AccentMode,
+    ExpressiveAccent,
+    LengthBudget,
+    LoudnessPolicy,
+    ProsodyPlan,
+    TtsBackend,
+)
 from .overlap_separation import NullSpeakerSeparator, detect_speaker_separator
 from .parallel import (
     BLEND,
@@ -549,9 +559,10 @@ class Pipeline:
         and ``speaker-only`` stay on the donor path.
         """
         return (
-            self.job.tts_backend != "qwen"
-            and self.job.expressive_accent == "blend"
-            and self.job.accent_mode in ("native", "reference-accent")
+            self.job.tts_backend != TtsBackend.QWEN
+            and self.job.expressive_accent == ExpressiveAccent.BLEND
+            and self.job.accent_mode
+            in (AccentMode.NATIVE, AccentMode.REFERENCE_ACCENT)
         )
 
     def _release_expressive_blend_engine(self) -> None:
@@ -574,9 +585,12 @@ class Pipeline:
         difference between "French with an English accent" and a clear next step.
         """
         backend = self.job.tts_backend
-        if backend == "qwen" or self.job.expressive_accent == "blend":
+        if (
+            backend == TtsBackend.QWEN
+            or self.job.expressive_accent == ExpressiveAccent.BLEND
+        ):
             return
-        if self.job.accent_mode == "preserve":
+        if self.job.accent_mode == AccentMode.PRESERVE:
             return
         message = (
             f"Backend {backend} clones the source speaker's accent; "
@@ -584,12 +598,12 @@ class Pipeline:
             "Use --expressive-accent blend for a target-language reference, "
             "or --accent-mode preserve to make this fallback explicit."
         )
-        if backend == "fish":
+        if backend == TtsBackend.FISH:
             message += (
                 " Fish has no language parameter, so it cannot separate timbre "
                 "from the reference accent."
             )
-        if self.job.accent_match != "off":
+        if self.job.accent_match != AccentMatch.OFF:
             message += " --accent-match has no effect in this fallback."
         self.log.warning(message)
 
@@ -674,7 +688,7 @@ class Pipeline:
                 device=self.job.primary_device,
                 dtype=dtype,
                 batch_size=self.job.tts_batch,
-                x_vector_only=self.job.accent_mode == "speaker-only",
+                x_vector_only=self.job.accent_mode == AccentMode.SPEAKER_ONLY,
             )
         return self._tts
 
@@ -717,7 +731,7 @@ class Pipeline:
             device=device,
             dtype=self.job.dtype,
             batch_size=self.job.tts_batch,
-            x_vector_only=self.job.accent_mode == "speaker-only",
+            x_vector_only=self.job.accent_mode == AccentMode.SPEAKER_ONLY,
             verbose=self.log.isEnabledFor(logging.DEBUG),
         )
 
@@ -999,7 +1013,7 @@ class Pipeline:
                 "transcript_provided": bool((self.job.ref_text or "").strip()),
                 "accent_mode": self.job.accent_mode,
             }
-        elif self.job.accent_mode in ("native", "reference-accent"):
+        elif self.job.accent_mode in (AccentMode.NATIVE, AccentMode.REFERENCE_ACCENT):
             # Timbre came from the video, so it is unknown without donor.json; the
             # accent source is still known from config or the resolved anchors.
             info = {"accent_mode": self.job.accent_mode}
@@ -1647,7 +1661,7 @@ class Pipeline:
         simply ignores. One probe render per speaker buys the measurement; it is a
         single line of the accent text, so it is noise beside the job it sizes.
         """
-        if self.job.tts_backend != "qwen":
+        if self.job.tts_backend != TtsBackend.QWEN:
             # The probe renders through the Base checkpoint; expressive backends
             # fall back to the anchor/reference clip rate below.
             return {}
@@ -1717,7 +1731,7 @@ class Pipeline:
         at all does it fall back to the accent clip's rate, which is what this
         used to rely on and is a measured ~20% under-estimate.
         """
-        if self.job.length_budget != "words":
+        if self.job.length_budget != LengthBudget.WORDS:
             return None
         if speaker is not None and rates.get(speaker):
             return float(rates[speaker])
@@ -1732,7 +1746,7 @@ class Pipeline:
         reads a passage at its own pace, so the two disagree. Kept as the fallback
         for the one case the probe cannot cover - no target-language text to read.
         """
-        if self.job.accent_mode == "native":
+        if self.job.accent_mode == AccentMode.NATIVE:
             # The generated anchor is target-language speech, so it sizes the
             # budget exactly as a supplied accent clip would.
             if self._primary_accent is None:
@@ -1742,7 +1756,7 @@ class Pipeline:
                 )
                 return None
             clip, text = self._primary_accent
-        elif self.job.accent_mode == "reference-accent":
+        elif self.job.accent_mode == AccentMode.REFERENCE_ACCENT:
             clip, text = self.job.accent_audio, self.job.accent_text
         elif self.job.ref_audio is not None and self.job.ref_text:
             clip, text = self.job.ref_audio, self.job.ref_text
@@ -2052,9 +2066,9 @@ class Pipeline:
         the VoiceDesign checkpoint at all.
         """
         if (
-            self.job.tts_backend != "qwen"
+            self.job.tts_backend != TtsBackend.QWEN
             and not self._uses_expressive_accent_blend()
-            and self.job.accent_mode != "reference-accent"
+            and self.job.accent_mode != AccentMode.REFERENCE_ACCENT
         ):
             # Without the opt-in expressive blend, an expressive backend clones
             # each speaker from the donor/pinned clip and takes its accent from
@@ -2068,7 +2082,7 @@ class Pipeline:
 
         speakers = self._speaker_order(transcript.segments)
 
-        if self.job.accent_mode == "reference-accent":
+        if self.job.accent_mode == AccentMode.REFERENCE_ACCENT:
             assert self.job.accent_audio is not None  # guaranteed by JobConfig
             text = self.job.accent_text or ""
             self._accents = {name: (self.job.accent_audio, text) for name in speakers}
@@ -2084,17 +2098,17 @@ class Pipeline:
             self._primary_speaker_name = self._primary_speaker(transcript)
             return dict(self._accents)
 
-        if self.job.accent_mode != "native":
+        if self.job.accent_mode != AccentMode.NATIVE:
             self._accents, self._accent_records, self._primary_accent = {}, {}, None
             self._primary_speaker_name = None
             return {}
 
         anchor_root = anchors_dir(self.settings.models_dir)
-        matched = self.job.accent_match != "off"
+        matched = self.job.accent_match != AccentMatch.OFF
         bands = self._speaker_rate_bands(transcript) if matched else {}
         genders = (
             self._speaker_genders(audio_path, transcript)
-            if self.job.accent_match == "gender"
+            if self.job.accent_match == AccentMatch.GENDER
             else {}
         )
 
@@ -2140,11 +2154,11 @@ class Pipeline:
         Re-derived from ``blend.json`` rather than held in memory, so a run served
         from cache still reports the strategy behind the voice it is reusing.
         """
-        if self.job.accent_mode not in ("native", "reference-accent"):
+        if self.job.accent_mode not in (AccentMode.NATIVE, AccentMode.REFERENCE_ACCENT):
             return None
-        if self.job.accent_blend_mode != "two-stage":
-            return {"strategy": "single-stage"}
-        strategy: dict[str, Any] = {"strategy": "two-stage"}
+        if self.job.accent_blend_mode != AccentBlend.TWO_STAGE:
+            return {"strategy": AccentBlend.SINGLE_STAGE.value}
+        strategy: dict[str, Any] = {"strategy": AccentBlend.TWO_STAGE.value}
         path = self.job_dir / _BLEND_INFO_NAME
         if not path.is_file():
             return strategy
@@ -2229,16 +2243,19 @@ class Pipeline:
         clips fix the voice of the whole video: regenerating them would make an
         otherwise identical rerun sound like different people.
         """
-        if self.job.tts_backend != "qwen" and not self._uses_expressive_accent_blend():
+        if (
+            self.job.tts_backend != TtsBackend.QWEN
+            and not self._uses_expressive_accent_blend()
+        ):
             # The two-stage blend is a Qwen-Base mechanism, and running it would
             # load that checkpoint. Without the opt-in expressive blend, an
             # expressive backend clones the donor directly.
             return {}
-        if self.job.accent_mode not in ("native", "reference-accent"):
+        if self.job.accent_mode not in (AccentMode.NATIVE, AccentMode.REFERENCE_ACCENT):
             return {}
-        if self.job.accent_blend_mode != "two-stage":
+        if self.job.accent_blend_mode != AccentBlend.TWO_STAGE:
             return {}
-        if self.job.tts_backend != "qwen":
+        if self.job.tts_backend != TtsBackend.QWEN:
             self.log.info(
                 "Building the target-language reference for %s with Qwen Base.",
                 self.job.tts_backend,
@@ -2277,7 +2294,7 @@ class Pipeline:
                 media.write_audio(out, blended.samples, blended.sample_rate)
                 rendered[name] = out
                 stats[name] = {
-                    "strategy": "two-stage",
+                    "strategy": AccentBlend.TWO_STAGE.value,
                     "takes": blended.takes,
                     "iters": blended.iters,
                     "target_ratio": target_ratio,
@@ -2335,7 +2352,7 @@ class Pipeline:
             self._write_voices(transcript, donors, blends)
 
             recorder: Any | None = None
-            if self.job.tts_backend == "qwen":
+            if self.job.tts_backend == TtsBackend.QWEN:
                 produced, sample_rate = self._synthesize_all(
                     lines, script, donors, blends
                 )
@@ -2522,10 +2539,10 @@ class Pipeline:
         kept, so the artifact reflects the text that was actually spoken.
         """
         by_id = {segment.id: text for segment, text in zip(segments, texts)}
-        if self.job.tts_backend == "qwen":
+        if self.job.tts_backend == TtsBackend.QWEN:
             produced, _rate = self._synthesize_all(segments, by_id, donors, blends)
         else:
-            if self.job.tts_backend == "fish":
+            if self.job.tts_backend == TtsBackend.FISH:
                 prosody, recorder = self._plan_prosody(segments, by_id, recorder)
             produced, _rate = self._synthesize_expressive(
                 segments, by_id, donors, tmp_dir, prosody, recorder, blends
@@ -2589,25 +2606,26 @@ class Pipeline:
                 language=self.job.target_language,
                 plan_source=(
                     "llm"
-                    if backend != "qwen" and self.job.prosody_plan == "llm"
+                    if backend != TtsBackend.QWEN
+                    and self.job.prosody_plan == ProsodyPlan.LLM
                     else "off"
                 ),
             )
-        if backend == "qwen":
-            if self.job.prosody_plan == "llm":
+        if backend == TtsBackend.QWEN:
+            if self.job.prosody_plan == ProsodyPlan.LLM:
                 self.log.warning(
                     "Qwen Base has no prosody controls; --prosody-plan llm is "
                     "ignored."
                 )
             return {}, recorder
-        if self.job.prosody_plan == "off":
+        if self.job.prosody_plan == ProsodyPlan.OFF:
             return {}, recorder
 
         ids = [segment.id for segment in lines]
         texts = [script.get(segment_id, "") for segment_id in ids]
         indexes = [index for index, text in enumerate(texts) if text.strip()]
 
-        if backend == "fish":
+        if backend == TtsBackend.FISH:
             from .prosody import FishInlinePlanner
 
             planned = list(texts)
@@ -2627,7 +2645,7 @@ class Pipeline:
                     )
                     recorder.set_plan_source("llm")
                 except Exception as exc:  # noqa: BLE001 - fall back on any failure
-                    if self.job.prosody_plan == "llm":
+                    if self.job.prosody_plan == ProsodyPlan.LLM:
                         raise
                     recorder.set_plan_source("llm_failed")
                     self.log.warning(
@@ -2663,7 +2681,7 @@ class Pipeline:
                 planned_specs = planner.plan([texts[index] for index in indexes])
                 recorder.set_plan_source("llm")
             except Exception as exc:  # noqa: BLE001 - fall back on any failure
-                if self.job.prosody_plan == "llm":
+                if self.job.prosody_plan == ProsodyPlan.LLM:
                     raise
                 recorder.set_plan_source("llm_failed")
                 self.log.warning(
@@ -2751,9 +2769,9 @@ class Pipeline:
         # codes so an unsupported auto-detected language simply stays on the
         # zero-shot path rather than raising.
         cross_lingual = (
-            backend == "cosyvoice3"
+            backend == TtsBackend.COSYVOICE3
             and not blends
-            and self.job.accent_mode != "preserve"
+            and self.job.accent_mode != AccentMode.PRESERVE
             and self.job.ref_audio is None
             and source_code is not None
             and language_code is not None
@@ -2785,7 +2803,7 @@ class Pipeline:
                 if not text.strip():
                     continue
                 ids.append(segment.id)
-                if backend == "fish":
+                if backend == TtsBackend.FISH:
                     speak.append(str(prosody.get(segment.id, text)))
                 else:
                     speak.append(text)
@@ -2793,7 +2811,7 @@ class Pipeline:
             if not ids:
                 continue
             trace: list[dict[str, Any]] = []
-            if backend == "fish":
+            if backend == TtsBackend.FISH:
                 wavs = engine.synthesize(
                     speak,
                     reference=reference,
@@ -2801,7 +2819,7 @@ class Pipeline:
                     language=language,
                     trace=trace,
                 )
-            elif backend == "chatterbox":
+            elif backend == TtsBackend.CHATTERBOX:
                 wavs = engine.synthesize(
                     speak,
                     reference=reference,
@@ -2832,7 +2850,7 @@ class Pipeline:
                     )
                     spec = (
                         specs[position].model_dump()
-                        if backend != "fish" and position < len(specs)
+                        if backend != TtsBackend.FISH and position < len(specs)
                         else None
                     )
                     recorder.record_line(
@@ -2890,7 +2908,7 @@ class Pipeline:
         if recorder is None:
             recorder = ProvenanceRecorder(
                 "dub",
-                "qwen",
+                TtsBackend.QWEN.value,
                 language=self.job.target_language,
                 plan_source="off",
             )
@@ -3488,7 +3506,7 @@ class Pipeline:
             if self.job.target_lufs is not None
             else self.settings.target_lufs
         )
-        if self._loudness_policy() != "match-source":
+        if self._loudness_policy() != LoudnessPolicy.MATCH_SOURCE:
             return float(fallback)
 
         source = self._source_loudness()

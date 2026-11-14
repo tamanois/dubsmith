@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Collection, Protocol, Sequence
 import numpy as np
 import soundfile as sf
 
+from . import options
 from .errors import DependencyError, TimingError
 from .media import limit_peaks, run_command, write_audio
 
@@ -179,7 +180,7 @@ class LibrosaStretcher:
 
 
 def detect_stretcher(
-    preference: str = "auto",
+    preference: str = options.Defaults.STRETCHER,
     *,
     work_dir: Path | str | None = None,
 ) -> TimeStretcher:
@@ -198,31 +199,38 @@ def detect_stretcher(
     """
     import shutil
 
-    preference = (preference or "auto").lower()
+    preference = (preference or options.Defaults.STRETCHER).lower()
+    canonical = options.STRETCHER_ALIASES.get(preference)
 
-    if preference in {"none", "identity", "off"}:
+    if canonical == options.Stretcher.NONE:
         return IdentityStretcher()
 
     available: dict[str, type] = {
-        "rubberband": RubberbandStretcher,
-        "sox": SoxStretcher,
-        "librosa": LibrosaStretcher,
+        options.Stretcher.RUBBERBAND.value: RubberbandStretcher,
+        options.Stretcher.SOX.value: SoxStretcher,
+        options.Stretcher.LIBROSA.value: LibrosaStretcher,
     }
 
-    if preference != "auto":
-        backend = available.get(preference)
+    if canonical != options.Stretcher.AUTO:
+        backend = available.get(canonical) if canonical else None
         if backend is None:
             raise DependencyError(
-                f"Unknown stretcher {preference!r}. Choose from: auto, none, "
-                f"{', '.join(sorted(available))}"
+                f"Unknown stretcher {preference!r}. Choose from: "
+                f"{', '.join(options.STRETCHERS)}"
             )
-        if preference in {"rubberband", "sox"} and shutil.which(preference) is None:
+        if canonical in {
+            options.Stretcher.RUBBERBAND,
+            options.Stretcher.SOX,
+        } and shutil.which(canonical) is None:
             raise DependencyError(
                 f"Stretcher {preference!r} was requested but the binary is not on PATH."
             )
         return backend(work_dir) if backend in {RubberbandStretcher, SoxStretcher} else backend()  # type: ignore[call-arg]
 
-    for name, cls in (("rubberband", RubberbandStretcher), ("sox", SoxStretcher)):
+    for name, cls in (
+        (options.Stretcher.RUBBERBAND.value, RubberbandStretcher),
+        (options.Stretcher.SOX.value, SoxStretcher),
+    ):
         if shutil.which(name) is not None:
             return cls(work_dir)
     return LibrosaStretcher()

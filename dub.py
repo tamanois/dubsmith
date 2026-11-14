@@ -29,7 +29,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from pipeline import __version__
+from pipeline import __version__, options
 from pipeline.asr import asr_device, resolve_compute_type
 from pipeline.config import (
     DEFAULT_BUDGET_SPEEDUP,
@@ -169,8 +169,8 @@ def build_anchors_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=["auto", "bf16", "fp16", "fp32"],
+        default=options.Defaults.DTYPE,
+        choices=options.DTYPES,
         help="Precision for the VoiceDesign checkpoint (default: auto).",
     )
     parser.add_argument(
@@ -318,8 +318,8 @@ def build_voices_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=["auto", "bf16", "fp16", "fp32"],
+        default=options.Defaults.DTYPE,
+        choices=options.DTYPES,
         help="Precision for the checkpoint (default: auto).",
     )
     parser.add_argument(
@@ -392,14 +392,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        default="qwen",
-        choices=[
-            "qwen",
-            "customvoice",
-            "cosyvoice3",
-            "chatterbox",
-            "fish",
-        ],
+        default=options.Defaults.SAY_BACKEND,
+        choices=options.SAY_BACKENDS,
         help=(
             "Synthesiser: 'qwen' (default) clones with the Qwen Base checkpoint; "
             "'customvoice' uses a preset Qwen CustomVoice speaker with a tone/"
@@ -460,8 +454,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prosody-plan",
         dest="prosody_plan",
-        default="off",
-        choices=["off", "llm"],
+        default=options.Defaults.SAY_PROSODY_PLAN,
+        choices=options.SAY_PROSODY_PLANS,
         help=(
             "Let the configured OpenAI-compatible model decide per-line prosody "
             "from the text. 'off' uses only --prosody/--emotion; 'llm' plans it "
@@ -471,8 +465,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--style-plan",
         dest="style_plan",
-        default="off",
-        choices=["off", "llm"],
+        default=options.Defaults.STYLE_PLAN,
+        choices=options.STYLE_PLANS,
         help=(
             "CustomVoice only: let the configured OpenAI-compatible model write "
             "the rich verbatim delivery instruction that --style-instruct takes "
@@ -483,8 +477,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--style-plan-scope",
         dest="style_plan_scope",
-        default="per-line",
-        choices=["per-line", "whole"],
+        default=options.Defaults.STYLE_PLAN_SCOPE,
+        choices=options.STYLE_PLAN_SCOPES,
         help=(
             "With --style-plan llm: 'per-line' writes one instruction per line "
             "(chunked, with a whole-passage overview when long); 'whole' writes "
@@ -544,8 +538,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fish-tag-mode",
         dest="fish_tag_mode",
-        default="keep",
-        choices=["keep", "llm"],
+        default=options.Defaults.FISH_TAG_MODE,
+        choices=options.FISH_TAG_MODES,
         help=(
             "Fish Speech: tags are the checkpoint's only style channel. 'keep' "
             "(default) speaks --text exactly as written, tags included; 'llm' has "
@@ -557,7 +551,7 @@ def build_say_parser() -> argparse.ArgumentParser:
         "--fish-quantize",
         dest="fish_quantize",
         default=None,
-        choices=["int8", "off"],
+        choices=options.FISH_QUANTIZES,
         help=(
             "Fish Speech weight format. 'int8' (default) loads 8-bit weight-only "
             "(~6 GB resident, ~11 GB peak) so the model fits a 12 GB card; "
@@ -602,8 +596,8 @@ def build_say_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=["auto", "bf16", "fp16", "fp32"],
+        default=options.Defaults.DTYPE,
+        choices=options.DTYPES,
         help="Precision for the checkpoint (default: auto).",
     )
     parser.add_argument(
@@ -775,8 +769,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=["auto", "bf16", "fp16", "fp32"],
+        default=options.Defaults.DTYPE,
+        choices=options.DTYPES,
         help=(
             "Precision for the voice-cloning checkpoint. 'auto' reads the "
             "device's capability: bf16 on Ampere and newer, fp16 on older "
@@ -784,7 +778,11 @@ def build_dub_parser() -> argparse.ArgumentParser:
             "the device cannot run it."
         ),
     )
-    parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
+    parser.add_argument(
+        "--whisper-model",
+        default=options.Defaults.WHISPER_MODEL,
+        help="Whisper model id.",
+    )
     parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
     parser.add_argument(
         "--tts-batch",
@@ -801,8 +799,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         dest="tts_backend",
-        default="qwen",
-        choices=["qwen", "cosyvoice3", "chatterbox", "fish"],
+        default=options.Defaults.TTS_BACKEND,
+        choices=options.TTS_BACKENDS,
         help=(
             "Synthesiser for the dubbed lines. 'qwen' (default) clones with the "
             "Qwen Base checkpoint and has no prosody control; 'cosyvoice3', "
@@ -814,8 +812,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prosody-plan",
         dest="prosody_plan",
-        default="auto",
-        choices=["off", "llm", "auto"],
+        default=options.Defaults.PROSODY_PLAN,
+        choices=options.PROSODY_PLANS,
         help=(
             "Let the configured OpenAI-compatible model decide per-line delivery "
             "(emotion, pace, volume, breath, pause, laughter) for the expressive "
@@ -866,7 +864,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--fish-quantize",
         dest="fish_quantize",
         default=None,
-        choices=["int8", "off"],
+        choices=options.FISH_QUANTIZES,
         help=(
             "Fish Speech weight format. 'int8' loads 8-bit weight-only so the "
             "model fits a 12 GB card; 'off' loads the bf16 weights."
@@ -874,8 +872,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stretcher",
-        default="auto",
-        choices=["auto", "rubberband", "sox", "librosa", "none"],
+        default=options.Defaults.STRETCHER,
+        choices=options.STRETCHERS,
         help="Time-stretch backend.",
     )
     parser.add_argument(
@@ -909,7 +907,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--loudness",
         dest="loudness_target",
         default=None,
-        choices=["match-source", "lufs"],
+        choices=options.LOUDNESS_POLICIES,
         help=(
             "Loudness policy: 'match-source' (default) sits the dub at the level "
             "of the original track; 'lufs' forces --lufs."
@@ -934,8 +932,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--separator",
-        default="auto",
-        choices=["auto", "demucs", "none"],
+        default=options.Defaults.SEPARATOR,
+        choices=options.SEPARATORS,
         help="Backend used to split speech from background.",
     )
     parser.add_argument(
@@ -946,8 +944,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--room",
-        default="off",
-        choices=["off", "match"],
+        default=options.Defaults.ROOM,
+        choices=options.ROOMS,
         help=(
             "'match' places the dub in the source's own acoustic space: a reverb "
             "tail, a continuous room-tone floor and a shallower duck, all derived "
@@ -1002,7 +1000,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--accent-mode",
         dest="accent_mode",
         default=None,
-        choices=["native", "preserve", "speaker-only", "reference-accent"],
+        choices=options.ACCENT_MODES,
         help=(
             "'native' (the default) keeps the speaker's timbre and takes "
             "pronunciation from a generated native accent anchor; 'preserve' "
@@ -1017,8 +1015,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--accent-match",
         dest="accent_match",
-        default="off",
-        choices=["off", "rate", "gender"],
+        default=options.Defaults.ACCENT_MATCH,
+        choices=options.ACCENT_MATCHES,
         help=(
             "With --accent-mode native, generate a per-speaker accent anchor that "
             "fits the source voice: 'rate' matches its speaking rate, 'gender' also "
@@ -1056,7 +1054,7 @@ def build_dub_parser() -> argparse.ArgumentParser:
         "--accent-blend",
         dest="accent_blend",
         default=None,
-        choices=["two-stage", "single-stage"],
+        choices=options.ACCENT_BLENDS,
         help=(
             "'two-stage' (default) renders the accent transcript once in the "
             "speaker's own voice and clones every line from that clip, so the "
@@ -1067,8 +1065,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expressive-accent",
         dest="expressive_accent",
-        default="donor",
-        choices=["donor", "blend"],
+        default=options.Defaults.EXPRESSIVE_ACCENT,
+        choices=options.EXPRESSIVE_ACCENTS,
         help=(
             "How an expressive backend (cosyvoice3, chatterbox, fish) gets its "
             "clone reference: 'donor' (default) clones the source-language "
@@ -1117,8 +1115,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--diarizer",
         dest="diarizer",
-        default="auto",
-        choices=["auto", "none"],
+        default=options.Defaults.DIARIZER,
+        choices=options.DIARIZERS,
         help=(
             "'auto' separates the speakers and clones each voice from its own "
             "donor; 'none' treats the video as a single speaker, as before. "
@@ -1152,8 +1150,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overlap",
         dest="overlap_mode",
-        default="dominant",
-        choices=["dominant", "separate"],
+        default=options.Defaults.OVERLAP_MODE,
+        choices=options.OVERLAP_MODES,
         help=(
             "How to handle a segment that carries two voices at once. 'dominant' "
             "dubs the whole line in its dominant speaker's voice (the default); "
@@ -1164,8 +1162,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overlap-separator",
         dest="overlap_separator",
-        default="auto",
-        choices=["auto", "none", "sepformer"],
+        default=options.Defaults.OVERLAP_SEPARATOR,
+        choices=options.OVERLAP_SEPARATORS,
         help=(
             "Backend for splitting overlapping speech: 'auto' uses SpeechBrain's "
             "SepFormer when installed, 'sepformer' requires it, 'none' disables "
@@ -1209,8 +1207,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--length-budget",
         dest="length_budget",
-        default="words",
-        choices=["off", "words"],
+        default=options.Defaults.LENGTH_BUDGET,
+        choices=options.LENGTH_BUDGETS,
         help=(
             "'words' (default) also tells the translator how many words fit each "
             "line, measured from the voice that will speak it (a probe render per "
@@ -1232,8 +1230,8 @@ def build_dub_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subtitles-mode",
         dest="subtitles_mode",
-        default="soft",
-        choices=["soft", "burn", "off"],
+        default=options.Defaults.SUBTITLES_MODE,
+        choices=options.SUBTITLES_MODES,
         help=(
             "Embed the target subtitles in the video: 'soft' (default) muxes a "
             "toggleable track and copies every other stream; 'burn' draws them "
@@ -1326,8 +1324,8 @@ def build_subtitles_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subtitles-mode",
         dest="subtitles_mode",
-        default="soft",
-        choices=["soft", "burn", "off"],
+        default=options.Defaults.SUBTITLES_MODE,
+        choices=options.SUBTITLES_MODES,
         help=(
             "'soft' (default) muxes a toggleable subtitle track; 'burn' draws "
             "the text into the frames (re-encodes the video); 'off' writes the "
@@ -1341,7 +1339,11 @@ def build_subtitles_parser() -> argparse.ArgumentParser:
         default=42,
         help="Longest a cue's text may be before it is split.",
     )
-    parser.add_argument("--whisper-model", default="large-v3", help="Whisper model id.")
+    parser.add_argument(
+        "--whisper-model",
+        default=options.Defaults.WHISPER_MODEL,
+        help="Whisper model id.",
+    )
     parser.add_argument("--llm-model", default=None, help="Override the configured LLM model.")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output root.")
     parser.add_argument(
@@ -1406,8 +1408,8 @@ def build_info_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=["auto", "bf16", "fp16", "fp32"],
+        default=options.Defaults.DTYPE,
+        choices=options.DTYPES,
         help="dtype to report on (default: auto).",
     )
     parser.add_argument(
@@ -2287,9 +2289,10 @@ def _one_per_line(
 
 def _say_plan_source(backend: str, args: argparse.Namespace) -> str:
     """Whether a ``say`` plan came from the model, the CLI, or nowhere."""
-    tag_mode = getattr(args, "fish_tag_mode", "keep")
-    if backend == "customvoice":
-        if getattr(args, "style_plan", "off") == "llm":
+    tag_mode = getattr(args, "fish_tag_mode", options.Defaults.FISH_TAG_MODE)
+    if backend == options.SayBackend.CUSTOMVOICE:
+        style_plan = getattr(args, "style_plan", options.Defaults.STYLE_PLAN)
+        if style_plan == options.StylePlan.LLM:
             return "llm"
         if (
             getattr(args, "style_instructs", None)
@@ -2304,7 +2307,7 @@ def _say_plan_source(backend: str, args: argparse.Namespace) -> str:
         return "llm"
     if getattr(args, "prosody", None) or getattr(args, "emotions", None):
         return "manual"
-    if backend == "fish":
+    if backend == options.SayBackend.FISH:
         return "manual"  # Fish takes its direction from tags in --text
     return "off"
 
@@ -2444,7 +2447,7 @@ def _say_log_file(
     if settings.log_file is not None:
         return settings.log_file
     base = Path("output") / "say"
-    if args.backend == "qwen":
+    if args.backend == options.SayBackend.QWEN:
         return base / f"{name}.log"
     return base / name / "say.log"
 
@@ -2495,7 +2498,7 @@ def _cmd_say_neural(
         # model needs the code, so only that backend requires --lang here.
         language = normalize_language(args.lang) if args.lang else None
         ref_text = (args.clone_text or "").strip() or None
-        if backend == "chatterbox" and language is None:
+        if backend == options.SayBackend.CHATTERBOX and language is None:
             raise ConfigError(
                 "--lang is required with --backend chatterbox when the voice is "
                 "cloned inline."
@@ -2551,8 +2554,8 @@ def _cmd_say_neural(
     # Fish has no spec: its delivery lives in the text, as tags. The planner can
     # write them ('llm'), or the caller already did ('keep', the default). Every
     # other backend renders one spec per line.
-    fish_tag_mode = getattr(args, "fish_tag_mode", "keep")
-    if backend == "fish" and fish_tag_mode == "llm":
+    fish_tag_mode = getattr(args, "fish_tag_mode", options.Defaults.FISH_TAG_MODE)
+    if backend == options.SayBackend.FISH and fish_tag_mode == options.FishTagMode.LLM:
         # Fish has no side channel, so the plan *is* the text: the model writes
         # the tags into each line and a guard rejects any change to the words.
         from pipeline.prosody import FishInlinePlanner
@@ -2581,7 +2584,7 @@ def _cmd_say_neural(
                 language=language,
                 trace=trace,
             )
-    elif backend == "fish":
+    elif backend == options.SayBackend.FISH:
         # The caller wrote the tags. Reserved <|...|> tokens were rejected in
         # validation, so this only reports the advisory problems and folds a
         # tag-only line into its neighbour, which would otherwise be an empty
@@ -2636,7 +2639,9 @@ def _cmd_say_neural(
         )
         log.info(
             "Prosody: %s for %d line(s)",
-            "LLM plan" if args.prosody_plan == "llm" else "explicit values",
+            "LLM plan"
+            if args.prosody_plan == options.SayProsodyPlan.LLM
+            else "explicit values",
             len(specs),
         )
         for index, spec in enumerate(specs, start=1):
@@ -2647,7 +2652,7 @@ def _cmd_say_neural(
             lines=len(lines),
             backend=backend,
         ):
-            if backend == "chatterbox":
+            if backend == options.SayBackend.CHATTERBOX:
                 rendered = engine.synthesize(
                     lines,
                     reference=reference,
@@ -2720,33 +2725,42 @@ def _validate_say_source(args: argparse.Namespace) -> None:
     depend on the backend, so the parser leaves the group unrequired and this
     enforces exactly one valid source per backend.
     """
-    if args.style_instructs and args.backend != "customvoice":
+    if args.style_instructs and args.backend != options.SayBackend.CUSTOMVOICE:
         raise ConfigError(
             "--style-instruct is only valid with --backend customvoice; the other "
             "backends take --prosody/--emotion (and --design already accepts a "
             "free-form prompt)."
         )
-    if args.style_plan != "off" and args.backend != "customvoice":
+    if (
+        args.style_plan != options.StylePlan.OFF
+        and args.backend != options.SayBackend.CUSTOMVOICE
+    ):
         raise ConfigError(
             "--style-plan is only valid with --backend customvoice; the other "
             "backends use --prosody-plan llm for structured prosody."
         )
-    if args.style_plan_scope != "per-line" and args.style_plan != "llm":
+    if (
+        args.style_plan_scope != options.StylePlanScope.PER_LINE
+        and args.style_plan != options.StylePlan.LLM
+    ):
         raise ConfigError("--style-plan-scope only applies with --style-plan llm.")
-    tag_mode = getattr(args, "fish_tag_mode", "keep")
-    if tag_mode != "keep" and args.backend != "fish":
+    tag_mode = getattr(args, "fish_tag_mode", options.Defaults.FISH_TAG_MODE)
+    if tag_mode != options.FishTagMode.KEEP and args.backend != options.SayBackend.FISH:
         raise ConfigError("--fish-tag-mode is only valid with --backend fish.")
-    if getattr(args, "fish_quantize", None) is not None and args.backend != "fish":
+    if (
+        getattr(args, "fish_quantize", None) is not None
+        and args.backend != options.SayBackend.FISH
+    ):
         raise ConfigError("--fish-quantize is only valid with --backend fish.")
-    if args.backend == "fish" and (
-        args.prosody or args.emotions or args.prosody_plan != "off"
+    if args.backend == options.SayBackend.FISH and (
+        args.prosody or args.emotions or args.prosody_plan != options.SayProsodyPlan.OFF
     ):
         raise ConfigError(
             "--backend fish takes its direction from [tags] inside --text (or "
             "--fish-tag-mode llm); it has no --prosody/--emotion/--prosody-plan "
             "channel."
         )
-    if args.backend == "fish" and tag_mode == "keep":
+    if args.backend == options.SayBackend.FISH and tag_mode == options.FishTagMode.KEEP:
         from pipeline.prosody import fish_structural_token
 
         for index, line in enumerate(_say_lines(args.text), start=1):
@@ -2756,11 +2770,11 @@ def _validate_say_source(args: argparse.Namespace) -> None:
                     f"line {index} of --text contains {token!r}, which Fish "
                     "reserves for its own prompt; remove it."
                 )
-    if args.fish_temperature is not None and args.backend != "fish":
+    if args.fish_temperature is not None and args.backend != options.SayBackend.FISH:
         raise ConfigError("--fish-temperature is only valid with --backend fish.")
-    if args.fish_top_p is not None and args.backend != "fish":
+    if args.fish_top_p is not None and args.backend != options.SayBackend.FISH:
         raise ConfigError("--fish-top-p is only valid with --backend fish.")
-    if args.backend == "customvoice":
+    if args.backend == options.SayBackend.CUSTOMVOICE:
         if not args.speaker:
             raise ConfigError(
                 "--backend customvoice needs --speaker (a preset voice, e.g. "
@@ -2834,9 +2848,9 @@ def _cmd_say_customvoice(
     if args.style_instructs:
         # A verbatim instruction is the checkpoint's own input format, so it is
         # sent as typed; anything structural given alongside it is dropped.
-        if args.style_plan != "off":
+        if args.style_plan != options.StylePlan.OFF:
             log.warning("--style-instruct overrides --style-plan for this run.")
-        if args.prosody or emotions or args.prosody_plan != "off":
+        if args.prosody or emotions or args.prosody_plan != options.SayProsodyPlan.OFF:
             log.warning(
                 "--style-instruct overrides --prosody/--emotion/--prosody-plan for "
                 "this run."
@@ -2848,10 +2862,10 @@ def _cmd_say_customvoice(
         specs = None
         mode = "verbatim"
         label = "style-instruct"
-    elif args.style_plan == "llm":
+    elif args.style_plan == options.StylePlan.LLM:
         # The richer form of --prosody-plan: the model writes the verbatim
         # instruction the checkpoint was trained to read, not a rendered template.
-        if args.prosody or emotions or args.prosody_plan != "off":
+        if args.prosody or emotions or args.prosody_plan != options.SayProsodyPlan.OFF:
             log.warning(
                 "--style-plan overrides --prosody/--emotion/--prosody-plan for "
                 "this run."
@@ -3115,8 +3129,8 @@ def _cmd_say_legacy(argv: Sequence[str]) -> int:
     _validate_say_source(args)
 
     emotions = _parse_emotions(args.emotions)
-    if args.backend == "qwen" and (
-        emotions or args.prosody or args.prosody_plan != "off"
+    if args.backend == options.SayBackend.QWEN and (
+        emotions or args.prosody or args.prosody_plan != options.SayProsodyPlan.OFF
     ):
         raise ConfigError(
             "--emotion/--prosody/--prosody-plan only applies to --backend "
@@ -3135,13 +3149,19 @@ def _cmd_say_legacy(argv: Sequence[str]) -> int:
     fish_tag_mode = getattr(args, "fish_tag_mode", "keep")
     if args.style_instructs:
         prosody_state = "verbatim"
-    elif args.style_plan == "llm":
+    elif args.style_plan == options.StylePlan.LLM:
         prosody_state = "verbatim-llm"
-    elif args.backend == "fish" and fish_tag_mode == "llm":
+    elif (
+        args.backend == options.SayBackend.FISH
+        and fish_tag_mode == options.FishTagMode.LLM
+    ):
         prosody_state = "inline-llm"
-    elif args.backend == "fish" and fish_tag_mode == "keep":
+    elif (
+        args.backend == options.SayBackend.FISH
+        and fish_tag_mode == options.FishTagMode.KEEP
+    ):
         prosody_state = "inline"
-    elif args.prosody_plan == "llm":
+    elif args.prosody_plan == options.SayProsodyPlan.LLM:
         prosody_state = "llm"
     elif args.prosody or emotions:
         prosody_state = "manual"
@@ -3156,7 +3176,7 @@ def _cmd_say_legacy(argv: Sequence[str]) -> int:
         prosody_state,
     )
 
-    if args.backend == "customvoice":
+    if args.backend == options.SayBackend.CUSTOMVOICE:
         return _cmd_say_customvoice(
             args,
             models_dir,
@@ -3164,7 +3184,7 @@ def _cmd_say_legacy(argv: Sequence[str]) -> int:
             emotions=emotions,
             log=log,
         )
-    if args.backend != "qwen":
+    if args.backend != options.SayBackend.QWEN:
         return _cmd_say_neural(
             args,
             models_dir,
@@ -3358,7 +3378,7 @@ def job_config_from_args(
     # ``None`` means "not asked for", which lets a saved voice pick the mode that
     # fits it without overriding an explicit choice. The pipeline's own default
     # is still ``native``.
-    accent_mode = args.accent_mode or "native"
+    accent_mode = args.accent_mode or options.Defaults.ACCENT_MODE
     # ``--accent-voice`` is an explicit request for reference-accent, so it must
     # stop the ``--voice`` block below from inferring a mode of its own.
     accent_requested = args.accent_mode is not None or bool(
@@ -3422,7 +3442,10 @@ def job_config_from_args(
                 "--accent-voice cannot be combined with --accent-audio or "
                 "--accent-text: the saved voice already supplies both. Pick one."
             )
-        if args.accent_mode is not None and args.accent_mode != "reference-accent":
+        if (
+            args.accent_mode is not None
+            and args.accent_mode != options.AccentMode.REFERENCE_ACCENT
+        ):
             raise ConfigError(
                 "--accent-voice implies --accent-mode reference-accent, so it "
                 f"cannot be combined with --accent-mode {args.accent_mode!r}. "
@@ -3449,7 +3472,7 @@ def job_config_from_args(
             )
         accent_audio = accent_saved.wav
         accent_text = accent_saved.ref_text
-        accent_mode = "reference-accent"
+        accent_mode = options.AccentMode.REFERENCE_ACCENT.value
 
     return JobConfig(
         video=args.video,

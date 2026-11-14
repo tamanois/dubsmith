@@ -13,6 +13,7 @@ from pathlib import Path
 from .config import JobConfig, normalize_language
 from .errors import ConfigError
 from .models import model_fingerprint
+from .options import AccentMode
 from .voices import find_prompt, load_voice
 
 __all__ = ["apply_accent_voice", "apply_saved_voice"]
@@ -46,11 +47,11 @@ def apply_saved_voice(
     }
     # Only infer when the caller left the default in place. An explicit mode is
     # always honoured.
-    if job.accent_mode == "native":
+    if job.accent_mode == AccentMode.NATIVE:
         if not saved.ref_text.strip():
-            updates["accent_mode"] = "speaker-only"
+            updates["accent_mode"] = AccentMode.SPEAKER_ONLY.value
         elif normalize_language(saved.language) == job.target_language:
-            updates["accent_mode"] = "preserve"
+            updates["accent_mode"] = AccentMode.PRESERVE.value
     return job.model_copy(update=updates)
 
 
@@ -81,6 +82,6 @@ def apply_accent_voice(
         update={
             "accent_audio": saved.wav,
             "accent_text": saved.ref_text,
-            "accent_mode": "reference-accent",
+            "accent_mode": AccentMode.REFERENCE_ACCENT.value,
         }
     )

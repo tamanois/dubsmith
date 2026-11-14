@@ -25,6 +25,16 @@ released under **CC BY 4.0** (see [`../LICENSE.md`](../LICENSE.md))
 The dubbed excerpt contains a **synthetic voice** cloned from the speaker. It is
 included to demonstrate the tool, not to represent the speaker.
 
+## The interface
+
+| File | What it is |
+|---|---|
+| `ui-dub.png` | The Dub page: recent inputs, target and source language, backend, prosody plan, voice and accent mode, with the device, precision and theme controls in the header. Used in the root README |
+| `ui-activity.png` | The Activity page: runs with their deliverable, state, duration and per-job actions, plus search and the state filter. Used in `docs/usage.md` |
+
+Both are captures of the app running locally on one machine, with a real job
+list. No transcript, reference audio or full prompt is visible in either.
+
 ## Regenerating the GIF and poster
 
 ```bash

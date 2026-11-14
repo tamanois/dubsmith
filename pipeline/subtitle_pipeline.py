@@ -29,6 +29,7 @@ from .config import Settings, SubtitleJobConfig
 from .errors import MediaError
 from .logging_utils import job_logger
 from .models import resolve_model
+from .options import SubtitlesMode
 from .translate import OpenAICompatTranslator, TranslationRequest, Translator
 
 __all__ = ["SubtitlesPipeline", "SubtitleResult"]
@@ -135,7 +136,7 @@ class SubtitlesPipeline:
         cues, target_srt = self._stage("subtitles", write_subtitles)
 
         output_video = None
-        if self.job.is_video and self.job.subtitles_mode != "off":
+        if self.job.is_video and self.job.subtitles_mode != SubtitlesMode.OFF:
             output_video = self._stage(
                 "embed", lambda: self._embed(target_srt)
             )
@@ -281,7 +282,7 @@ class SubtitlesPipeline:
     def _embed(self, target_srt: Path) -> Path:
         """Put the SRT into the video, softly or burned in."""
         stem = self.job.output_stem
-        if self.job.subtitles_mode == "burn":
+        if self.job.subtitles_mode == SubtitlesMode.BURN:
             output = self.job_dir / f"{stem}{_BURNED_VIDEO_SUFFIX}"
             return media.burn_subtitles(
                 self.input_path, target_srt, output, language=self.job.target_language
