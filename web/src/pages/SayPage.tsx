@@ -1,7 +1,23 @@
 import React from "react";
 import { api } from "../api";
-import { capabilitiesOf, useBackends } from "../capabilities";
+import { backendOptions, capabilitiesOf, useBackends } from "../capabilities";
 import type { Job, VoiceInfo } from "../types";
+import {
+  DEFAULTS,
+  DEVICE_OPTIONS,
+  DTYPE_OPTIONS,
+  FISH_QUANTIZE_OPTIONS,
+  FISH_TAG_MODE,
+  FISH_TAG_MODE_OPTIONS,
+  LANGUAGE_OPTIONS,
+  SAY_BACKEND,
+  SAY_PROSODY_PLAN,
+  SAY_PROSODY_PLAN_OPTIONS,
+  STYLE_PLAN,
+  STYLE_PLAN_OPTIONS,
+  STYLE_PLAN_SCOPE,
+  STYLE_PLAN_SCOPE_OPTIONS,
+} from "../options";
 import {
   Button,
   Card,
@@ -20,19 +36,6 @@ import {
 import { UploadField } from "../components/UploadField";
 import { PresetPanel } from "../components/PresetPanel";
 import { RecentInputs } from "../components/RecentInputs";
-
-const LANGUAGES = [
-  "French",
-  "English",
-  "German",
-  "Italian",
-  "Portuguese",
-  "Spanish",
-  "Japanese",
-  "Korean",
-  "Chinese",
-  "Russian",
-];
 
 function perLine(value: string): string[] | undefined {
   const lines = value
@@ -65,7 +68,7 @@ export function SayPage({
   initialJob?: Job | null;
 }) {
   const [text, setText] = React.useState("");
-  const [backend, setBackend] = React.useState("qwen");
+  const [backend, setBackend] = React.useState<string>(DEFAULTS.sayBackend);
   const [source, setSource] = React.useState<"voice" | "design" | "clone" | "speaker">("voice");
   const [voice, setVoice] = React.useState("");
   const [design, setDesign] = React.useState("");
@@ -73,24 +76,30 @@ export function SayPage({
   const [cloneName, setCloneName] = React.useState("");
   const [cloneText, setCloneText] = React.useState("");
   const [speaker, setSpeaker] = React.useState("");
-  const [language, setLanguage] = React.useState("French");
+  const [language, setLanguage] = React.useState<string>(DEFAULTS.language);
   const [saveAs, setSaveAs] = React.useState("");
   const [prosody, setProsody] = React.useState("");
   const [emotions, setEmotions] = React.useState("");
-  const [prosodyPlan, setProsodyPlan] = React.useState("off");
+  const [prosodyPlan, setProsodyPlan] = React.useState<string>(
+    DEFAULTS.sayProsodyPlan,
+  );
   const [styleInstructs, setStyleInstructs] = React.useState("");
-  const [stylePlan, setStylePlan] = React.useState("off");
-  const [stylePlanScope, setStylePlanScope] = React.useState("per-line");
+  const [stylePlan, setStylePlan] = React.useState<string>(DEFAULTS.stylePlan);
+  const [stylePlanScope, setStylePlanScope] = React.useState<string>(
+    DEFAULTS.stylePlanScope,
+  );
   const [planChunk, setPlanChunk] = React.useState("");
   const [chatterboxExaggeration, setChatterboxExaggeration] = React.useState("");
   const [chatterboxCfg, setChatterboxCfg] = React.useState("");
   const [chatterboxTemp, setChatterboxTemp] = React.useState("");
   const [fishTemp, setFishTemp] = React.useState("");
   const [fishTopP, setFishTopP] = React.useState("");
-  const [fishQuantize, setFishQuantize] = React.useState("int8");
-  const [fishTagMode, setFishTagMode] = React.useState("keep");
-  const [device, setDevice] = React.useState("auto");
-  const [dtype, setDtype] = React.useState("auto");
+  const [fishQuantize, setFishQuantize] = React.useState<string>(
+    DEFAULTS.fishQuantize,
+  );
+  const [fishTagMode, setFishTagMode] = React.useState<string>(DEFAULTS.fishTagMode);
+  const [device, setDevice] = React.useState<string>(DEFAULTS.device);
+  const [dtype, setDtype] = React.useState<string>(DEFAULTS.dtype);
   const [force, setForce] = React.useState(false);
   const [provenance, setProvenance] = React.useState(true);
   const [voices, setVoices] = React.useState<VoiceInfo[]>([]);
@@ -118,27 +127,27 @@ export function SayPage({
 
   const applySpec = React.useCallback((spec: Record<string, unknown>) => {
     setText(asText(spec.text));
-    setBackend(asText(spec.backend, "qwen"));
-    setLanguage(asText(spec.language, "French"));
+    setBackend(asText(spec.backend, DEFAULTS.sayBackend));
+    setLanguage(asText(spec.language, DEFAULTS.language));
     setSaveAs(asText(spec.save_as));
-    setDevice(asText(spec.device, "auto"));
-    setDtype(asText(spec.dtype, "auto"));
+    setDevice(asText(spec.device, DEFAULTS.device));
+    setDtype(asText(spec.dtype, DEFAULTS.dtype));
     setForce(Boolean(spec.force));
     setProvenance(spec.provenance === undefined ? true : Boolean(spec.provenance));
     setProsody(joined(spec.prosody, "\n"));
     setEmotions(joined(spec.emotions, ", "));
-    setProsodyPlan(asText(spec.prosody_plan, "off"));
+    setProsodyPlan(asText(spec.prosody_plan, DEFAULTS.sayProsodyPlan));
     setStyleInstructs(joined(spec.style_instructs, "\n"));
-    setStylePlan(asText(spec.style_plan, "off"));
-    setStylePlanScope(asText(spec.style_plan_scope, "per-line"));
+    setStylePlan(asText(spec.style_plan, DEFAULTS.stylePlan));
+    setStylePlanScope(asText(spec.style_plan_scope, DEFAULTS.stylePlanScope));
     setPlanChunk(asText(spec.plan_chunk));
     setChatterboxExaggeration(asText(spec.chatterbox_exaggeration));
     setChatterboxCfg(asText(spec.chatterbox_cfg_weight));
     setChatterboxTemp(asText(spec.chatterbox_temperature));
     setFishTemp(asText(spec.fish_temperature));
     setFishTopP(asText(spec.fish_top_p));
-    setFishQuantize(asText(spec.fish_quantize, "int8"));
-    setFishTagMode(asText(spec.fish_tag_mode, "keep"));
+    setFishQuantize(asText(spec.fish_quantize, DEFAULTS.fishQuantize));
+    setFishTagMode(asText(spec.fish_tag_mode, DEFAULTS.fishTagMode));
 
     if (spec.speaker) {
       setSource("speaker");
@@ -164,7 +173,7 @@ export function SayPage({
   }, [initialJob, applySpec]);
 
   React.useEffect(() => {
-    if (backend === "customvoice") setSource("speaker");
+    if (backend === SAY_BACKEND.customvoice) setSource("speaker");
     else if (source === "speaker") setSource("voice");
   }, [backend]);
 
@@ -175,17 +184,17 @@ export function SayPage({
     if (!caps.prosody) {
       setProsody("");
       setEmotions("");
-      setProsodyPlan("off");
+      setProsodyPlan(SAY_PROSODY_PLAN.off);
     }
     if (!caps.style) {
       setStyleInstructs("");
-      setStylePlan("off");
-      setStylePlanScope("per-line");
+      setStylePlan(STYLE_PLAN.off);
+      setStylePlanScope(STYLE_PLAN_SCOPE.perLine);
     }
     if (!caps.fish_tuning) {
       setFishTemp("");
       setFishTopP("");
-      setFishTagMode("keep");
+      setFishTagMode(FISH_TAG_MODE.keep);
     }
     if (!caps.chatterbox_tuning) {
       setChatterboxExaggeration("");
@@ -229,10 +238,10 @@ export function SayPage({
       // longer show.
       prosody: allows("prosody") ? perLine(prosody) : undefined,
       emotions: allows("prosody") ? list(emotions) : undefined,
-      prosody_plan: allows("prosody") ? prosodyPlan : "off",
+      prosody_plan: allows("prosody") ? prosodyPlan : SAY_PROSODY_PLAN.off,
       style_instructs: allows("style") ? perLine(styleInstructs) : undefined,
-      style_plan: allows("style") ? stylePlan : "off",
-      style_plan_scope: allows("style") ? stylePlanScope : "per-line",
+      style_plan: allows("style") ? stylePlan : STYLE_PLAN.off,
+      style_plan_scope: allows("style") ? stylePlanScope : STYLE_PLAN_SCOPE.perLine,
       plan_chunk: num(planChunk),
       chatterbox_exaggeration: allows("chatterbox_tuning")
         ? num(chatterboxExaggeration)
@@ -244,7 +253,7 @@ export function SayPage({
       fish_temperature: allows("fish_tuning") ? num(fishTemp) : undefined,
       fish_top_p: allows("fish_tuning") ? num(fishTopP) : undefined,
       fish_quantize: allows("fish_tuning") ? fishQuantize : undefined,
-      fish_tag_mode: allows("fish_tuning") ? fishTagMode : "keep",
+      fish_tag_mode: allows("fish_tuning") ? fishTagMode : FISH_TAG_MODE.keep,
     };
     if (source === "voice") spec.voice = voice || undefined;
     if (source === "design") spec.design = design || undefined;
@@ -312,25 +321,19 @@ export function SayPage({
             <Select
               value={backend}
               onChange={(event) => setBackend(event.target.value)}
-              options={[
-                { value: "qwen", label: "Qwen Base (cloning)" },
-                { value: "customvoice", label: "Qwen CustomVoice (preset speaker)" },
-                { value: "cosyvoice3", label: "CosyVoice3" },
-                { value: "chatterbox", label: "Chatterbox" },
-                { value: "fish", label: "Fish S2-Pro" },
-              ]}
+              options={backendOptions(backends, "say")}
             />
           </Field>
-          <Field label="Language">
+            <Field label="Language">
             <Select
               value={language}
               onChange={(event) => setLanguage(event.target.value)}
-              options={LANGUAGES.map((item) => ({ value: item, label: item }))}
+              options={LANGUAGE_OPTIONS}
             />
           </Field>
         </div>
 
-        {backend !== "customvoice" ? (
+        {backend !== SAY_BACKEND.customvoice ? (
           <div className="space-y-4">
             <Field label="Voice source">
               <Select
@@ -433,10 +436,7 @@ export function SayPage({
               value={prosodyPlan}
               disabled={!allows("prosody")}
               onChange={(event) => setProsodyPlan(event.target.value)}
-              options={[
-                { value: "off", label: "Use the values below" },
-                { value: "llm", label: "Ask the LLM to plan" },
-              ]}
+              options={SAY_PROSODY_PLAN_OPTIONS}
             />
           </Field>
           <Field
@@ -474,7 +474,7 @@ export function SayPage({
         </Field>
 
         <Disclosure title="Advanced options" hint="Style planning, sampling and hardware">
-          {backend === "customvoice" ? (
+          {backend === SAY_BACKEND.customvoice ? (
             <>
               <Field
                 label="Verbatim style instructions"
@@ -492,34 +492,25 @@ export function SayPage({
                   <Select
                     value={stylePlan}
                     onChange={(event) => setStylePlan(event.target.value)}
-                    options={[
-                      { value: "off", label: "Use the instructions above" },
-                      { value: "llm", label: "Ask the LLM to write them" },
-                    ]}
+                    options={STYLE_PLAN_OPTIONS}
                   />
                 </Field>
                 <Field label="Style plan scope" tooltip="One style per line, or a single style for the whole text.">
                   <Select
                     value={stylePlanScope}
                     onChange={(event) => setStylePlanScope(event.target.value)}
-                    options={[
-                      { value: "per-line", label: "Per line" },
-                      { value: "whole", label: "One for the whole text" },
-                    ]}
+                    options={STYLE_PLAN_SCOPE_OPTIONS}
                   />
                 </Field>
               </div>
             </>
           ) : null}
-          {backend === "fish" ? (
+          {backend === SAY_BACKEND.fish ? (
             <Field label="Fish tag mode" tooltip="Keep the [tags] you wrote, or let the LLM add them.">
               <Select
                 value={fishTagMode}
                 onChange={(event) => setFishTagMode(event.target.value)}
-                options={[
-                  { value: "keep", label: "Keep the tags I wrote" },
-                  { value: "llm", label: "Let the LLM add tags" },
-                ]}
+                options={FISH_TAG_MODE_OPTIONS}
               />
             </Field>
           ) : null}
@@ -530,7 +521,7 @@ export function SayPage({
           >
             <Input value={planChunk} onChange={(event) => setPlanChunk(event.target.value)} placeholder="from settings" />
           </Field>
-          {backend === "chatterbox" ? (
+          {backend === SAY_BACKEND.chatterbox ? (
             <div className="grid gap-4 md:grid-cols-3">
               <Field label="Exaggeration" tooltip="How theatrical the delivery is.">
                 <Input value={chatterboxExaggeration} onChange={(event) => setChatterboxExaggeration(event.target.value)} />
@@ -543,7 +534,7 @@ export function SayPage({
               </Field>
             </div>
           ) : null}
-          {backend === "fish" ? (
+          {backend === SAY_BACKEND.fish ? (
             <div className="grid gap-4 md:grid-cols-3">
               <Field label="Temperature" tooltip="Sampling randomness; lower is steadier.">
                 <Input value={fishTemp} onChange={(event) => setFishTemp(event.target.value)} />
@@ -555,10 +546,7 @@ export function SayPage({
                 <Select
                   value={fishQuantize}
                   onChange={(event) => setFishQuantize(event.target.value)}
-                  options={[
-                    { value: "int8", label: "int8" },
-                    { value: "off", label: "bf16" },
-                  ]}
+                  options={FISH_QUANTIZE_OPTIONS}
                 />
               </Field>
             </div>
@@ -569,8 +557,7 @@ export function SayPage({
                 value={device}
                 onChange={(event) => setDevice(event.target.value)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "cpu", label: "CPU" },
+                  ...DEVICE_OPTIONS,
                   { value: "cuda:0", label: "cuda:0" },
                   { value: "cuda:1", label: "cuda:1" },
                 ]}
@@ -580,12 +567,7 @@ export function SayPage({
               <Select
                 value={dtype}
                 onChange={(event) => setDtype(event.target.value)}
-                options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "bf16", label: "bfloat16" },
-                  { value: "fp16", label: "float16" },
-                  { value: "fp32", label: "float32" },
-                ]}
+                options={DTYPE_OPTIONS}
               />
             </Field>
             <Toggle label="Ignore caches" checked={force} onChange={setForce} />

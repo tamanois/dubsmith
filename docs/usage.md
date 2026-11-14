@@ -1,8 +1,100 @@
 # Usage
 
-Choose a command, copy a worked example, and iterate quickly.
+Two surfaces, one pipeline: a local browser app for choosing options without
+remembering flags, and a command line for scripting. Every option exists in
+both, and both write the same artifacts. Full flag, environment-variable and
+HTTP-route tables are in [Reference](reference.md).
 
-## Which command do I want?
+## The app
+
+Start it once with `dub-server` and open <http://127.0.0.1:8000> — the install
+and the `DUB_*` variables are in
+[Getting started → Start the app](getting-started.md#start-the-app).
+
+Every screen has its own address, so a view can be bookmarked, shared or
+reached with the browser's back button: `#/activity`, `#/dub`, `#/say`,
+`#/voices`, `#/models`, `#/devices`, `#/files`, `#/settings`.
+
+| Page | What it is for |
+|---|---|
+| **Activity** | every job, with its output file as the title and the operation as the subtitle; filter by state, search, paginate, and bulk-clear finished records |
+| **Dub** | the dubbing form: input, target and source language, backend, prosody plan, voice, accent mode, then **Advanced options** |
+| **Subtitles only** | the same input and language flow without TTS; the mode switch is in the Dub header |
+| **Say** | speech generation from a saved, designed or cloned voice, or a CustomVoice preset speaker |
+| **Voices** | design, clone, register, audition, paginate and delete library voices |
+| **Models** | status, downloads (MVP set, one model, or everything) and deletion behind a confirmation that reports the freed space |
+| **Devices** | detected hardware, precision, optional packages and system binaries |
+| **Files** | generated outputs first, then uploads: inline playback, path copy, per-run details, download, bulk delete |
+| **Settings** | LLM endpoint/model/timeouts, audio defaults, storage, logging, default device and precision, JSON export/import |
+
+![The Activity page: each run with its deliverable, state, duration and actions](media/ui-activity.png)
+
+**Activity** — each run keeps the name of its deliverable, its input, its start
+time, its duration and its state. A failure prints the failing command and its
+error inline; a finished job offers **Download**, **Files**, **Retry** and
+**Edit**, and the checkbox column clears finished records in bulk.
+
+### How a job runs
+
+Submitting returns immediately with a job id. The states are `QUEUED`,
+`PROCESSING`, `COMPLETED`, `FAILED` and `CANCELLED`, one heavy job runs at a
+time, and the queue is bounded: excess work is rejected with a message rather
+than silently queued. Stage changes, log lines and the final result stream over
+SSE; if the stream drops, the page reconnects and resumes from the last event,
+and plain HTTP state keeps working meanwhile, so **Cancel** still succeeds.
+
+Progress is real stage state — the app never invents a percentage. The log opens
+by itself while a job is queued or running and starts collapsed once it is
+finished, but a log you opened stays open. A finished job can be **retried** in a
+fresh folder (the original is untouched), **edited** with every stored option
+prefilled, **downloaded**, or **compared** against its source.
+
+### Choosing options without guessing
+
+Each field carries a tooltip. The few choices most people make stay visible; the
+technical knobs are under **Advanced options**, grouped by topic (accent blend,
+backend tuning, audio and subtitles, timing and speakers, models and hardware).
+
+Options the selected backend cannot honour are disabled with the reason printed
+underneath, and their values are dropped from the request — switching from
+Chatterbox to Qwen Base cannot send a stale prosody line. Combinations that span
+several fields block **Submit** and explain themselves above it: source equal to
+target language, a reference clip in *keep the speaker's accent* mode without a
+transcript, *borrow a reference accent* with neither a clip nor a saved accent
+voice, accent matching outside native mode, or no voice source at all on the Say
+form. The server validates the same rules and answers `422` with the same
+message, so bypassing the form does not help.
+
+**Presets** save the form's options (not the input file) at the bottom of the
+Dub and Say forms, and **recent** or **favorited** inputs make a previously used
+clip one click away.
+
+### Where the files go
+
+Each job gets its own folder under `DUB_OUTPUT_DIR`:
+
+```text
+<stem>__<operation>__<language>__<run-id>/
+```
+
+The pipeline writes its normal artifacts inside it, so two runs never overwrite
+each other, and the main deliverable keeps the input's name (`talk_dubbed.mp4`,
+`talk_dubbed.wav`, `talk_subtitled.mp4`). **Files** lists them one row per run;
+**Details** reveals every artifact in that run. Uploads are stored under the app
+data directory and can be reused by later jobs.
+
+### What the app does not do
+
+It is local and single-user: no accounts, no authentication, no remote workers,
+and one job at a time. Keep it bound to `127.0.0.1`, or put authentication in
+front of it before exposing it. Uploads must come through the app or already
+live under `input/`, `output/` or the app data directory; arbitrary filesystem
+paths are rejected, and the API's own security boundaries are listed in
+[Reference → HTTP API](reference.md#http-api).
+
+## The command line
+
+### Which command do I want?
 
 | If you want… | Use | What it changes |
 |---|---|---|
@@ -19,17 +111,17 @@ Choose a command, copy a worked example, and iterate quickly.
 | to drop the source accent using the model's own phonetics | `--accent-mode speaker-only` | keeps the timbre, lets the model choose target-language phonetics |
 | a native accent you choose yourself | `--accent-mode reference-accent --accent-audio nat.wav --accent-text "…"` | timbre from the video's speaker, pronunciation from `nat.wav` |
 | the same accent from a saved voice | `--accent-mode reference-accent --accent-voice deep-fr` | the saved voice supplies the clip and its exact transcript, no flags repeated |
-| every speaker in their own voice | *nothing* | finds the speakers and clones each one from their own voice — see [Dubbing a video with several speakers](multi-speaker.md#dubbing-a-video-with-several-speakers) |
+| every speaker in their own voice | *nothing* | finds the speakers and clones each one from their own voice — see [Dubbing a video with several speakers](dub-quality.md#dubbing-a-video-with-several-speakers) |
 | one voice for the whole video | `--diarizer none` | the pre-P1 behaviour: whichever speaker talks most supplies the voice |
 | no music behind the voice | `--no-background` | discards the separated bed instead of ducking it |
 | an absolute loudness target | `--loudness lufs --lufs -16` | forces a level instead of matching the source |
 | to redo a run from scratch | `--force` | ignores the stage cache |
 | to judge a run without listening | *nothing* | read `report.json` in the job folder |
 
-Every option is described in [Options in full](options.md);
+Every option is described in [Reference](reference.md);
 `python dub.py --help` prints the same list.
 
-## Commands, grouped by purpose
+### Commands, grouped by purpose
 
 **Set up**
 
@@ -113,7 +205,7 @@ python dub.py --video talk.mp4 --target fr -v          # debug logging
 python dub.py --video talk.mp4 --target fr --device cpu # rule the GPU out
 ```
 
-## Fast iteration
+### Fast iteration
 
 A 5-minute video takes a few minutes to dub, which is slow to iterate on. Slice
 out a short section and dub that instead — the pipeline behaves identically,
@@ -127,7 +219,7 @@ python dub.py --video clip60.mp4 --target fr
 Note that `-c copy` cuts on the nearest keyframe, so `clip60.mp4` may start a
 second or two earlier than requested. That is fine for trying out options.
 
-## Verified commands
+### Verified commands
 
 These were all run on a 4:47 English TED talk → French, on 2× RTX 3060. The
 figures come from each run's `report.json`.
@@ -161,9 +253,9 @@ decides whether a line that still does not fit loses its tail or starts late:
 The simulations are the same model that reproduced the run's own 0.25 s result to
 the line (31 lines, 4.67 s predicted against 31 and 4.69 s measured), which is why
 they are quoted — but they are predictions, not runs. The full curve is in
-[When a translation is too long for its slot](audio-and-timing.md#when-a-translation-is-too-long-for-its-slot).
+[When a translation is too long for its slot](dub-quality.md#when-a-translation-is-too-long-for-its-slot).
 
 ---
 
 Next: [Voices](voices.md) for the voice library and accent modes, or
-[Options](options.md) for every flag.
+[Reference](reference.md) for every flag, default and endpoint.

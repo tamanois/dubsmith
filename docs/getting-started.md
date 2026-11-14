@@ -1,8 +1,12 @@
-# Setup
+# Getting started
 
-Full installation and configuration. For the copy-paste happy path, see
-[Quick start](../README.md#quick-start). For a container image with every
-dependency, see [Docker](docker.md).
+Install it, download the models, and dub something — in the browser app or from
+the terminal. For the shortest possible version, see
+[Quick start](../README.md#quick-start).
+
+Both surfaces share one install: the app is the same package plus the `web`
+extra and a built frontend. Native install first; [Docker](#docker-optional) is
+at the end of this page.
 
 ## Hardware requirements
 
@@ -243,6 +247,54 @@ if a required model is missing, so you can also just try a dub and see.
 
 ---
 
+## Start the app
+
+The browser app is the same install plus FastAPI/uvicorn and a built frontend.
+Node 20+ (CI uses 22) is needed only to build or develop it:
+
+```bash
+pip install ".[web]"
+cd web && npm install && npm run build && cd ..
+dub-server
+# http://127.0.0.1:8000
+```
+
+Every way to start it, from the repository root:
+
+| Command | Use it for |
+|---|---|
+| `dub-server` | the normal start: the API and the built UI on one port |
+| `python -m server` | the same, from a checkout without the console script |
+| `make serve` | the API with auto-reload — `uvicorn server.asgi:app --reload --reload-dir server --reload-dir pipeline` |
+| `make web` | the frontend in development: Vite on <http://localhost:5173>, HMR, `/api` proxied to port 8000 |
+| `make web-build` | write `web/dist`, which the single-process server serves at `/` |
+
+The first three read `DUB_HOST` and `DUB_PORT`. The Vite server always listens on
+5173 and proxies to 8000, so start the API first; it needs Node 22 (CI's
+version) and `npm install` once in `web/`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DUB_HOST` | `127.0.0.1` | Bind address. Keep it loopback unless you add authentication. |
+| `DUB_PORT` | `8000` | HTTP port. |
+| `DUB_DATA_DIR` | `data` | SQLite database, uploads and job metadata (gitignored). |
+| `DUB_OUTPUT_DIR` | `output` | Root for the unique per-run output folders. |
+
+`LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` come from the same `.env` as the
+CLI; secrets are never written to the database.
+
+Install **editable** (`pip install -e ".[web]"`) while working on the code. A
+plain `pip install .` freezes a copy in `site-packages`, so the running server
+ignores your changes and the app looks broken.
+
+Open <http://127.0.0.1:8000>, upload a video on **Dub**, choose the target
+language and press **Start dubbing**. Progress and the log stream live on
+**Activity**, and the finished files are there too. The page-by-page tour,
+presets and settings are in [Usage → The app](usage.md#the-app). If the page does
+not load, see [Troubleshooting → The browser app](troubleshooting.md#the-browser-app).
+
+---
+
 ## CosyVoice 3 (optional, expressive speech)
 
 `dub say --backend cosyvoice3` adds per-line emotion/pace/volume instructions and
@@ -390,4 +442,130 @@ The backend runs `pipeline.fish_worker` with `.venv-fish/bin/python`; set
 
 ---
 
-Next: [Usage](usage.md) for the command chooser and worked examples.
+## Docker (optional)
+
+The native install above is the normal path. The image exists for portable,
+reproducible machines and hosts where installing system packages is
+inconvenient: it contains every runtime dependency, including the optional
+backends, but **no model weights** — those are downloaded or mounted at runtime.
+
+**What is in the image:** Debian bookworm with Python 3.10, `ffmpeg`/`ffprobe`,
+`rubberband` and `sox`; the main environment with `.[full,gpu-asr]` (Qwen TTS,
+faster-whisper, Demucs, funasr, SpeechBrain, the CUDA 12 libraries CTranslate2
+needs and `torchcodec`); CosyVoice 3 in the main environment (checkout under
+`third_party/CosyVoice` and the transformers 4.51 overlay); Chatterbox in
+`/app/.venv-chatterbox`; Fish Speech in `/app/.venv-fish`. Nothing from
+`models/`, `voices/`, `input/`, `output/` or `data/` is baked in.
+
+```bash
+docker build -t dubsmith .
+```
+
+The default image includes all three optional backends, so it is large (roughly
+35–40 GB on disk) and slow to build. Slim it with the build args below.
+
+```bash
+# CPU-only: no CUDA torch wheels, still runs every path, just slower
+docker build -t dubsmith:cpu \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+  --build-arg CHATTERBOX_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+  --build-arg FISH_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+  --build-arg INSTALL_GPU_ASR=0 .
+
+# without the three isolated expressive backends
+docker build -t dubsmith:lean \
+  --build-arg INSTALL_COSYVOICE=0 \
+  --build-arg INSTALL_CHATTERBOX=0 \
+  --build-arg INSTALL_FISH=0 .
+```
+
+| Build arg | Default | Effect |
+|---|---|---|
+| `TORCH_INDEX_URL` | empty (PyPI, CUDA wheel) | Pre-install the main `torch`/`torchaudio` from another index, e.g. the CPU index |
+| `INSTALL_GPU_ASR` | `1` | Install `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` so CTranslate2 can use the GPU |
+| `INSTALL_COSYVOICE` | `1` | Clone CosyVoice and install its runtime dependencies in the main environment |
+| `INSTALL_CHATTERBOX` | `1` | Create `/app/.venv-chatterbox` |
+| `CHATTERBOX_TORCH_INDEX_URL` | cu124 wheel index | Torch index used for Chatterbox |
+| `INSTALL_FISH` | `1` | Create `/app/.venv-fish` and clone fish-speech |
+| `FISH_TORCH_INDEX_URL` | empty (PyPI, CUDA wheel) | Pre-install Fish's `torch==2.8.0`/`torchaudio` from another index |
+| `APP_UID` / `APP_GID` | `1000` | UID/GID of the runtime user |
+
+The default PyPI torch wheels are CUDA builds, so a GPU host needs a driver
+compatible with the bundled CUDA version. The `*_INDEX_URL` args accept any
+PyTorch wheel index (`cpu`, `cu124`, `cu128`, `cu130`, …).
+
+**Download the models once**, into directories you will mount:
+
+```bash
+mkdir -p models voices input output data
+
+docker run --rm -v "$PWD/models:/app/models" dubsmith models --download all
+```
+
+**Dub on a GPU host:**
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD/models:/app/models" \
+  -v "$PWD/voices:/app/voices" \
+  -v "$PWD/input:/app/input" \
+  -v "$PWD/output:/app/output" \
+  --env-file .env \
+  dubsmith --video input/talk.mp4 --target fr
+```
+
+On a CPU host, drop `--gpus all`; the pipeline picks CPU automatically. Check
+that the GPU is visible before a long run with
+`docker run --rm --gpus all dubsmith devices` — `none - everything will run on
+the CPU` means the container cannot see the card (check `--gpus`, the NVIDIA
+Container Toolkit and the host driver).
+
+**The app in Docker** needs the port published and the data directory mounted:
+
+```bash
+docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
+  -v "$PWD/models:/app/models" -v "$PWD/voices:/app/voices" \
+  -v "$PWD/input:/app/input" -v "$PWD/output:/app/output" \
+  -v "$PWD/data:/app/data" --env-file .env \
+  dubsmith dub-server
+```
+
+The image builds the frontend, so `http://127.0.0.1:8000` serves the app. Set
+`DUB_HOST=0.0.0.0` inside the container (the default binds loopback and is then
+unreachable from the host).
+
+Other entry points: replace the command with `say --voice …`,
+`info`, `models --list`, or use `--entrypoint bash` for a shell.
+
+**The LLM endpoint.** `--env-file .env` passes `LLM_BASE_URL`, `LLM_API_KEY` and
+`LLM_MODEL` in. A `LLM_BASE_URL` of `http://127.0.0.1:8080/v1` points at the
+**container**, not the host; when the model runs on the host:
+
+```bash
+docker run --rm --gpus all --add-host=host.docker.internal:host-gateway \
+  -e LLM_BASE_URL=http://host.docker.internal:8080/v1 \
+  ... dubsmith --video input/talk.mp4 --target fr
+```
+
+Docker Desktop provides `host.docker.internal` already; on Linux, `--network
+host` is another option.
+
+**Caches and permissions.** The image runs as the unprivileged `dubsmith` user
+with UID/GID 1000. If your host UID differs, build with
+`--build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`, or pass
+`--user "$(id -u):$(id -g)"` at run time — and with `--user`, also pass
+`-e HOME=/tmp` so Demucs and Hugging Face can write their caches. Mounted
+directories must be writable for outputs, models and anchors; mount
+`-v "$PWD/.cache/docker:/home/dubsmith/.cache"` to keep Demucs/Hugging Face
+downloads.
+
+**Limits.** The image is built for `linux/amd64` — `onnxruntime-gpu` and some
+audio extensions have no ARM wheels; on an ARM host use
+`--platform linux/amd64` and expect emulation to be slow. Models are never
+included, so a first run downloads them (or expects them in the mounted
+`models/`). Docker is not required for normal use.
+
+---
+
+Next: [Usage](usage.md) for the app tour, the command chooser and worked
+examples.

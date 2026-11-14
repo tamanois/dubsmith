@@ -26,6 +26,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from . import options
 from .errors import DependencyError, MediaError
 from .media import resample
 
@@ -77,7 +78,7 @@ class NullSpeakerSeparator:
     without a separate "is this enabled" check.
     """
 
-    name = "none"
+    name = options.OverlapSeparator.NONE.value
 
     def separate(
         self, samples: np.ndarray, sample_rate: int, num_speakers: int = SUPPORTED_SPEAKERS
@@ -90,7 +91,7 @@ class NullSpeakerSeparator:
 class SepFormerSpeakerSeparator:
     """SpeechBrain SepFormer-backed separator (16 kHz, two speakers)."""
 
-    name = "sepformer"
+    name = options.OverlapSeparator.SEPFORMER.value
 
     def __init__(
         self,
@@ -232,7 +233,7 @@ def _fit_length(values: np.ndarray, size: int) -> np.ndarray:
 
 
 def detect_speaker_separator(
-    preference: str = "auto",
+    preference: str = options.Defaults.OVERLAP_SEPARATOR,
     *,
     device: str = "auto",
     model_id: str = DEFAULT_SEPARATION_MODEL,
@@ -257,13 +258,14 @@ def detect_speaker_separator(
     """
     import importlib.util
 
-    key = (preference or "auto").strip().lower()
-    if key in {"none", "off", "identity"}:
+    key = (preference or options.Defaults.OVERLAP_SEPARATOR).strip().lower()
+    canonical = options.OVERLAP_SEPARATOR_ALIASES.get(key)
+    if canonical == options.OverlapSeparator.NONE:
         return NullSpeakerSeparator()
 
     available = importlib.util.find_spec("speechbrain") is not None
 
-    if key == "sepformer":
+    if canonical == options.OverlapSeparator.SEPFORMER:
         if not available:
             raise DependencyError(
                 "Overlapping-speech separation was requested but speechbrain is "
@@ -271,10 +273,10 @@ def detect_speaker_separator(
             )
         return SepFormerSpeakerSeparator(model_id=model_id, device=device, savedir=savedir)
 
-    if key != "auto":
+    if canonical != options.OverlapSeparator.AUTO:
         raise DependencyError(
-            f"Unknown speaker separator {preference!r}. Choose from: auto, none, "
-            "sepformer"
+            f"Unknown speaker separator {preference!r}. Choose from: "
+            f"{', '.join(options.OVERLAP_SEPARATORS)}"
         )
 
     if available:

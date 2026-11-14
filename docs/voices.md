@@ -1,8 +1,12 @@
 # Voices
 
-The saved voice library, voice cards, the four accent modes, and how to borrow a
-native accent without losing the speaker's timbre. For a task-oriented overview of
-`dub say` and expressive backends, see [Voice generation](voice-generation.md).
+The saved voice library, voice cards, standalone speech with `dub say`, the
+expressive backends, per-line emotion, and the four accent modes with the native
+blend. A voice made here is reusable: `say` speaks it, and `--voice` dubs with
+it.
+
+`dub say` needs no video and no translation, and no LLM endpoint unless you use
+`--prosody-plan llm` or `--style-plan llm`.
 
 ## Voice library (saved voices)
 
@@ -150,9 +154,9 @@ read — and all clone the voice from a reference clip.
 
 | Backend | Languages | Controls | Setup |
 |---|---|---|---|
-| `--backend cosyvoice3` | 9, including **French** | emotion, pace, volume, `[breath]`, `[laughter]` | `python dub.py models --download tts_cosyvoice3`; [Setup](setup.md#cosyvoice-3-optional-expressive-speech) |
-| `--backend chatterbox` | 23, including **French** | emotion exaggeration (one intensity) | `python dub.py models --download tts_chatterbox`; [Setup](setup.md#chatterbox-optional-expressive-speech) |
-| `--backend fish` | ~100 | delivery as **inline tags** in `--text` (34 documented tags + free-form) | `python dub.py models --download tts_fish`; [Setup](setup.md#fish-speech-s2-pro-optional-expressive-speech) |
+| `--backend cosyvoice3` | 9, including **French** | emotion, pace, volume, `[breath]`, `[laughter]` | `python dub.py models --download tts_cosyvoice3`; [Getting started](getting-started.md#cosyvoice-3-optional-expressive-speech) |
+| `--backend chatterbox` | 23, including **French** | emotion exaggeration (one intensity) | `python dub.py models --download tts_chatterbox`; [Getting started](getting-started.md#chatterbox-optional-expressive-speech) |
+| `--backend fish` | ~100 | delivery as **inline tags** in `--text` (34 documented tags + free-form) | `python dub.py models --download tts_fish`; [Getting started](getting-started.md#fish-speech-s2-pro-optional-expressive-speech) |
 
 ```bash
 # CosyVoice3, with real per-line direction
@@ -313,10 +317,12 @@ controls that backend can honour.
 ### `--prosody-plan llm`
 
 Pass `--prosody-plan llm` to let the configured OpenAI-compatible model decide
-per-line prosody from the text itself. The plan is written first; any explicit
-`--prosody` or `--emotion` value then overrides it, so a hand-written direction
-always wins over the model's guess. This is what produces variation *across*
-sentences rather than one delivery for the whole clip.
+per-line prosody from the text itself. For `say` the default is `off`; for
+dubbing it is `auto`, which plans when the endpoint is reachable and falls back
+to neutral otherwise (`llm` fails instead). The plan is written first; any
+explicit `--prosody` or `--emotion` value then overrides it, so a hand-written
+direction always wins over the model's guess. This is what produces variation
+*across* sentences rather than one delivery for the whole clip.
 
 ```bash
 python dub.py say --voice warm-fr --backend cosyvoice3 \
@@ -414,8 +420,8 @@ expose the sampler (model defaults 0.7 / 0.7).
 
 Chatterbox and Fish pin conflicting `torch`/`transformers` versions, so each runs
 in its own child environment. Installation steps are in
-[Setup → Chatterbox](setup.md#chatterbox-optional-expressive-speech) and
-[Setup → Fish](setup.md#fish-speech-s2-pro-optional-expressive-speech).
+[Getting started → Chatterbox](getting-started.md#chatterbox-optional-expressive-speech) and
+[Getting started → Fish](getting-started.md#fish-speech-s2-pro-optional-expressive-speech).
 
 CosyVoice, Chatterbox and Fish all run in child processes for the same
 version-conflict reason. `--save-as` and `--design` are not supported on the
@@ -644,7 +650,7 @@ measures the **cloned voice** with a probe render per speaker (`03a_rate.json`),
 builds each line's word ceiling from that measurement, and checks the translation
 against the ceiling before synthesising it. Reference pace is now a pronunciation
 and delivery choice rather than a length lever; see
-[When a translation is too long for its slot](audio-and-timing.md#when-a-translation-is-too-long-for-its-slot).
+[When a translation is too long for its slot](dub-quality.md#when-a-translation-is-too-long-for-its-slot).
 
 Need a transcript and never wrote one down? Transcribing the clip with the same
 model the pipeline uses is accurate enough in practice — the run behind the table
@@ -654,4 +660,4 @@ numbers or names by hand.
 
 ---
 
-Next: [Multi-speaker](multi-speaker.md), or [Audio and timing](audio-and-timing.md).
+Next: [Dubbing quality](dub-quality.md), or [Performance](performance.md).

@@ -1,7 +1,9 @@
-# Options in full
+# Reference
 
-Every flag, its default, and what it achieves. `python dub.py --help` prints the
-same list at the terminal.
+Every CLI flag, its default, the environment variables, and the local HTTP API.
+`python dub.py --help` prints the same flags at the terminal. The browser app
+exposes these options as form fields; [Usage → The app](usage.md#the-app) shows
+where each group lives.
 
 ## Input and language
 
@@ -102,14 +104,14 @@ backend and checkpoint that wrote it, and switching models keeps both cards.
 
 ## Speakers
 
-See [Dubbing a video with several speakers](multi-speaker.md#dubbing-a-video-with-several-speakers).
+See [Dubbing a video with several speakers](dub-quality.md#dubbing-a-video-with-several-speakers).
 
 | Option | Default | What it achieves |
 |---|---|---|
 | `--diarizer BACKEND` | `auto` | `auto` finds the speakers with the embedding model; `none` dubs every line in one voice, which is the pre-P1 behaviour. Without `funasr` installed, `auto` warns and behaves as `none`. |
 | `--speaker-threshold D` | `0.7` | Cosine distance above which two embeddings count as different people. Raise it if one speaker is being split in two; lower it if two speakers are being merged. |
 | `--min-speaker-seconds S` | `20.0` | A voice must own at least this much speech to be dubbed separately; a shorter cluster joins its nearest neighbour. The floor is well above the 3 s needed to clone at all, because a donor of a second or two does not describe a voice — its blend stalls near the accent (measured at `donor_ratio` 0.23 on the 11-minute job, where the dub audibly kept the anchor's voice). `0` keeps every cluster. |
-| `--overlap MODE` | `dominant` | What to do with a segment that carries two voices at once. `dominant` dubs the whole line in its dominant speaker's voice; `separate` splits it and dubs both voices (needs the optional `speechbrain`). See [Dubbing a video with several speakers](multi-speaker.md#dubbing-a-video-with-several-speakers). |
+| `--overlap MODE` | `dominant` | What to do with a segment that carries two voices at once. `dominant` dubs the whole line in its dominant speaker's voice; `separate` splits it and dubs both voices (needs the optional `speechbrain`). See [Dubbing a video with several speakers](dub-quality.md#dubbing-a-video-with-several-speakers). |
 | `--overlap-separator BACKEND` | `auto` | `auto` uses SpeechBrain's SepFormer when installed, `sepformer` requires it, `none` disables it. Only used with `--overlap separate`. |
 
 ## Audio bed and loudness
@@ -200,7 +202,7 @@ and optional packages.
 
 | Option | Default | What it achieves |
 |---|---|---|
-| `--output-dir DIR` | `output` | Where job folders are written. Each input gets its own `<stem>` folder. |
+| `--output-dir DIR` | `output` | Where job folders are written. The CLI uses one `<stem>` folder per input; the API overrides it with a unique `<stem>__<operation>__<language>__<run-id>` folder per run. |
 | `--subtitles-mode MODE` | `soft` | How the target subtitles reach the video: `soft` muxes a toggleable track and copies every other stream (other subtitle languages are kept), `burn` draws them into the frames and re-encodes the video, `off` writes the SRT files only. |
 | `--no-subtitles` | off | Skips both SRT files and implies `--subtitles-mode off`. |
 | `--force` | off | Ignores the stage cache and rebuilds everything. |
@@ -226,7 +228,7 @@ model, the prosody plan, per-line render times and a total.
 | `--backend NAME` | `qwen` | `qwen` (clone), `customvoice` (preset speaker + instruction), `cosyvoice3` (clone + per-line prosody), `chatterbox` (clone + expression intensity), `fish` (clone + inline tags). |
 | `--prosody SPEC` | — | Per-line `emotion`/`pace`/`volume`/`exaggeration` and bare `breath`/`pause`/`laughter` flags; repeat per line or broadcast one. Rejected by `qwen` and `fish`. |
 | `--emotion TEXT` | — | Shorthand for `emotion=` (alias `--instruct`); repeatable/comma-separated. Rejected by `qwen` and `fish` (Fish takes its direction from tags in `--text`). |
-| `--style-instruct TEXT` | — | `customvoice` only: the delivery instruction, sent **verbatim** to the checkpoint. Repeatable (one per line, or one value broadcast). Wins over `--style-plan`/`--prosody`/`--emotion`/`--prosody-plan`. |
+| `--style-instruct TEXT` | — | `customvoice` only: the delivery instruction, sent **verbatim** to the checkpoint. Repeatable (one per line, or one value broadcast). Wins over `--style-plan`/`--prosody`/`--emotion`/`--prosody-plan`. Alias: `--raw-instruct`. |
 | `--style-plan {off,llm}` | `off` | `customvoice` only: `llm` writes those verbatim instructions for you, which is the form the checkpoint expects. An explicit `--style-instruct` still wins. Requires the LLM settings. `-v` logs every request and reply. |
 | `--style-plan-scope {per-line,whole}` | `per-line` | With `--style-plan llm`: one instruction per line (chunked, with a whole-passage overview when long), or a single instruction for the entire text. |
 | `--plan-chunk N` | `LLM_PLAN_CHUNK_SIZE` (10) | Lines per planning request before `--style-plan llm`, `--prosody-plan llm` and `--fish-tag-mode llm` switch to the overview + chunked strategy. |
@@ -240,6 +242,7 @@ model, the prosody plan, per-line render times and a total.
 | `--fish-tag-mode {keep,llm}` | `keep` | `fish` only. `keep` speaks `--text` exactly as written, tags included; `llm` has the model insert the tags, guarded so the words cannot change. Fish has no `--prosody`/`--emotion`/`--prosody-plan` channel. |
 | `--fish-quantize {int8,off}` | `int8` | `fish` only. `int8` loads 8-bit weight-only (~6 GB resident, ~11 GB peak) so the model fits a 12 GB card; `off` loads the bf16 weights Fish documents as needing ~24 GB. CPU runs always use bf16. |
 | `--clone-text TEXT` | — | Transcript of `--clone`. Optional: without it `qwen` clones from the speaker embedding alone (lower similarity), and CosyVoice loses the reference's accent. |
+| `--save-as LABEL` | — | Save the inline `--design` or `--clone` voice under this label while speaking, so the next run reuses it instead of re-encoding the clip. |
 | `--no-provenance` | off | Skips the timestamped `provenance/provenance-<timestamp>.json` record of the per-line prosody, the LLM reply and the text transformations. |
 
 `--text` is split into one utterance per line. Both a real newline and a literal
@@ -263,5 +266,150 @@ skipped. Outputs live in `<output>/<stem>-subtitles/`.
 
 ---
 
-Next: [Outputs and caching](outputs-and-caching.md), or
-[Troubleshooting](troubleshooting.md).
+## Models, anchors and the environment
+
+These commands do not run a job.
+
+**Models** — `dub.py models` lists what is present and downloads what is missing.
+
+| Option | Default | What it achieves |
+|---|---|---|
+| `--list` | mode | Show every known model and whether it is present (the default). |
+| `--download NAME\|all\|everything` | — | Download one model by name, `all` for the MVP-required set, `everything` to include the optional backends. |
+| `--force` | off | Re-download even when it is already present. |
+| `--models-dir DIR` | `MODELS_DIR` | Override the models directory for this command. |
+
+**Anchors** — `dub.py anchors` lists or generates the per-language accent
+anchors the default `native` accent mode borrows pronunciation from. Without
+`--generate` it lists what is cached. `--lang` chooses languages (repeatable,
+defaults to all), `--device` and `--dtype` apply as for a job, `--force`
+regenerates existing anchors, and `--models-dir` overrides the models directory.
+
+**Info** — `dub.py info` reports the accelerator, the device and precision a run
+would pick, the optional packages, the system binaries and the models.
+`--device`, `--devices`, `--dtype` and `--models-dir` narrow the report.
+
+**Devices** — `dub.py devices` lists every GPU torch can see, the precision each
+would run and the exact `--device` flag to select it. It is read-only: no model
+is loaded and no stage starts.
+
+**Also available on every command** — `--version` prints the package version,
+and `--voices-dir DIR` (dub, say and voices) overrides `VOICES_DIR` for one run.
+
+---
+
+## HTTP API
+
+`dub-server` (or `python -m server`) serves this JSON API under `/api` and the
+built frontend at `/`. It is the same code path as the CLI: every request is
+validated and mapped onto the same `pipeline/` entry point, so the two cannot
+disagree.
+
+| App page | Endpoints | CLI equivalent |
+|---|---|---|
+| Dub | `POST /api/jobs/dub` | `dub.py --video/--audio …` |
+| Subtitles only | `POST /api/jobs/subtitles` | `dub.py subtitles …` |
+| Say | `POST /api/jobs/say` | `dub.py say …` |
+| Voices | `GET/POST/DELETE /api/voices…` | `dub.py voices …` |
+| Models | `GET /api/models`, `POST /api/models/download`, `DELETE /api/models/{name}` | `dub.py models …` |
+| Devices | `GET /api/devices`, `/api/info`, `/api/packages`, `/api/usage` | `dub.py devices`, `info` |
+| Files | `GET/POST/DELETE /api/files…`, `/api/outputs…` | — (browse `output/`) |
+| Settings | `GET/PATCH /api/settings`, `/api/settings/export`, `/import`, `/api/presets`, `/api/favorites` | `.env` and flags |
+| Activity | `GET /api/jobs…`, `GET /api/jobs/{id}/events` | `run.log`, `report.json` |
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Liveness |
+| GET | `/api/devices` | Structured device report |
+| GET | `/api/info` | Environment, models, packages |
+| GET | `/api/packages` | Optional packages and system binaries |
+| GET | `/api/models` | Registry status |
+| POST | `/api/models/download` | Download one, `all`, or `everything` |
+| DELETE | `/api/models/{name}` | Delete a checkpoint directory (reports freed bytes) |
+| GET | `/api/usage` | Disk used by models, voices, outputs and uploads |
+| GET | `/api/backends` | Per-backend capabilities and the reason for each gap |
+| GET | `/api/presets?kind=…` | Saved form configurations |
+| POST | `/api/presets` | Save a preset |
+| DELETE | `/api/presets/{id}` | Delete a preset |
+| GET | `/api/favorites` | Pinned input paths |
+| POST | `/api/favorites` | Pin an input path |
+| DELETE | `/api/favorites?path=…` | Unpin an input path |
+| GET | `/api/voices` | Saved voices |
+| POST | `/api/voices/design` | Design a voice (job) |
+| POST | `/api/voices/clone` | Clone a voice (job) |
+| POST | `/api/voices/add` | Register a clip (job) |
+| DELETE | `/api/voices/{label}` | Delete a voice |
+| GET | `/api/voices/{label}/audio` | Stream a saved voice's clip |
+| GET | `/api/anchors` | Cached accent anchors |
+| POST | `/api/anchors/generate` | Generate anchors (job) |
+| POST | `/api/jobs/dub` | Start a dub |
+| POST | `/api/jobs/subtitles` | Start a subtitles-only job |
+| POST | `/api/jobs/say` | Start speech generation |
+| GET | `/api/jobs?page=&page_size=&state=&q=` | Recent jobs (paginated, filterable) |
+| GET | `/api/jobs/{id}` | Job detail and recent events |
+| GET | `/api/jobs/{id}/events` | SSE stream of stages, log lines and the final job |
+| GET | `/api/jobs/{id}/input` | Stream the job's source file (compare view) |
+| POST | `/api/jobs/{id}/retry` | Re-run the stored options as a new job |
+| POST | `/api/jobs/{id}/cancel` | Cancel |
+| POST | `/api/jobs/clear` | Delete finished job records in bulk |
+| GET | `/api/files?page=&page_size=` | Uploaded files (paginated) |
+| POST | `/api/files/upload` | Upload a media file |
+| GET | `/api/files/{id}/download` | Download an upload (`?inline=1` to play it) |
+| DELETE | `/api/files/{id}` | Delete an upload |
+| POST | `/api/files/delete` | Delete uploads in bulk |
+| GET | `/api/outputs?page=&page_size=` | One row per run, with its main artifact |
+| GET | `/api/outputs/files?job_dir=…` | Every artifact in one run (details view) |
+| GET | `/api/outputs/download?path=…` | Download an output (`?inline=1` to play it) |
+| DELETE | `/api/outputs?path=…` | Delete an output |
+| POST | `/api/outputs/delete` | Delete outputs in bulk |
+| GET/PATCH | `/api/settings` | Non-secret settings |
+| GET | `/api/settings/export` | Download a JSON settings document |
+| POST | `/api/settings/import` | Apply a JSON settings document |
+
+### Jobs, states and events
+
+Every submitting endpoint returns immediately with a job id. A job is persisted
+as `QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` or `CANCELLED`; the state
+machine rejects invalid transitions, one heavy job runs at a time in a spawned
+process, and the queue is bounded — excess work is rejected rather than buffered.
+
+Jobs are stored in SQLite under `DUB_DATA_DIR` (default `data/`), which also
+holds uploads and metadata. `GET /api/jobs/{id}/events` is an SSE stream of
+stage starts and ends, log lines, errors and the final job. Progress is real
+stage state only. A dropped stream resumes from the last event id, and the plain
+HTTP endpoints keep working meanwhile, so cancel still succeeds.
+
+### Backend capabilities
+
+`GET /api/backends` publishes what each TTS backend can honour, per job kind,
+with a reason for every gap. The table comes from `pipeline/capabilities.py`,
+which the Say validator also uses, so a form and the pipeline cannot drift:
+
+```json
+{"say": [{"id": "qwen", "label": "Qwen Base (cloning)", "prosody": false,
+           "save_as": true, "expressive": false, "speaker": false,
+           "sources": ["voice", "design", "clone"],
+           "unsupported": {"prosody": "…Qwen Base has no prosody controls — put the delivery cues in the text."}}],
+ "dub": [ … ]}
+```
+
+The forms read it once per load, disable what the selected backend cannot
+honour, print the reason, and drop those values from the payload.
+
+### Security boundaries
+
+- Inputs must be uploaded through the app or already live under `input/`,
+  `output/` or the app data directory; arbitrary filesystem paths are rejected.
+- Uploads are size- and type-checked and stored under server-generated names.
+- Deletes are restricted to the app's own directories; model deletion is
+  restricted to the models directory and refuses package-backed models.
+- Only files a job already used can be streamed back as its source.
+- CORS is limited to local development origins.
+- No authentication yet: bind to `127.0.0.1`, or add auth before exposing it.
+
+---
+
+Next: [Outputs and caching](outputs-and-caching.md) for artifacts and
+`report.json`, or [Troubleshooting](troubleshooting.md) when something breaks.

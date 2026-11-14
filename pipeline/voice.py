@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import TTSError
+from .options import AccentMode
 from .voices import load_prompt
 
 if TYPE_CHECKING:  # pragma: no cover - annotation only, avoids an import cycle
@@ -116,7 +117,10 @@ def build_prompt(engine: TTSEngine, spec: VoiceSpec) -> None:
         if spec.prompt is not None and spec.blend is None
         else None
     )
-    if spec.accent_mode in ("native", "reference-accent"):
+    if spec.accent_mode in (
+        AccentMode.NATIVE,
+        AccentMode.REFERENCE_ACCENT,
+    ):
         if spec.blend is not None:
             engine.prepare_prompt_from_file(spec.blend, spec.accent_text)
             return

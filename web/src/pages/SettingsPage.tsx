@@ -1,5 +1,12 @@
 import React from "react";
 import { api } from "../api";
+import {
+  DEVICE_OPTIONS,
+  DTYPE_OPTIONS,
+  LOG_LEVEL_OPTIONS,
+  LOUDNESS_OPTIONS,
+  SEPARATOR_OPTIONS,
+} from "../options";
 import type { SettingsInfo } from "../types";
 import {
   Button,
@@ -186,10 +193,7 @@ export function SettingsPage() {
               <Select
                 value={settings.loudness_target}
                 onChange={(event) => update("loudness_target", event.target.value)}
-                options={[
-                  { value: "match-source", label: "Match the source" },
-                  { value: "lufs", label: "Absolute LUFS" },
-                ]}
+                options={LOUDNESS_OPTIONS}
               />
             </Field>
             <Field label="LUFS target">
@@ -199,11 +203,7 @@ export function SettingsPage() {
               <Select
                 value={settings.separator}
                 onChange={(event) => update("separator", event.target.value)}
-                options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "demucs", label: "Demucs" },
-                  { value: "none", label: "None" },
-                ]}
+                options={SEPARATOR_OPTIONS}
               />
             </Field>
             <Field label="Duck depth (dB)">
@@ -230,12 +230,7 @@ export function SettingsPage() {
               <Select
                 value={settings.log_level}
                 onChange={(event) => update("log_level", event.target.value)}
-                options={[
-                  { value: "INFO", label: "INFO" },
-                  { value: "DEBUG", label: "DEBUG" },
-                  { value: "WARNING", label: "WARNING" },
-                  { value: "ERROR", label: "ERROR" },
-                ]}
+                options={LOG_LEVEL_OPTIONS}
               />
             </Field>
             <Field label="Default device">
@@ -243,8 +238,7 @@ export function SettingsPage() {
                 value={settings.default_device}
                 onChange={(event) => update("default_device", event.target.value)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "cpu", label: "CPU" },
+                  ...DEVICE_OPTIONS,
                   { value: "cuda:0", label: "cuda:0" },
                   { value: "cuda:1", label: "cuda:1" },
                 ]}
@@ -254,12 +248,7 @@ export function SettingsPage() {
               <Select
                 value={settings.default_dtype}
                 onChange={(event) => update("default_dtype", event.target.value)}
-                options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "bf16", label: "bfloat16" },
-                  { value: "fp16", label: "float16" },
-                  { value: "fp32", label: "float32" },
-                ]}
+                options={DTYPE_OPTIONS}
               />
             </Field>
             <Toggle

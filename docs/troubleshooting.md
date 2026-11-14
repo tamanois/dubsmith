@@ -1,9 +1,31 @@
 # Troubleshooting
 
 Symptoms, causes and fixes, plus how the logs work and what the project does not
-attempt yet.
+attempt yet. The rows below name CLI flags; the app exposes the same option in
+the form and shows the same message in the job's log.
 
-## Troubleshooting
+## The browser app
+
+| Symptom | Cause and fix |
+|---|---|
+| `dub-server: command not found` | The `web` extra is not installed. Activate the virtualenv, then `pip install -e ".[web]"`. |
+| `http://127.0.0.1:8000` answers but the page is blank or 404 | `web/dist` is missing. Build it once with `cd web && npm install && npm run build`, then restart `dub-server`. |
+| Edits to `web/src` have no effect | The server serves the built bundle. Re-run `npm run build` and hard-refresh the tab; or run `npm run dev` (port 5173, proxying `/api`). |
+| Edits to `server/` or `pipeline/` have no effect | Restart `dub-server`. If the package was installed with `pip install .` instead of `pip install -e ".[web]"`, the server is running the frozen copy in `site-packages`. |
+| `Address already in use` on start | Another process owns port 8000. Stop it, or set `DUB_PORT` (and open the new port). |
+| `Attribute "app" not found in module "server.app"` | `server/app.py` exposes a factory, `create_app()`. Use `uvicorn server.asgi:app …` or `uvicorn server.app:create_app --factory …`. |
+| The app is unreachable from another machine | It binds `127.0.0.1` on purpose. Set `DUB_HOST=0.0.0.0` only behind authentication — there is none built in. |
+| An upload is rejected | Only media types and the size cap the server enforces are accepted; the file must go through the upload field. Paths outside `input/`, `output/` and the data directory are refused by design. |
+| A job stays `QUEUED` | One heavy job runs at a time; the queue is bounded and excess work is rejected. Cancel or clear the running job on **Activity**, and check that `DUB_DATA_DIR` is writable. |
+| A job fails immediately | Read its log in the activity panel: the message is the same one the CLI prints, so the rows in the next section apply. A `422` means the request was rejected before it was queued (wrong combination of options). |
+| Live progress stops updating | The SSE stream dropped and the page is reconnecting with backoff; plain HTTP state and **Cancel** keep working. Refresh to resync. |
+| `Could not stream the source file` | The job's input is outside the directories the app may read. Re-upload it through the app. |
+| Where are the jobs and uploads stored? | SQLite, uploads and job metadata live in `DUB_DATA_DIR` (default `data/`); outputs in `DUB_OUTPUT_DIR` (default `output/`). To reset the app state, stop the server and remove `data/` — the output folders are separate and are not touched. |
+| The app cannot download a model | Same causes as `dub models --download`: disk space, network, or a gated checkpoint (`hf auth login` or `HF_TOKEN`). The job log names the failing checkpoint. |
+| A form field is greyed out | The selected backend cannot honour it; the reason is printed under the field. `GET /api/backends` publishes the same table. |
+| **Submit** is disabled with a message | The options contradict each other (source equals target, a reference clip without its transcript, a borrowed accent with no clip, accent matching outside native mode). The message names the fix. |
+
+## The command line and the pipeline
 
 | Symptom | Cause and fix |
 |---|---|
@@ -29,8 +51,8 @@ attempt yet.
 | `--style-instruct is only valid with --backend customvoice` | That flag is the CustomVoice delivery instruction. Other backends take `--prosody`/`--emotion`, and `--design` already accepts a free-form prompt |
 | `--style-plan is only valid with --backend customvoice` | The LLM-written verbatim instruction is CustomVoice-only. Other backends use `--prosody-plan llm` for structured prosody |
 | `--style-plan-scope only applies with --style-plan llm` | Add `--style-plan llm`, or drop `--style-plan-scope` |
-| `fish-speech is not installed` | Create `.venv-fish` (see [Setup](setup.md#fish-speech-s2-pro-optional-expressive-speech)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
-| `the CosyVoice worker is missing the Python module '…'` | A CosyVoice runtime dependency is absent. Install the full list in [Setup](setup.md#cosyvoice-3-optional-expressive-speech). If the module is `pkg_resources`, run `pip install "setuptools<81"` |
+| `fish-speech is not installed` | Create `.venv-fish` (see [Getting started](getting-started.md#fish-speech-s2-pro-optional-expressive-speech)) or set `FISH_PYTHON`; weights: `python dub.py models --download tts_fish` |
+| `the CosyVoice worker is missing the Python module '…'` | A CosyVoice runtime dependency is absent. Install the full list in [Getting started](getting-started.md#cosyvoice-3-optional-expressive-speech). If the module is `pkg_resources`, run `pip install "setuptools<81"` |
 | `--backend fish ... has no --prosody/--emotion/--prosody-plan channel` | Fish takes its delivery from `[tag]` cues in `--text`: write them yourself, or pass `--fish-tag-mode llm` and let the model write them |
 | `Fish Speech S2-Pro needs about 24 GB of VRAM` | That message means the bf16 weights were requested (`--fish-quantize off`) or the int8 path could not start. Drop the flag to use the int8 default, retry with `--device cpu` (slow), or use a larger GPU |
 | `unsupported operation: more than one element of the written-to tensor refers to a single memory location` | torch is older than 2.5 while transformers 4.57 builds the sliding-window attention mask with an in-place write onto an expanded tensor. It aborts Qwen3-TTS synthesis (the `blend`/`rate-probe` stages may still pass). Install `torch==2.5.1` and `torchaudio==2.5.1` as pinned in [Requirements](../requirements.txt); `--backend fish` and the other expressive backends are unaffected |
@@ -69,7 +91,7 @@ attempt yet.
 | `--accent-match only applies to --accent-mode native` | Use `--accent-mode native` (the default), or drop `--accent-match` |
 | The dub still has the speaker's accent | The default `native` mode already borrows a generated anchor. If it is not enough, try `--accent-match gender`, then `--accent-mode speaker-only`, or supply your own clip with `--accent-mode reference-accent` |
 | Still sounds foreign in `reference-accent` mode | Check `--accent-text` matches the clip word for word — mismatched text misaligns the borrowed codes. A longer, more natural accent clip also helps |
-| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — each voice's lines are cloned from that voice's own `reference_blend[_<speaker>].wav`, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](testing-and-quality.md#auditing-a-dubs-voice-line-by-line) |
+| The voice changes part-way through the video | Only possible in `reference-accent` with `--accent-blend single-stage`, where every line is free to follow the accent codes or the speaker embedding. The default `two-stage` removes that choice — each voice's lines are cloned from that voice's own `reference_blend[_<speaker>].wav`, so the voice cannot change between lines. Listen to that clip on its own to confirm stage 1 picked up the speaker's timbre; if it did not, raise `--blend-takes` or try a different `--accent-audio`. To measure it rather than judge it, see [Auditing a dub's voice](outputs-and-caching.md#auditing-the-voice-line-by-line) |
 | A voice changes *between speakers* rather than mid-line | Expected, unless the two voices are the same person: each speaker is cloned from their own donor. If the count is wrong, see the speaker-threshold rows above |
 | The borrowed accent dominates — the speaker's own voice is barely there | The blend was built too close to the accent voice. Check `report.json` → `donor.blend.donor_ratio`: a low value means it never got far enough to the speaker. Raise `--blend-iters`, or lower `--blend-ratio` if you want more of the accent |
 | The blend reached a donor ratio of only … | Informational: the target was not met within `--blend-iters` passes, and the best pass was used anyway. Raise `--blend-iters` or lower `--blend-ratio` |
@@ -83,7 +105,7 @@ attempt yet.
 | Two people are merged into one voice | Lower `--speaker-threshold` (e.g. `0.3`), and check `--min-speaker-seconds` is not folding the quieter speaker away. `--diarizer none` confirms the rest of the pipeline is unaffected |
 | A quiet speaker's lines are in the wrong voice | Their cluster was probably shorter than `--min-speaker-seconds` and got folded into the nearest voice. Lower it, at the cost of cloning from a shorter window |
 | `funasr is not installed, so every line will be dubbed in one voice` | Informational fallback, not an error: the job still runs. Install `funasr` for multi-speaker dubbing, or pass `--diarizer none` to make the intent explicit |
-| The dub is rushed, or words are missing | Check `accelerated_segments` and `needed_ratio_min`: the voice is being sped up because the written line is longer than the window holds. Raise `--budget-speedup` only if `deficit_seconds_total` is also high; otherwise the lines are simply long for their slots. See [When a translation is too long for its slot](audio-and-timing.md#when-a-translation-is-too-long-for-its-slot) |
+| The dub is rushed, or words are missing | Check `accelerated_segments` and `needed_ratio_min`: the voice is being sped up because the written line is longer than the window holds. Raise `--budget-speedup` only if `deficit_seconds_total` is also high; otherwise the lines are simply long for their slots. See [When a translation is too long for its slot](dub-quality.md#when-a-translation-is-too-long-for-its-slot) |
 | `audit_qc.py` reports `SKIP timbre — no accent clip to measure against` | Expected for a `preserve` job: nothing was borrowed, so "did the line follow the accent voice?" has no answer. Pass `--accent <clip>` to force one. The other three gates still report, and the exit code stays 0 |
 | The timbre audit fails while the GPUs are busy | Pass `--device cpu` to `audit_qc.py` or `audit_timbre.py`. The measurement is slower there but identical |
 
@@ -180,7 +202,7 @@ Pass `-v` to see the mode each CosyVoice line used (`zero_shot`,
   videos, and iterative length control in the translation loop. Background
   preservation, native-accent borrowing and multi-speaker dubbing are
   implemented (see [Accent modes](voices.md#accent-modes) and
-  [Dubbing a video with several speakers](multi-speaker.md#dubbing-a-video-with-several-speakers)).
+  [Dubbing a video with several speakers](dub-quality.md#dubbing-a-video-with-several-speakers)).
 - **Native accent is generated, not downloaded.** The default `native` mode
   synthesises a short anchor per language with the VoiceDesign checkpoint, cached
   under `models/anchors/`, so no voice is shipped per language and

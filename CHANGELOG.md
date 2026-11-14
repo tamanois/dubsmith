@@ -13,12 +13,12 @@ All notable changes to this project are documented here. The format follows
   React + Vite + Tailwind interface covering dubbing, subtitles, speech
   generation, voices, models, devices, files and settings. Every job writes to a
   unique `<stem>__<operation>__<language>__<run-id>` folder, so outputs never
-  overwrite. See `docs/web-ui.md`.
+  overwrite. See `docs/usage.md` (the app) and `docs/reference.md` (HTTP API).
 - Shared pipeline operations for the CLI and API: `pipeline/say.py`,
   `pipeline/voice_ops.py`, `pipeline/job_ops.py`, `pipeline/info.py`, plus
   structured device/environment reports and an optional stage-event hook on the
   dubbing and subtitles pipelines.
-- Frontend regression tests (Vitest + Testing Library, 185 tests) cover the API
+- Frontend regression tests (Vitest + Testing Library, 248 tests) cover the API
   wrapper and SSE reconnect, the UI primitives, uploads, live job logs,
   cancellation, retry/edit/compare and filtering, pagination and bulk actions on
   every list, model deletion, playback, presets, recent/favorite inputs, settings
@@ -50,6 +50,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Option values now have a single declaration. `pipeline/options.py` owns every
+  accepted value, its aliases and its default; the CLI's `argparse` choices, the
+  config validators, the API request schemas and the web forms all read from it,
+  and backend ids and labels come from `GET /api/backends`. The browser mirrors
+  the vocabulary in `web/src/options.ts`, which derives every dropdown from the
+  declaration. Renaming or adding a value is a two-file change instead of a
+  search across every form, flag and validator; `tests/test_options.py` and
+  `web/test/options.test.ts` fail when the copies disagree. No user-visible value
+  changed.
 - Main outputs are now named after the input stem (`talk_dubbed.mp4`,
   `talk_dubbed.wav`, `talk_subtitled.mp4`) instead of the generic
   `video_dubbed.mp4` / `dub.wav`, so a run folder is self-describing. The app's
@@ -143,8 +152,8 @@ All notable changes to this project are documented here. The format follows
 - `pip install .` (non-editable) made `dub-server` import a frozen snapshot from
   `site-packages`, so source changes never reached the running server and the UI
   hit 404s on `/api/usage` and `/api/presets` while showing `NaN` pagination.
-  The install is now editable and `docs/web-ui.md` tells you to rebuild and
-  restart after a backend change.
+  The install is now editable and `docs/getting-started.md` tells you to rebuild
+  and restart after a backend change.
 
 ## [0.2.0] - 2026-11-09
 
@@ -155,8 +164,9 @@ All notable changes to this project are documented here. The format follows
 - Expressive dubbing backends: `cosyvoice3`, `chatterbox`, and `fish`, selected
   with `--backend`; per-line delivery is planned from the translated text with
   `--prosody-plan auto|off|llm`.
-- Optional `Dockerfile` and `docs/docker.md` for a portable image containing all
-  dependencies (including the optional backends) but no model weights.
+- Optional `Dockerfile`, documented in `docs/getting-started.md`, for a portable
+  image containing all dependencies (including the optional backends) but no
+  model weights.
 - Standalone speech generation with `dub say`, including saved voices, inline
   voice design and cloning, and the `customvoice` preset-speaker backend.
 - Voice library import with `dub voices --add`, optional transcription, voice

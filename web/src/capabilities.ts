@@ -1,6 +1,7 @@
 import React from "react";
 import { api } from "./api";
 import type { BackendCapabilities } from "./types";
+import { SAY_BACKENDS, TTS_BACKENDS, type Option } from "./options";
 
 export type BackendMap = Record<string, BackendCapabilities>;
 
@@ -53,4 +54,22 @@ export function capabilitiesOf(
   backend: string,
 ): BackendCapabilities | null {
   return map[backend] ?? null;
+}
+
+/**
+ * Picker options for one job kind, in the order the server lists them.
+ *
+ * The API owns the ids *and* the labels, so a renamed backend needs no frontend
+ * change. Before the fetch resolves - or if it fails - the known ids are shown
+ * with the id as the label: a metadata hiccup must not leave the picker empty,
+ * because the server would still accept the job.
+ */
+export function backendOptions(map: BackendMap, kind: "say" | "dub"): Option[] {
+  const options = Object.values(map).map((caps) => ({
+    value: caps.id,
+    label: caps.label,
+  }));
+  if (options.length) return options;
+  const fallback = kind === "say" ? SAY_BACKENDS : TTS_BACKENDS;
+  return fallback.map((id) => ({ value: id, label: id }));
 }

@@ -1,11 +1,5 @@
 import type { Device } from "../types";
-
-const DTYPES = [
-  { value: "auto", label: "auto" },
-  { value: "bf16", label: "bfloat16" },
-  { value: "fp16", label: "float16" },
-  { value: "fp32", label: "float32" },
-];
+import { DEVICE_OPTIONS, DTYPE_OPTIONS } from "../options";
 
 /**
  * Always-visible defaults for every new job. Kept in the header rather than on
@@ -24,8 +18,7 @@ export function DefaultsBar({
   onChange: (patch: { default_device?: string; default_dtype?: string }) => void;
 }) {
   const deviceOptions = [
-    { value: "auto", label: "auto" },
-    { value: "cpu", label: "cpu" },
+    ...DEVICE_OPTIONS,
     ...devices.map((item) => ({
       value: item.label,
       label: `${item.label} — ${item.name}`,
@@ -62,7 +55,7 @@ export function DefaultsBar({
           onChange={(event) => onChange({ default_dtype: event.target.value })}
           className="rounded-md border border-white/10 bg-ink-850 px-2 py-1 text-slate-200"
         >
-          {DTYPES.map((option) => (
+          {DTYPE_OPTIONS.map((option) => (
             <option key={option.value} value={option.value}>
               {option.label}
             </option>

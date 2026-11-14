@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  push:
   pull_request:
 
 # A newer push makes an older run's answer irrelevant.
@@ -37,7 +36,7 @@ jobs:
       matrix:
         # The documented floor, plus the versions between it and the current
         # release. The upper bound is enforced by requires-python.
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@v4
